@@ -1,15 +1,50 @@
 import asyncio
+import os
 import requests
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
-from google import genai
 
+# ----------------- КЛЮЧИ -----------------
 TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
-GEMINI_API_KEY = "AQ.Ab8RN6KPLSbx1Qjh6ZiAcc5CTcHpUCyJWVcrlmqhhwEcvXVlSg"
+GEMINI_KEY = os.environ.get(
+    "GEMINI_API_KEY",
+    "AQ.Ab8RN6Jyloyq3bkfvMyL7OkXUQqsBBDGXnORlOmQmZGbvKEDYQ",
+)
+# ----------------------------------------
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+def call_gemini_rest(prompt: str) -> str:
+    """Прямой REST-запрос к Gemini API с поддержкой токенов формата AQ."""
+    # Передаем ключ и в заголовок Bearer, и в URL для гарантированной авторизации
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+    headers = {
+        "Authorization": f"Bearer {GEMINI_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=25)
+        res_json = r.json()
+        if "candidates" in res_json:
+            return res_json["candidates"][0]["content"]["parts"][0]["text"]
+        elif "error" in res_json:
+            # Резервная попытка через light-модель
+            url_alt = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}"
+            r_alt = requests.post(
+                url_alt, headers=headers, json=payload, timeout=25
+            )
+            res_alt = r_alt.json()
+            if "candidates" in res_alt:
+                return res_alt["candidates"][0]["content"]["parts"][0]["text"]
+            return f"Ответ API: {res_json['error'].get('message', res_json)}"
+        return "Не удалось разобрать ответ нейросети."
+    except Exception as e:
+        return f"Ошибка соединения с Gemini: {e}"
 
 
 def fetch_hh(query: str, count: int = 8) -> list:
@@ -80,7 +115,7 @@ def fetch_habr(query: str, count: int = 8) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет!\n\n"
-        "Отправь мне текст вакансии, а я найду предложения на **hh.ru** и **Хабр Карьере**,\n"
+        "Отправь мне текст любой вакансии, а я найду аналогичные предложения на **hh.ru** и **Хабр Карьере**,\n"
         "рассчитаю **процент совпадения** и оценю **вероятность компании**!"
     )
 
@@ -92,36 +127,27 @@ async def handle_vacancy(message: Message):
         "⏳ Анализирую стек, собираю данные и считаю вероятности..."
     )
 
-    keywords_prompt = f"""
-    Выдели 2-3 главных поисковых слова для этой вакансии (роль и главный стек, например: 'Python FastAPI' или 'Product Manager').
-    В ответе напиши ТОЛЬКО эти слова, без кавычек и лишнего текста:
-    {user_text}
-    """
-
-    search_query = "IT"
-    for model_name in ["gemini-3.5-flash-lite", "gemini-3.6-flash"]:
-        try:
-            kw_res = ai_client.models.generate_content(
-                model=model_name, contents=keywords_prompt
-            )
-            if kw_res.text:
-                search_query = kw_res.text.strip().replace("\n", " ")
-                break
-        except Exception:
-            continue
+    keywords_prompt = f"Выдели 2-3 поисковых слова для вакансии (роль и главный стек, например 'Python FastAPI'). Выведи ТОЛЬКО эти слова:\n{user_text}"
+    kw_result = call_gemini_rest(keywords_prompt)
+    search_query = (
+        kw_result.strip().replace("\n", " ")
+        if "Ответ API" not in kw_result
+        else "IT"
+    )
 
     raw_vacancies = fetch_hh(search_query) + fetch_habr(search_query)
-
     if not raw_vacancies:
-        await status_msg.edit_text("Не удалось найти вакансии по запросу.")
+        await status_msg.edit_text(
+            "Не удалось найти открытые вакансии по этому запросу."
+        )
         return
 
     matching_prompt = f"""
-    Ты — эксперт по анализу рынка труда.
+    Ты — эксперт по подбору персонала.
     Исходная вакансия:
     {user_text}
 
-    Найденные открытые вакансии:
+    Найденные вакансии:
     {raw_vacancies}
 
     Задачи:
@@ -129,7 +155,7 @@ async def handle_vacancy(message: Message):
        - 🎯 Совпадение по роли/стеку: от 0% до 100%
        - 🕵️ Вероятность, что это та же компания: от 0% до 100%
     2. Выбери 3-5 наиболее релевантных вакансий (по убыванию совпадения).
-    3. Оформи каждую строго по шаблону:
+    3. Оформи строго по шаблону:
     🔹 [Должность]
     🏢 Компания: [Название]
     🌐 Источник: (hh.ru или Хабр Карьера)
@@ -137,42 +163,40 @@ async def handle_vacancy(message: Message):
     🕵️ Вероятность, что это та же компания: [Y]%
     💰 Зарплата: [Вилка или 'не указана']
     🔗 Ссылка: [URL]
-    💡 Комментарий: (1 краткое предложение сути сходства)
+    💡 Комментарий: (1 краткое предложение: суть сходства)
     """
 
-    models_to_try = ["gemini-3.5-flash-lite", "gemini-3.6-flash"]
-    result_text = None
-    last_err = None
+    result_text = call_gemini_rest(matching_prompt)
 
-    for model in models_to_try:
-        try:
-            res = ai_client.models.generate_content(
-                model=model, contents=matching_prompt
-            )
-            if res.text:
-                result_text = res.text
-                break
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(1.5)
-
-    if result_text:
-        if len(result_text) > 4000:
-            parts = [
-                result_text[i : i + 4000]
-                for i in range(0, len(result_text), 4000)
-            ]
-            await status_msg.edit_text(parts[0])
-            for p in parts[1:]:
-                await message.answer(p)
-        else:
-            await status_msg.edit_text(result_text)
+    if len(result_text) > 4000:
+        parts = [
+            result_text[i : i + 4000] for i in range(0, len(result_text), 4000)
+        ]
+        await status_msg.edit_text(parts[0])
+        for p in parts[1:]:
+            await message.answer(p)
     else:
-        await status_msg.edit_text(f"Ошибка при поиске: {last_err}")
+        await status_msg.edit_text(result_text)
+
+
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
 
 
 async def main():
+    port = int(os.environ.get("PORT", 10000))
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
     await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
