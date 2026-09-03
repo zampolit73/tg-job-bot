@@ -48,7 +48,6 @@ TECH_KEYWORDS = (
     "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
 )
 
-# Профильные IT-каналы для внутреннего поиска по истории
 TARGET_TG_CHANNELS = [
     "normrabota", "it_jobs", "devops_jobs", "job_finder_dev",
     "qa_jobs", "jvmjobs", "forpython", "devjobs"
@@ -97,9 +96,9 @@ def fallback_extract_keywords(text: str) -> list:
     return [first_phrase if first_phrase else "IT Вакансия", "Kubernetes DevOps", "CI/CD"]
 
 
-# ----------------- GROQ CLIENT -----------------
+# ----------------- GROQ CLIENT (АКТУАЛЬНЫЕ МОДЕЛИ) -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
-    models = ("llama-3.1-8b-instant", "openai/gpt-oss-20b")
+    models = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile")
     last_err = ""
     for model_name in models:
         try:
@@ -110,7 +109,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
                     temperature=0.1,
                     max_tokens=max_tokens
                 ),
-                timeout=8.0
+                timeout=9.0
             )
             content = res.choices[0].message.content
             if content and content.strip():
@@ -264,11 +263,11 @@ async def search_telegram_native(search_term: str) -> list:
     return jobs
 
 
-# ----------------- ОБРАБОТЧИКИ -----------------
+# ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (MTProto Pro)**\n\n"
+        "💼 **Multi-Source OSINT Lead Hunter (Pro Edition)**\n\n"
         "Отправьте обезличенный бриф. Бот выполнит параллельный скоринг по **hh.ru, Хабр, SuperJob и Telegram-каналам**.",
         parse_mode=ParseMode.MARKDOWN
     )
