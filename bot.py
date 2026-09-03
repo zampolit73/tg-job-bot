@@ -12,20 +12,26 @@ from groq import AsyncGroq
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# ----------------- КОНФИГУРАЦИЯ -----------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8982024680:AAGSIE8AbyboYoG1HcxLmI9-7ljX2JbTk7s")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
-SUPERJOB_KEY = "v3.r.137453308.2b27077a942fb8adcdba08488e08d669db756f70.9b015112521c7e90ef8c34fbc87e5b222fb2ea67"
+# ----------------- КОНФИГУРАЦИЯ ЧЕРЕЗ ENV -----------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SUPERJOB_KEY = os.getenv("SUPERJOB_KEY")
 
-# Данные авторизации Telethon
-TG_API_ID = 34645565
-TG_API_HASH = "95a795c728a02edb5ed9bbe36289454d"
-TG_SESSION_STRING = "1ApWapzMBuyXchwXzM24tiq9__tlPtWNNFsgnWBO-LAu6w4mz6YLBZ3Vz45ToetY0XPXoZNacT90-QLNUMazCumsgEiqaXdnS9tJNXGCIqyK5fWEzkJcVCivWmNllXbjV9FlHYvEwqHFEXTPw0Cpi7HTHiiZpyj_XD2jwkPPr9r9eVlYNOizF3YXEnYEE1CFPgZvh3p2H1DeixKdZzFmxmuYWvhB9QJahw1Mn1JNEgEFriRKoGHcyDt4CKFC9Q7p8xZ3cy4OeMyYleClP8YzT6IWZ_8pXCb_HfUu2L_phhy46VFNI2A5gtbry-ktXwmJrFWnqLXpAzTSCfIJACwKDvC6REtmOxN4="
+TG_API_ID = int(os.getenv("TG_API_ID", "0"))
+TG_API_HASH = os.getenv("TG_API_HASH", "")
+TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "")
+
+if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
+    raise ValueError("Критические переменные окружения TELEGRAM_BOT_TOKEN или GROQ_API_KEY не заданы!")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
-telethon_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
+
+# Инициализируем Telethon только если переданы креды
+telethon_client = None
+if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
+    telethon_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
@@ -91,12 +97,12 @@ def fallback_extract_keywords(text: str) -> list:
     text_lower = text.lower()
     found = [tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)]
     if found:
-        return [f"NAME:({found[0]})", " ".join(found[:3]), found[0]]
+        return [found[0], " ".join(found[:3]), found[0]]
     first_phrase = text.split("\n")[0][:30].strip()
     return [first_phrase if first_phrase else "IT Вакансия", "Kubernetes DevOps", "CI/CD"]
 
 
-# ----------------- GROQ CLIENT (АКТУАЛЬНЫЕ МОДЕЛИ) -----------------
+# ----------------- GROQ CLIENT -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
     models = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile")
     last_err = ""
@@ -123,7 +129,8 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
 # ----------------- АСИНХРОННЫЕ ПАРСЕРЫ -----------------
 async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
-    params = {"text": query, "area": 113, "per_page": count}
+    clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
+    params = {"text": clean_q, "area": 113, "per_page": count}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         r = await client.get(url, params=params, headers=headers, timeout=2.5)
@@ -197,6 +204,8 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
 
 
 async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
+    if not SUPERJOB_KEY:
+        return []
     words = [w for w in CLEAN_QUERY_RE.sub(" ", query).split() if len(w) > 2][:2]
     clean_q = " ".join(words)
     if not clean_q:
@@ -230,45 +239,49 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
         return []
 
 
-# ----------------- TELETHON SEARCH ПО КАНАЛАМ -----------------
-async def search_telegram_native(search_term: str) -> list:
-    jobs = []
-    if not telethon_client.is_connected():
-        return jobs
+# ----------------- БЫСТРЫЙ ПАРАЛЛЕЛЬНЫЙ TELETHON SEARCH -----------------
+async def _scan_single_channel(channel: str, search_term: str) -> list:
+    results = []
+    try:
+        async for message in telethon_client.iter_messages(channel, search=search_term, limit=2):
+            if message.text:
+                post_text = clean_html(message.text)
+                post_url = f"https://t.me/{channel}/{message.id}"
+                company_match = re.search(r"(?:компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
+                company = company_match.group(1).strip() if company_match else f"@{channel}"
+                results.append({
+                    "id": None,
+                    "source": f"Telegram (@{channel})",
+                    "title": post_text[:40] + "...",
+                    "company": company,
+                    "salary": "в посте",
+                    "url": post_url,
+                    "desc": post_text[:250],
+                })
+    except Exception:
+        pass
+    return results
 
+
+async def search_telegram_native(search_term: str) -> list:
+    if not telethon_client or not telethon_client.is_connected():
+        return []
     clean_term = search_term.strip()
     if not clean_term:
-        return jobs
-
-    for channel in TARGET_TG_CHANNELS[:4]:
-        try:
-            async for message in telethon_client.iter_messages(channel, search=clean_term, limit=2):
-                if message.text:
-                    post_text = clean_html(message.text)
-                    post_url = f"https://t.me/{channel}/{message.id}"
-                    company_match = re.search(r"(?:компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
-                    company = company_match.group(1).strip() if company_match else f"@{channel}"
-
-                    jobs.append({
-                        "id": None,
-                        "source": f"Telegram (@{channel})",
-                        "title": post_text[:40] + "...",
-                        "company": company,
-                        "salary": "в посте",
-                        "url": post_url,
-                        "desc": post_text[:250],
-                    })
-        except Exception:
-            continue
-    return jobs
+        return []
+    
+    # Параллельный опрос всех целевых каналов одновременно
+    tasks = [_scan_single_channel(ch, clean_term) for ch in TARGET_TG_CHANNELS[:5]]
+    results = await asyncio.gather(*tasks)
+    return [item for sublist in results for item in sublist]
 
 
 # ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Pro Edition)**\n\n"
-        "Отправьте обезличенный бриф. Бот выполнит параллельный скоринг по **hh.ru, Хабр, SuperJob и Telegram-каналам**.",
+        "💼 **Multi-Source OSINT Lead Hunter (Secure Edition)**\n\n"
+        "Отправьте обезличенный бриф заявки. Бот выполнит параллельный скоринг баз и выявит прямого заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -278,10 +291,10 @@ async def handle_vacancy(message: Message):
     user_text = message.text
     status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
 
-    prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 3 запроса через точку с запятой в одну строку:
-1. Роль для hh.ru строго с оператором NAME:(...). Пример: NAME:("DevOps") или NAME:("Backend").
-2. Связка из 2-3 ключевых технологий через пробел. Пример: 'Kubernetes Helm PostgreSQL'.
-3. Самый специфичный термин стека или продукта для точного поиска (1-2 слова). Пример: 'Kafka' или 'OnPrem'.
+    prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 3 поисковых запроса через точку с запятой в одну строку:
+1. Профильная должность/роль (без кавычек). Пример: DevOps инженер или Java разработчик.
+2. Связка из 2-3 ключевых технологий через пробел. Пример: Kubernetes Helm PostgreSQL.
+3. Самый специфичный термин стека или продукта (1-2 слова). Пример: Kafka или OnPrem.
 Текст:
 {user_text[:500]}"""
 
@@ -400,10 +413,11 @@ async def handle_vacancy(message: Message):
 
 async def main():
     threading.Thread(target=run_health_server, daemon=True).start()
-    try:
-        await telethon_client.start()
-    except Exception:
-        pass
+    if telethon_client:
+        try:
+            await telethon_client.start()
+        except Exception:
+            pass
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
