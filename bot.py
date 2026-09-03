@@ -20,7 +20,7 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
-# Предкомпилированные регулярные выражения (ускоряют парсинг в разы)
+# Предкомпилированные регулярные выражения
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 WORD_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9\-]+")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
@@ -91,9 +91,9 @@ def fallback_extract_keywords(text: str) -> list:
     text_lower = text.lower()
     found = [tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)]
     if found:
-        return [f"NAME:({found[0]})", " ".join(found[:3])]
+        return [f"NAME:({found[0]})", " ".join(found[:3]), found[0]]
     first_phrase = text.split("\n")[0][:30].strip()
-    return [first_phrase if first_phrase else "IT Вакансия", "Разработчик"]
+    return [first_phrase if first_phrase else "IT Вакансия", "Разработчик", "Backend"]
 
 
 def is_agency(company_name: str) -> bool:
@@ -103,13 +103,13 @@ def is_agency(company_name: str) -> bool:
 
 def build_lead_osint_url(company_name: str) -> str:
     clean_company = CLEAN_NAME_RE.sub("", company_name).strip()
-    target_role = 'CTO OR "Team Lead" OR "Head of Engineering" OR "Engineering Manager"'
+    target_role = 'CTO OR "Team Lead" OR "Head of Engineering" OR "Head of Infrastructure" OR "Engineering Manager"'
     query = f'site:linkedin.com/in "{clean_company}" ({target_role})'
     return f"https://www.google.com/search?q={quote_plus(query)}"
 
 
 # ----------------- АСИНХРОННЫЙ LLM CLIENT -----------------
-async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
+async def call_groq_async(prompt: str, max_tokens: int = 1600) -> tuple[str, str]:
     models = ("llama-3.1-8b-instant", "openai/gpt-oss-20b")
     last_err = ""
     for model_name in models:
@@ -132,11 +132,11 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
     return "", last_err
 
 
-# ----------------- АСИНХРОННЫЕ ПАРСЕРЫ (HTTPX) -----------------
+# ----------------- АСИНХРОННЫЕ ПАРСЕРЫ -----------------
 async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "AsyncOSINT/12.0"}
+    headers = {"User-Agent": "AsyncOSINT/13.0"}
     try:
         r = await client.get(url, params=params, headers=headers, timeout=3.0)
         data = r.json()
@@ -164,7 +164,7 @@ async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> lis
 
 async def fetch_hh_full_details(client: httpx.AsyncClient, vacancy_id: str) -> str:
     url = f"https://api.hh.ru/vacancies/{vacancy_id}"
-    headers = {"User-Agent": "AsyncOSINT/12.0"}
+    headers = {"User-Agent": "AsyncOSINT/13.0"}
     try:
         r = await client.get(url, headers=headers, timeout=2.5)
         data = r.json()
@@ -179,7 +179,7 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
     clean_q = CLEAN_HABR_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
-    headers = {"User-Agent": "AsyncOSINT/12.0"}
+    headers = {"User-Agent": "AsyncOSINT/13.0"}
     try:
         r = await client.get(url, params=params, headers=headers, timeout=3.0)
         data = r.json()
@@ -211,7 +211,7 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
     clean_q = CLEAN_HABR_RE.sub(" ", query).strip()
     url = "https://api.superjob.ru/2.0/vacancies/"
     params = {"keyword": clean_q, "count": count}
-    headers = {"User-Agent": "AsyncOSINT/12.0", "X-Api-App-Id": SUPERJOB_KEY}
+    headers = {"User-Agent": "AsyncOSINT/13.0", "X-Api-App-Id": SUPERJOB_KEY}
     try:
         r = await client.get(url, params=params, headers=headers, timeout=3.0)
         data = r.json()
@@ -238,7 +238,7 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
         return []
 
 
-# ----------------- ВЕБ-ПОИСК (DUCKDUCKGO В ПОТОКАХ) -----------------
+# ----------------- ВЕБ-ПОИСК В ПОТОКАХ -----------------
 def _sync_ddgs_search(search_query: str, count: int, is_tg: bool = False) -> list:
     jobs = []
     try:
@@ -276,13 +276,13 @@ async def fetch_niche_portals(query: str, count: int = 3) -> list:
     )
 
 
-# ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
+# ----------------- ОБРАБОТЧИКИ TELEGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Turbo)**\n\n"
-        "Отправьте обезличенный текст заявки/вакансии.\n"
-        "Бот проведёт асинхронный поиск по всем базам и вычислит конечного заказчика.",
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "Отправьте обезличенный текст заявки от агентства/посредника.\n"
+        "Бот проанализирует контекст задач, просканирует рынок и найдет конечного заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -294,27 +294,32 @@ async def handle_vacancy(message: Message):
 
     exact_shingle = extract_best_shingle(user_text)
 
-    prompt_kw = f"""Выдели ключевую роль и технологическое ядро.
-Сформируй ровно 2 запроса через точку с запятой:
-1. Роль для hh.ru с оператором NAME:(...). Например: NAME:("DevOps") или NAME:("C#").
-2. Стек из 2-3 инструментов. Например: 'Kubernetes Helm CI/CD' или 'Kafka Opensearch'.
-Выведи ТОЛЬКО 2 запроса через точку с запятой:
-{user_text[:400]}"""
+    # УЛУЧШЕННЫЙ ПРОМПТ №1: Анти-банальность и редкие связки
+    prompt_kw = f"""Ты — OSINT-аналитик. Твоя задача — извлечь из заявки маркеры, которые выведут на ОРИГИНАЛЬНОГО работодателя, а не на посредников.
 
-    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=35)
+ПРАВИЛА:
+1. ИСКЛЮЧИ грейды и общие слова: "Senior", "Middle", "Junior", "опыт", "разработка", "команда", "удаленно".
+2. Запрос 1 (Роль): Главная специализация для hh.ru строго через оператор NAME:(...). Пример: NAME:("DevOps") или NAME:("Системный аналитик").
+3. Запрос 2 (Уникальная связка стека): 2-3 термина, которые редко встречаются вместе, но есть в тексте (например: 'Minio OnPremise' или 'Kafka Opensearch Kubernetes').
+4. Запрос 3 (Специфика проекта/домен): Редкое словосочетание задач или продукта (например: 'траблшутинг инфраструктуры' или 'платформенные сервисы').
+
+Выведи ТОЛЬКО 3 запроса через точку с запятой в одну строку:
+{user_text[:600]}"""
+
+    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=55)
     queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
-    if not queries:
+    if not queries or len(queries) < 2:
         queries = fallback_extract_keywords(user_text)
 
-    tg_query = exact_shingle if exact_shingle else (queries[1] if len(queries) > 1 else queries[0])
-    niche_query = queries[1] if len(queries) > 1 else queries[0]
+    tg_query = exact_shingle if exact_shingle else queries[1]
+    niche_query = queries[2] if len(queries) > 2 else queries[1]
 
-    # Полностью асинхронный сбор через единый пул соединений
+    # Полностью асинхронный параллельный сбор через HTTPX
     async with httpx.AsyncClient(http2=True) as http_client:
         tasks = [
             fetch_hh(http_client, queries[0], 6),
-            fetch_habr(http_client, queries[1] if len(queries) > 1 else queries[0], 6),
-            fetch_superjob(http_client, queries[1] if len(queries) > 1 else queries[0], 4),
+            fetch_habr(http_client, queries[1], 6),
+            fetch_superjob(http_client, queries[1], 4),
             fetch_telegram_posts(tg_query, 3),
             fetch_niche_portals(niche_query, 3),
         ]
@@ -343,14 +348,23 @@ async def handle_vacancy(message: Message):
     ]
     vacancies_payload = "\n".join(compact_list)
 
-    prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
-Агентство прислало обезличенный запрос. Твоя задача — вычислить ТОП-3 прямых работодателей, у которых взят этот проект.
+    # УЛУЧШЕННЫЙ ПРОМПТ №2: Zero-Tolerance к несовпадениям и поиск почерка задач
+    prompt_match = f"""Ты — строгий OSINT-следователь по деанонимизации IT-заказчиков в аутстаффинге.
+Агентство скопировало бриф прямого клиента и стёрло название компании. Твоя цель — вскрыть первоисточник.
 
-ОРИГИНАЛЬНЫЙ ОБЕЗЛИЧЕННЫЙ ЗАПРОС:
-\"\"\"{user_text[:600]}\"\"\"
+ОРИГИНАЛЬНЫЙ БРИФ:
+\"\"\"{user_text[:800]}\"\"\"
 
 НАЙДЕННЫЕ ВАКАНСИИ И ПУБЛИКАЦИИ:
 {vacancies_payload}
+
+ЖЁСТКИЕ ПРАВИЛА ВЕРИФИКАЦИИ:
+1. ШТРАФ ЗА БАНАЛЬНОСТЬ: Совпадение только по базовым вещам (Linux, Git, Docker, SQL, REST) НЕ ДАЁТ права ставить статус прямого заказчика. За совпадение только общего стека — вероятность не выше 35%.
+2. МАРКЕР ПЕРВОИСТОЧНИКА: Ставь 🟢 Высокую вероятность (80-95%) ТОЛЬКО если совпадают:
+   - Специфические задачи (например, OnPrem + траблшутинг нетиповых окружений);
+   - Редкие связки компонентов (например, Minio + Opensearch + Yandex Cloud);
+   - Смысловые формулировки обязанностей (следы копирования оригинального текста).
+3. ОТСЕВ: Если в запросе DevOps, а вакансия системного администратора офиса — игнорируй такого кандидата.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
@@ -363,21 +377,22 @@ async def handle_vacancy(message: Message):
 🏛 **Источник:** [hh.ru / Хабр / SuperJob / Telegram / Finder.vc / VC.ru]
 
 🔍 **Факторы совпадения:**
-• [1-2 конкретных маркера: совпадение задач, терминов или архитектуры]
+• [Что конкретно совпало: редкие технологии, продуктовые задачи или дословные фразы]
+• [Почему это именно прямой заказчик, а не просто похожая вакансия]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Должность ЛПР или контакт]
-• **Болевая точка:** [Какую текущую проблему решает аутстафф]
-• **Первый контакт:** [Краткая фраза первого сообщения]
+• **К кому идти:** [Точная роль ЛПР: Head of Infrastructure, CTO, Lead DevOps]
+• **Болевая точка:** [Какая острая проектная боль видна в тексте]
+• **Первый контакт:** [Готовый 1-2 предложения хук для сообщения в Telegram/LinkedIn]
 ══════════════════════════════
 """
 
-    result_text, err = await call_groq_async(prompt_match, max_tokens=1500)
+    result_text, err = await call_groq_async(prompt_match, max_tokens=1600)
     if not result_text:
         await status_msg.edit_text(f"⚠️ Ошибка генерации: {err}")
         return
 
-    # Обогащение отчета ссылками на ЛПР
+    # Добавление прямых ссылок на ЛПР
     enhanced_lines = []
     current_company = ""
     for line in result_text.splitlines():
