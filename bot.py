@@ -4,29 +4,36 @@ import re
 import threading
 from urllib.parse import quote_plus
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import requests
+import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
-from groq import Groq
+from groq import AsyncGroq
+from duckduckgo_search import DDGS
 
-# ----------------- КЛЮЧИ -----------------
-TELEGRAM_BOT_TOKEN = "8982024680:AAGSIE8AbyboYoG1HcxLmI9-7ljX2JbTk7s"
-GROQ_API_KEY = "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"
-# ----------------------------------------
+# ----------------- КОНФИГУРАЦИЯ -----------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8982024680:AAGSIE8AbyboYoG1HcxLmI9-7ljX2JbTk7s")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
+SUPERJOB_KEY = "v3.r.137453308.2b27077a942fb8adcdba08488e08d669db756f70.9b015112521c7e90ef8c34fbc87e5b222fb2ea67"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
-groq_client = Groq(api_key=GROQ_API_KEY.strip())
+groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
-KNOWN_AGENCIES = [
+# Предкомпилированные регулярные выражения (ускоряют парсинг в разы)
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+WORD_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9\-]+")
+CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
+CLEAN_HABR_RE = re.compile(r'[^\w\s\+\#\.\-]')
+
+KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
     "агентство", "selecty", "ancor", "анкор", "кадры", "outstaff", "аутстафф",
     "personnel", "talent", "staff", "headhunting", "подбор персонала",
     "ibs", "icl", "aston", "bell integrator", "neoflex", "epam", "reksoft", "andersen"
-]
+)
 
-TECH_KEYWORDS = [
+TECH_KEYWORDS = (
     "c#", ".net", "asp.net", "python", "django", "fastapi", "flask",
     "java", "spring", "kotlin", "golang", "go", "php", "laravel",
     "javascript", "typescript", "react", "vue", "angular", "node.js",
@@ -34,9 +41,9 @@ TECH_KEYWORDS = [
     "qa", "тестировщик", "automation", "autotest", "selenium", "playwright",
     "data science", "ml", "системный аналитик", "бизнес-аналитик", "product manager",
     "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
-]
+)
 
-RUSSIAN_STOPWORDS = {
+RUSSIAN_STOPWORDS = frozenset({
     "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все", "она", "так",
     "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по", "только", "ее", "мне", "было",
     "вот", "от", "меня", "еще", "нет", "о", "из", "ему", "теперь", "когда", "даже", "ну", "вдруг",
@@ -44,15 +51,15 @@ RUSSIAN_STOPWORDS = {
     "вам", "ведь", "там", "потом", "себя", "ничего", "ей", "может", "они", "тут", "где", "есть",
     "надо", "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб", "без", "будет", "будто",
     "про", "при", "опыт", "работа", "работы", "знание", "понимание", "обязанности", "требования"
-}
+})
 
-
+# ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot is alive!")
+        self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
         pass
@@ -60,49 +67,20 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
-def _sync_call_groq(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
-    models = ["llama-3.1-8b-instant", "openai/gpt-oss-20b"]
-    last_err = ""
-    for model_name in models:
-        try:
-            res = groq_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
-                max_tokens=max_tokens,
-                timeout=12.0
-            )
-            content = res.choices[0].message.content
-            if content and len(content.strip()) > 0:
-                return content, ""
-        except Exception as e:
-            last_err = str(e)
-            continue
-    return "", last_err
-
-
-async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
-    """Асинхронный вызов Groq в отдельном потоке — бот никогда не блокируется."""
-    return await asyncio.to_thread(_sync_call_groq, prompt, max_tokens)
-
-
+# ----------------- УТИЛИТЫ -----------------
 def clean_html(raw_html: str) -> str:
-    clean = re.sub(r"<[^>]+>", " ", raw_html)
-    return " ".join(clean.split())
+    return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
 
 def extract_best_shingle(text: str, n_words: int = 4) -> str:
-    lines = text.split("\n")
     cleaned_phrases = []
-    for line in lines:
-        words = re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9\-]+", line.lower())
-        meaningful = [w for w in words if w not in RUSSIAN_STOPWORDS and len(w) > 2]
-        if len(meaningful) >= n_words:
-            cleaned_phrases.append(" ".join(meaningful[:n_words]))
+    for line in text.splitlines():
+        words = [w for w in WORD_RE.findall(line.lower()) if w not in RUSSIAN_STOPWORDS and len(w) > 2]
+        if len(words) >= n_words:
+            cleaned_phrases.append(" ".join(words[:n_words]))
     if cleaned_phrases:
         cleaned_phrases.sort(key=lambda p: sum(len(w) for w in p.split()), reverse=True)
         return f'"{cleaned_phrases[0]}"'
@@ -110,15 +88,12 @@ def extract_best_shingle(text: str, n_words: int = 4) -> str:
 
 
 def fallback_extract_keywords(text: str) -> list:
-    found = []
     text_lower = text.lower()
-    for tech in TECH_KEYWORDS:
-        if re.search(r"\b" + re.escape(tech) + r"\b", text_lower):
-            found.append(tech)
+    found = [tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)]
     if found:
         return [f"NAME:({found[0]})", " ".join(found[:3])]
     first_phrase = text.split("\n")[0][:30].strip()
-    return [first_phrase if first_phrase else "DevOps", "Kubernetes"]
+    return [first_phrase if first_phrase else "IT Вакансия", "Разработчик"]
 
 
 def is_agency(company_name: str) -> bool:
@@ -126,14 +101,47 @@ def is_agency(company_name: str) -> bool:
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-def fetch_hh(query: str, count: int = 8) -> list:
+def build_lead_osint_url(company_name: str) -> str:
+    clean_company = CLEAN_NAME_RE.sub("", company_name).strip()
+    target_role = 'CTO OR "Team Lead" OR "Head of Engineering" OR "Engineering Manager"'
+    query = f'site:linkedin.com/in "{clean_company}" ({target_role})'
+    return f"https://www.google.com/search?q={quote_plus(query)}"
+
+
+# ----------------- АСИНХРОННЫЙ LLM CLIENT -----------------
+async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
+    models = ("llama-3.1-8b-instant", "openai/gpt-oss-20b")
+    last_err = ""
+    for model_name in models:
+        try:
+            res = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=max_tokens
+                ),
+                timeout=11.0
+            )
+            content = res.choices[0].message.content
+            if content and content.strip():
+                return content, ""
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return "", last_err
+
+
+# ----------------- АСИНХРОННЫЕ ПАРСЕРЫ (HTTPX) -----------------
+async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "FastOSINTBot/10.0"}
-    jobs = []
+    headers = {"User-Agent": "AsyncOSINT/12.0"}
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=3.5).json()
-        for item in r.get("items", []):
+        r = await client.get(url, params=params, headers=headers, timeout=3.0)
+        data = r.json()
+        jobs = []
+        for item in data.get("items", []):
             company = item.get("employer", {}).get("name", "Не указана")
             if is_agency(company):
                 continue
@@ -149,32 +157,34 @@ def fetch_hh(query: str, count: int = 8) -> list:
                 "url": item.get("alternate_url"),
                 "desc": clean_html(desc),
             })
+        return jobs
     except Exception:
-        pass
-    return jobs
+        return []
 
 
-def fetch_hh_full_details(vacancy_id: str) -> str:
+async def fetch_hh_full_details(client: httpx.AsyncClient, vacancy_id: str) -> str:
     url = f"https://api.hh.ru/vacancies/{vacancy_id}"
-    headers = {"User-Agent": "FastOSINTBot/10.0"}
+    headers = {"User-Agent": "AsyncOSINT/12.0"}
     try:
-        r = requests.get(url, headers=headers, timeout=2.5).json()
-        raw_desc = r.get("description", "")
-        key_skills = " ".join([s.get("name", "") for s in r.get("key_skills", [])])
+        r = await client.get(url, headers=headers, timeout=2.5)
+        data = r.json()
+        raw_desc = data.get("description", "")
+        key_skills = " ".join([s.get("name", "") for s in data.get("key_skills", [])])
         return clean_html(f"{raw_desc} {key_skills}")[:350]
     except Exception:
         return ""
 
 
-def fetch_habr(query: str, count: int = 8) -> list:
-    clean_q = re.sub(r'[^\w\s\+\#\.\-]', ' ', query).strip()
+async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
+    clean_q = CLEAN_HABR_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
-    headers = {"User-Agent": "FastOSINTBot/10.0"}
-    jobs = []
+    headers = {"User-Agent": "AsyncOSINT/12.0"}
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=3.5).json()
-        for item in r.get("list", []):
+        r = await client.get(url, params=params, headers=headers, timeout=3.0)
+        data = r.json()
+        jobs = []
+        for item in data.get("list", []):
             company = item.get("company", {}).get("title", "Не указана")
             if is_agency(company):
                 continue
@@ -192,29 +202,25 @@ def fetch_habr(query: str, count: int = 8) -> list:
                 "url": full_url,
                 "desc": f"Стек: {skills}",
             })
+        return jobs
     except Exception:
-        pass
-    return jobs
+        return []
 
 
-def fetch_superjob(query: str, count: int = 5) -> list:
-    clean_q = re.sub(r'[^\w\s\+\#\.\-]', ' ', query).strip()
+async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
+    clean_q = CLEAN_HABR_RE.sub(" ", query).strip()
     url = "https://api.superjob.ru/2.0/vacancies/"
     params = {"keyword": clean_q, "count": count}
-    headers = {
-        "User-Agent": "FastOSINTBot/10.0",
-        "X-Api-App-Id": "v3.r.137453308.2b27077a942fb8adcdba08488e08d669db756f70.9b015112521c7e90ef8c34fbc87e5b222fb2ea67"
-    }
-    jobs = []
+    headers = {"User-Agent": "AsyncOSINT/12.0", "X-Api-App-Id": SUPERJOB_KEY}
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=3.5).json()
-        for item in r.get("objects", []):
-            client = item.get("client", {})
-            company = client.get("title", "Не указана")
+        r = await client.get(url, params=params, headers=headers, timeout=3.0)
+        data = r.json()
+        jobs = []
+        for item in data.get("objects", []):
+            company = item.get("client", {}).get("title", "Не указана")
             if is_agency(company):
                 continue
-            p_from = item.get("payment_from", 0)
-            p_to = item.get("payment_to", 0)
+            p_from, p_to = item.get("payment_from", 0), item.get("payment_to", 0)
             cur = item.get("currency", "")
             sal_str = f"{p_from if p_from else ''} - {p_to if p_to else ''} {cur}".strip() if (p_from or p_to) else "не указана"
             desc = clean_html(item.get("candidat", "") or item.get("work", ""))
@@ -227,49 +233,56 @@ def fetch_superjob(query: str, count: int = 5) -> list:
                 "url": item.get("link", ""),
                 "desc": desc[:250],
             })
+        return jobs
     except Exception:
-        pass
-    return jobs
+        return []
 
 
-def fetch_telegram_posts(query: str, count: int = 3) -> list:
+# ----------------- ВЕБ-ПОИСК (DUCKDUCKGO В ПОТОКАХ) -----------------
+def _sync_ddgs_search(search_query: str, count: int, is_tg: bool = False) -> list:
     jobs = []
     try:
-        from duckduckgo_search import DDGS
-        ddgs = DDGS(timeout=3.5)
-        search_query = f"site:t.me {query} вакансия"
-        results = list(ddgs.text(search_query, max_results=count))
-        for res in results:
-            url = res.get("href", "")
-            if "t.me/" in url:
-                channel_match = re.search(r"t\.me/([^/]+)", url)
-                channel_name = f"@{channel_match.group(1)}" if channel_match else "Telegram"
-                jobs.append({
-                    "id": None,
-                    "source": f"Telegram ({channel_name})",
-                    "title": res.get("title", "")[:50],
-                    "company": channel_name,
-                    "salary": "в посте",
-                    "url": url,
-                    "desc": res.get("body", "")[:250],
-                })
+        with DDGS(timeout=3.5) as ddgs:
+            results = list(ddgs.text(search_query, max_results=count))
+            for res in results:
+                url, title, body = res.get("href", ""), res.get("title", ""), res.get("body", "")
+                if is_tg and "t.me/" in url:
+                    m = re.search(r"t\.me/([^/]+)", url)
+                    c_name = f"@{m.group(1)}" if m else "Telegram"
+                    jobs.append({
+                        "id": None, "source": f"Telegram ({c_name})", "title": title[:50],
+                        "company": c_name, "salary": "в посте", "url": url, "desc": body[:250]
+                    })
+                elif not is_tg:
+                    domain = "Finder.vc" if "finder.vc" in url else "GeekLink" if "geeklink.io" in url else "VC.ru"
+                    cand = title.split("—")[0].split("-")[0].split(":")[0].strip()
+                    if not is_agency(cand):
+                        jobs.append({
+                            "id": None, "source": domain, "title": title[:50],
+                            "company": cand, "salary": "в источнике", "url": url, "desc": body[:250]
+                        })
     except Exception:
         pass
     return jobs
 
 
-def build_lead_osint_url(company_name: str) -> str:
-    clean_company = re.sub(r'[\'\"«»@]', '', company_name).strip()
-    target_role = "CTO OR \"Team Lead\" OR \"Head of DevOps\" OR \"Engineering Manager\""
-    query = f'site:linkedin.com/in "{clean_company}" ({target_role})'
-    return f"https://www.google.com/search?q={quote_plus(query)}"
+async def fetch_telegram_posts(query: str, count: int = 3) -> list:
+    return await asyncio.to_thread(_sync_ddgs_search, f"site:t.me {query} вакансия", count, True)
 
 
+async def fetch_niche_portals(query: str, count: int = 3) -> list:
+    return await asyncio.to_thread(
+        _sync_ddgs_search, f'(site:vc.ru/tribuna OR site:finder.vc OR site:geeklink.io) "{query}" вакансия', count, False
+    )
+
+
+# ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте обезличенный текст заявки. Бот просканирует источники и определит прямого заказчика.",
+        "💼 **Multi-Source OSINT Lead Hunter (Turbo)**\n\n"
+        "Отправьте обезличенный текст заявки/вакансии.\n"
+        "Бот проведёт асинхронный поиск по всем базам и вычислит конечного заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -277,13 +290,13 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
+    status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram, VC, Finder)...")
 
     exact_shingle = extract_best_shingle(user_text)
 
     prompt_kw = f"""Выдели ключевую роль и технологическое ядро.
 Сформируй ровно 2 запроса через точку с запятой:
-1. Роль для hh.ru с оператором NAME:(...). Например: NAME:("DevOps") или NAME:("SRE").
+1. Роль для hh.ru с оператором NAME:(...). Например: NAME:("DevOps") или NAME:("C#").
 2. Стек из 2-3 инструментов. Например: 'Kubernetes Helm CI/CD' или 'Kafka Opensearch'.
 Выведи ТОЛЬКО 2 запроса через точку с запятой:
 {user_text[:400]}"""
@@ -293,39 +306,41 @@ async def handle_vacancy(message: Message):
     if not queries:
         queries = fallback_extract_keywords(user_text)
 
-    tg_search_query = exact_shingle if exact_shingle else queries[1] if len(queries) > 1 else queries[0]
+    tg_query = exact_shingle if exact_shingle else (queries[1] if len(queries) > 1 else queries[0])
+    niche_query = queries[1] if len(queries) > 1 else queries[0]
 
-    tasks = [
-        asyncio.to_thread(fetch_hh, queries[0], 6),
-        asyncio.to_thread(fetch_habr, queries[1] if len(queries) > 1 else queries[0], 6),
-        asyncio.to_thread(fetch_superjob, queries[1] if len(queries) > 1 else queries[0], 4),
-        asyncio.to_thread(fetch_telegram_posts, tg_search_query, 3),
-    ]
+    # Полностью асинхронный сбор через единый пул соединений
+    async with httpx.AsyncClient(http2=True) as http_client:
+        tasks = [
+            fetch_hh(http_client, queries[0], 6),
+            fetch_habr(http_client, queries[1] if len(queries) > 1 else queries[0], 6),
+            fetch_superjob(http_client, queries[1] if len(queries) > 1 else queries[0], 4),
+            fetch_telegram_posts(tg_query, 3),
+            fetch_niche_portals(niche_query, 3),
+        ]
+        results = await asyncio.gather(*tasks)
 
-    results = await asyncio.gather(*tasks)
-    raw_vacancies = [item for sublist in results for item in sublist]
-    unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
+        raw_vacancies = [item for sublist in results for item in sublist]
+        unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
-    if not unique_vacancies:
-        await status_msg.edit_text("❌ Вакансии работодателей не найдены. Попробуйте передать текст с более конкретным описанием стека.")
-        return
+        if not unique_vacancies:
+            await status_msg.edit_text("❌ Вакансии работодателей не найдены. Попробуйте передать текст с более конкретным описанием стека.")
+            return
 
-    # Дозагрузка полных описаний топ-3 с hh.ru
-    hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:3]
-    if hh_candidates:
-        full_text_tasks = [asyncio.to_thread(fetch_hh_full_details, v["id"]) for v in hh_candidates]
-        full_texts = await asyncio.gather(*full_text_tasks)
-        for cand, full_desc in zip(hh_candidates, full_texts):
-            if full_desc:
-                cand["desc"] = full_desc
+        # Дозагрузка полных описаний hh.ru в том же пуле
+        hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:3]
+        if hh_candidates:
+            full_texts = await asyncio.gather(*[fetch_hh_full_details(http_client, v["id"]) for v in hh_candidates])
+            for cand, full_desc in zip(hh_candidates, full_texts):
+                if full_desc:
+                    cand["desc"] = full_desc
 
     await status_msg.edit_text(f"🧠 Скоринг {len(unique_vacancies)} позиций через Groq LPU...")
 
-    compact_list = []
-    for idx, v in enumerate(unique_vacancies[:10], 1):
-        compact_list.append(
-            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:250]}"
-        )
+    compact_list = [
+        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:250]}"
+        for idx, v in enumerate(unique_vacancies[:12], 1)
+    ]
     vacancies_payload = "\n".join(compact_list)
 
     prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
@@ -334,7 +349,7 @@ async def handle_vacancy(message: Message):
 ОРИГИНАЛЬНЫЙ ОБЕЗЛИЧЕННЫЙ ЗАПРОС:
 \"\"\"{user_text[:600]}\"\"\"
 
-НАЙДЕННЫЕ ВАКАНСИИ И ПОСТЫ:
+НАЙДЕННЫЕ ВАКАНСИИ И ПУБЛИКАЦИИ:
 {vacancies_payload}
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
@@ -345,10 +360,10 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Вакансия/Пост:** [Открыть источник](URL)
-🏛 **Источник:** [hh.ru / Хабр Карьера / SuperJob / Telegram]
+🏛 **Источник:** [hh.ru / Хабр / SuperJob / Telegram / Finder.vc / VC.ru]
 
 🔍 **Факторы совпадения:**
-• [1-2 конкретных маркера: совпадение редких задач, терминов или архитектуры]
+• [1-2 конкретных маркера: совпадение задач, терминов или архитектуры]
 
 💡 **Стратегия выхода для сейлза:**
 • **К кому идти:** [Должность ЛПР или контакт]
@@ -358,16 +373,14 @@ async def handle_vacancy(message: Message):
 """
 
     result_text, err = await call_groq_async(prompt_match, max_tokens=1500)
-
     if not result_text:
         await status_msg.edit_text(f"⚠️ Ошибка генерации: {err}")
         return
 
-    lines = result_text.split("\n")
+    # Обогащение отчета ссылками на ЛПР
     enhanced_lines = []
     current_company = ""
-
-    for line in lines:
+    for line in result_text.splitlines():
         if "🏢 **КОМПАНИЯ:**" in line:
             current_company = line.replace("🏢 **КОМПАНИЯ:**", "").strip()
             enhanced_lines.append(line)
@@ -378,8 +391,7 @@ async def handle_vacancy(message: Message):
         else:
             enhanced_lines.append(line)
 
-    final_header = "🎯 **ОТЧЁТ ПО ДЕАНОНИМИЗАЦИИ ПРЯМОГО ЗАКАЗЧИКА**\n\n"
-    final_output = final_header + "\n".join(enhanced_lines)
+    final_output = "🎯 **ОТЧЁТ ПО ДЕАНОНИМИЗАЦИИ ПРЯМОГО ЗАКАЗЧИКА**\n\n" + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
         parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
