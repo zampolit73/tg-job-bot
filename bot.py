@@ -15,7 +15,7 @@ dp = Dispatcher()
 
 
 def call_ai(prompt: str) -> str:
-    """Запрос через OpenRouter к 100% активным бесплатным моделям."""
+    """Запрос через OpenRouter с автомаршрутизацией по бесплатным моделям."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY.strip()}",
@@ -24,23 +24,22 @@ def call_ai(prompt: str) -> str:
         "X-Title": "JobHunterBot",
     }
 
-    # Постоянно поддерживаемые бесплатные модели на OpenRouter
-    free_models = [
-        "deepseek/deepseek-chat:free",
-        "deepseek/deepseek-r1:free",
+    # Специальные авто-роуты OpenRouter, которые сами выбирают живую бесплатную модель
+    models_to_try = [
+        "openrouter/free",
+        "openrouter/auto",
         "google/gemma-2-9b-it:free",
-        "mistralai/mistral-7b-instruct:free",
-        "meta-llama/llama-3.2-3b-instruct:free",
+        "mistralai/mistral-small-3-instruct:free",
     ]
 
     last_error = ""
-    for model in free_models:
+    for model in models_to_try:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
         }
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=40)
+            r = requests.post(url, headers=headers, json=payload, timeout=35)
             data = r.json()
             if "choices" in data and len(data["choices"]) > 0:
                 return data["choices"][0]["message"]["content"]
@@ -120,7 +119,7 @@ def fetch_habr(query: str, count: int = 8) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет!\n\n"
-        "Отправь мне текст любой вакансии, а я найду похожие предложения на **hh.ru** и **Хабр Карьере**,\n"
+        "Отправь мне текст вакансии, а я найду похожие предложения на **hh.ru** и **Хабр Карьере**,\n"
         "рассчитаю **процент совпадения** и оценю **вероятность компании**!"
     )
 
@@ -133,8 +132,8 @@ async def handle_vacancy(message: Message):
     )
 
     keywords_prompt = (
-        f"Выдели 2-3 ключевых слова для поиска вакансий (роль и стек, например 'Python Django' или 'DevOps'). "
-        f"В ответе выведи ТОЛЬКО эти слова:\n{user_text}"
+        f"Выдели 2-3 ключевых поисковых слова для вакансии (роль и стек, например 'Python Django'). "
+        f"Выведи ТОЛЬКО эти слова, без лишних символов:\n{user_text}"
     )
     kw_result = call_ai(keywords_prompt)
     search_query = (
@@ -151,7 +150,7 @@ async def handle_vacancy(message: Message):
         return
 
     matching_prompt = f"""
-Ты — HR-эксперт.
+Ты — эксперт по подбору персонала.
 Исходная вакансия:
 {user_text}
 
