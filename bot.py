@@ -44,21 +44,18 @@ KNOWN_AGENCIES = (
     "ibs", "icl", "aston", "bell integrator", "neoflex", "epam", "reksoft", "andersen"
 )
 
-# ----------------- ВЕСОВАЯ ТАКСОНОМИЯ СТЕКА (WEIGHTED SCORING) -----------------
-# Вес 1.0 — Базовый шум (встречается везде)
+# ----------------- ВЕСОВАЯ ТАКСОНОМИЯ СТЕКА -----------------
 TIER1_COMMON = {
     "git", "linux", "docker", "rest", "api", "sql", "ci/cd", "ci", "cd",
     "python", "java", "c#", "javascript", "bash"
 }
 
-# Вес 2.5 — Профильный рабочий стек
 TIER2_SPECIALIZED = {
     "kubernetes", "k8s", "helm", "ansible", "terraform", "postgresql", "postgres",
     "golang", "go", "spring", "fastapi", "django", "typescript", "react", "vue",
     "angular", "node.js", "redis", "rabbitmq", "kafka", "playwright", "selenium"
 }
 
-# Вес 5.0 — Архитектурные маркеры и специфика окружения (высочайшая точность)
 TIER3_RARE_MARKERS = {
     "onprem", "on-premise", "bare-metal", "ceph", "victoriametrics", "clickhouse",
     "opensearch", "istio", "argocd", "flux", "vault", "nomad", "dwh", "greenplum",
@@ -120,14 +117,14 @@ def extract_weighted_tokens(text: str) -> dict[str, float]:
     return tokens
 
 
-def calculate_weighted_similarity(source_weights: dict[str, float], candidate_text: str) -> float:
+# Асимметричный скоринг покрытия требований (Asymmetric Containment)
+def calculate_asymmetric_containment(source_weights: dict[str, float], candidate_text: str) -> float:
     if not source_weights:
         return 0.0
     candidate_weights = extract_weighted_tokens(candidate_text)
-    common_keys = set(source_weights.keys()).intersection(candidate_weights.keys())
-    matched_score = sum(source_weights[k] for k in common_keys)
-    total_possible = sum(source_weights.values())
-    return matched_score / total_possible if total_possible > 0 else 0.0
+    matched_score = sum(source_weights[k] for k in source_weights if k in candidate_weights)
+    total_source_weight = sum(source_weights.values())
+    return matched_score / total_source_weight if total_source_weight > 0 else 0.0
 
 
 # ----------------- GROQ CLIENT -----------------
@@ -155,7 +152,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
 
 
 # ----------------- ОТКРЫТЫЕ ИСТОЧНИКИ ВАКАНСИЙ -----------------
-async def fetch_hh_rss(client: httpx.AsyncClient, query: str, count: int = 8, phrase_mode: bool = False) -> list:
+async def fetch_hh_rss(client: httpx.AsyncClient, query: str, count: int = 8, phrase_mode: bool = False, is_artifact: bool = False) -> list:
     q_str = f'"{query}"' if phrase_mode else query
     url = f"https://hh.ru/rss/vacancies?text={quote_plus(q_str)}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -183,7 +180,8 @@ async def fetch_hh_rss(client: httpx.AsyncClient, query: str, count: int = 8, ph
                 "salary": "в описании",
                 "url": link,
                 "desc": desc[:350],
-                "is_ngram": phrase_mode
+                "is_ngram": phrase_mode,
+                "is_artifact_hit": is_artifact
             })
         return jobs
     except Exception:
@@ -215,7 +213,8 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
                 "salary": sal_str,
                 "url": full_url,
                 "desc": f"Стек: {skills}",
-                "is_ngram": False
+                "is_ngram": False,
+                "is_artifact_hit": False
             })
         return jobs
     except Exception:
@@ -248,7 +247,8 @@ async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 6) 
                 "salary": sal_str,
                 "url": vac.get("vac_url", "https://trudvsem.ru"),
                 "desc": f"{requirement} {duty}"[:350],
-                "is_ngram": False
+                "is_ngram": False,
+                "is_artifact_hit": False
             })
         return jobs
     except Exception:
@@ -284,7 +284,8 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
                 "salary": sal_str,
                 "url": item.get("link", ""),
                 "desc": desc[:300],
-                "is_ngram": False
+                "is_ngram": False,
+                "is_artifact_hit": False
             })
         return jobs
     except Exception:
@@ -307,7 +308,8 @@ async def _scan_single_channel(channel: str, search_term: str) -> list:
                     "salary": "в посте",
                     "url": post_url,
                     "desc": post_text[:300],
-                    "is_ngram": False
+                    "is_ngram": False,
+                    "is_artifact_hit": False
                 })
     except Exception:
         pass
@@ -329,8 +331,8 @@ async def search_telegram_native(search_term: str) -> list:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Pro Scorer)**\n\n"
-        "Отправьте бриф вакансии. Бот выполнит каскадный поиск по открытым базам с взвешенным скорингом редких маркеров.",
+        "💼 **Multi-Source OSINT Lead Hunter (Artifact & Containment Edition)**\n\n"
+        "Отправьте бриф вакансии. Бот использует детекцию HR-артефактов и асимметричный скоринг урезанных брифов.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -338,25 +340,27 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("⚡️ Каскадный анализ текста и извлечение маркеров...")
+    status_msg = await message.answer("⚡️ Сканирование на лексические артефакты и маркеры...")
 
-    prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 4 поисковых параметра через точку с запятой в одну строку:
+    prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 5 параметров через точку с запятой в одну строку:
 1. Должность без минус-слов. Пример: DevOps инженер
-2. 2-3 ключевые технологии. Пример: Kubernetes Ansible Terraform
-3. 1 редкий маркер окружения/инфраструктуры (Tier 3). Пример: OnPrem или Ceph или ClickHouse
-4. Уникальная N-грамма: дословная фраза из 3-4 слов из блока задач/требований (без кавычек). Пример: миграция в закрытый контур
+2. 2-3 ключевые технологии через пробел. Пример: Kubernetes Ansible Terraform
+3. 1 редкий маркер окружения/инфраструктуры. Пример: OnPrem или Ceph
+4. Уникальная N-грамма задач (3-4 слова из обязанностей). Пример: миграция в закрытый контур
+5. HR-артефакт (2-4 слова: условия, техника, специфика бенефитов или ДМС/оформления). Пример: Mac M3 на выбор ИЛИ ДМС со стоматологией
 Текст:
-{user_text[:800]}"""
+{user_text[:900]}"""
 
-    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=65)
+    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=85)
     queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
     
     role_query = queries[0] if len(queries) > 0 else "Разработчик"
     stack_query = queries[1] if len(queries) > 1 else "Kubernetes"
     rare_term = queries[2] if len(queries) > 2 else stack_query.split()[0]
     ngram_phrase = queries[3] if len(queries) > 3 else ""
+    hr_artifact = queries[4] if len(queries) > 4 else ""
 
-    await status_msg.edit_text("⚡️ Запуск каскадных поисковых волн...")
+    await status_msg.edit_text("⚡️ Запуск каскадных поисковых волн и проверка копипаста...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
@@ -367,9 +371,13 @@ async def handle_vacancy(message: Message):
             search_telegram_native(rare_term),
         ]
 
-        # Каскадная Волна 1: Точный поиск N-граммы
+        # Каскадная Волна 1: Точный поиск N-граммы задач
         if len(ngram_phrase.split()) >= 3:
             tasks.append(fetch_hh_rss(http_client, ngram_phrase, 5, phrase_mode=True))
+
+        # Каскадная Волна 2: Точечный поиск по HR-артефакту (условия / бенефиты)
+        if len(hr_artifact.split()) >= 2:
+            tasks.append(fetch_hh_rss(http_client, hr_artifact, 5, phrase_mode=True, is_artifact=True))
 
         try:
             results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=4.5)
@@ -380,56 +388,55 @@ async def handle_vacancy(message: Message):
     unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте уточнить ключевой стек.")
+        await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте передать более развернутый текст брифа.")
         return
 
-    # Локальный взвешенный скоринг
+    # Асимметричный скоринг покрытия урезанного брифа (Asymmetric Containment)
     source_weights = extract_weighted_tokens(user_text)
     for vac in unique_vacancies:
-        base_score = calculate_weighted_similarity(source_weights, vac["title"] + " " + vac["desc"])
-        ngram_bonus = 0.6 if vac.get("is_ngram") else 0.0
-        vac["final_rank"] = base_score + ngram_bonus
+        containment_score = calculate_asymmetric_containment(source_weights, vac["title"] + " " + vac["desc"])
+        ngram_bonus = 0.5 if vac.get("is_ngram") else 0.0
+        artifact_bonus = 0.6 if vac.get("is_artifact_hit") else 0.0
+        vac["final_rank"] = containment_score + ngram_bonus + artifact_bonus
 
     unique_vacancies.sort(key=lambda x: x["final_rank"], reverse=True)
     top_candidates = unique_vacancies[:7]
 
-    await status_msg.edit_text(f"🧠 Глубокий 3D-скоринг ТОП-{len(top_candidates)} позиций...")
+    await status_msg.edit_text(f"🧠 Глубокий скоринг ТОП-{len(top_candidates)} позиций в Groq LPU...")
 
     compact_list = [
-        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Совпадение N-граммы: {'ДА' if v.get('is_ngram') else 'НЕТ'} | Описание: {v['desc'][:260]}"
+        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Совпадение N-граммы: {'ДА' if v.get('is_ngram') else 'НЕТ'} | Совпадение условий: {'ДА' if v.get('is_artifact_hit') else 'НЕТ'} | Описание: {v['desc'][:260]}"
         for idx, v in enumerate(top_candidates, 1)
     ]
     vacancies_payload = "\n".join(compact_list)
 
     prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
-Агентство скопировало бриф прямого работодателя. Твоя задача — вычислить ТОП-3 компаний с глубокой 3D-оценкой.
+Агентство скопировало бриф прямого работодателя и вырезало часть текста. Твоя цель — вычислить ТОП-3 оригинальных заказчиков.
 
-ОРИГИНАЛЬНЫЙ БРИФ:
+ОРИГИНАЛЬНЫЙ БРИФ АГЕНТСТВА:
 \"\"\"{user_text[:800]}\"\"\"
 
 КАНДИДАТЫ ДЛЯ АНАЛИЗА:
 {vacancies_payload}
 
-ПРАВИЛА ОЦЕНКИ ПО 3 ПРОЕКЦИЯМ:
-1. Совпадение стека: оценивай не базовые инструменты (Docker, Git), а профильные (Tier 2/3).
-2. Архитектурная задача: совпадает ли цель (миграция, закрытый контур, highload, разработка с нуля)?
-3. Инфраструктурные ограничения: тип среды (OnPrem/Cloud/Hybrid, требования регуляторов).
-Если совпала N-грамма (цитата задач) — это 90-98% вероятности оригинала.
+ПРАВИЛА ОЦЕНКИ:
+1. Если совпало 'Совпадение N-граммы: ДА' или 'Совпадение условий: ДА' — это 92-99% вероятности оригинала (прямой копипаст).
+2. Помни, что бриф агентства короче оригинала: если вакансия работодателя включает в себя ВСЕ требования брифа, ставь высокий скор.
+3. Отсекай кадровые агентства.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании или канал]
-🎯 **Общий скор:** [XX]%
-🎲 **Вероятность оригинала:** [🟢 Высокая (85-98%) / 🟡 Средняя (55-80%) / 🟠 Косвенная (30-50%)]
+🎯 **Покрытие требований брифа:** [XX]%
+🎲 **Вероятность статуса заказчика:** [🟢 Высокая (85-99%) / 🟡 Средняя (55-80%) / 🟠 Косвенная (30-50%)]
 📌 **Позиция:** [Название вакансии]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник](URL)
 🏛 **Источник:** [Хабр / Работа России / hh.ru / SuperJob / Telegram]
 
-📊 **3D-Анализ соответствия:**
-• **Стек и инструменты:** [Совпадение профильных технологий]
-• **Проектная задача:** [Что совпало по обязанностям/целям проекта]
-• **Инфраструктура/Контур:** [Специфика окружения: OnPrem, облака, финтех и т.д.]
+📊 **Факторы деанонимизации:**
+• **Стек и покрытие:** [Насколько полно вакансия закрывает бриф]
+• **Копипаст-маркеры:** [Совпали ли дословные формулировки задач или условия работы]
 
 💡 **Стратегия выхода для сейлза:**
 • **К кому идти:** [Точная роль ЛПР: Head of Infrastructure, CTO, Lead DevOps]
