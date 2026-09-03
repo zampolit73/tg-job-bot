@@ -6,6 +6,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
+from aiogram.enums import ParseMode
 from groq import Groq
 
 # ----------------- КЛЮЧИ -----------------
@@ -51,7 +52,6 @@ def run_health_server():
 
 
 def call_groq_safe(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
-    """Вызов актуальных рабочих моделей Groq."""
     models = [
         "openai/gpt-oss-20b",
         "qwen/qwen3.6-27b",
@@ -92,7 +92,6 @@ def is_agency(company_name: str) -> bool:
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-# 1. HeadHunter API
 def fetch_hh(query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
@@ -120,7 +119,6 @@ def fetch_hh(query: str, count: int = 8) -> list:
     return jobs
 
 
-# 2. Хабр Карьера API
 def fetch_habr(query: str, count: int = 8) -> list:
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": query, "per_page": count}
@@ -150,7 +148,6 @@ def fetch_habr(query: str, count: int = 8) -> list:
     return jobs
 
 
-# 3. Веб-поиск
 def fetch_web_safe(query: str, count: int = 3) -> list:
     jobs = []
     try:
@@ -177,22 +174,26 @@ def fetch_web_safe(query: str, count: int = 3) -> list:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source B2B Lead Finder**\n\n"
-        "Отправьте мне текст любой вакансии.\n"
-        "Я найду прямых работодателей, исключу кадровые агентства и сформирую рекомендации для выхода на ЛПР."
+        "💼 **OSINT B2B Lead Finder**\n\n"
+        "Отправьте мне обезличенный текст заявки/вакансии.\n"
+        "Я просканирую рынок, определю вероятного конечного заказчика и подготовлю структуру для выхода сейлза.",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("🕵️ **Шаг 1/3:** Выделяю маркеры проекта и поисковые связки...")
+    status_msg = await message.answer("🔍 **Этап 1/3:** Выделяю ключевой стек и уникальные поисковые токены...")
 
-    prompt_kw = f"""Выдели ключевую роль, стек и уникальные термины.
-Сформируй ровно 2 поисковых запроса (по 2-3 слова).
-Пример: 'Аналитик дашборды; промодвижок витрины' или 'C# ASP.NET; REST API'.
-Выведи ТОЛЬКО 2 фразы через точку с запятой:
-{user_text[:500]}"""
+    # Улучшенный промпт генерации запросов: акцент на редких сущностях
+    prompt_kw = f"""Ты — специалист по поиску в базах вакансий (hh.ru, Хабр).
+Проанализируй текст и выдели 2 точных поисковых запроса (по 2-3 слова).
+Запрос 1 (Стек): главная роль + 1-2 обязательные технологии (например: 'C# ASP.NET' или 'Системный аналитик BPMN').
+Запрос 2 (Уникальный маркер): редкие термины, отражающие специфику задач (например: 'промодвижок витрины' или 'highload clickhouse' или 'микросервисы gRPC').
+
+Выведи ТОЛЬКО эти два запроса через точку с запятой, без кавычек и пояснений:
+{user_text[:600]}"""
 
     kw_res, _ = call_groq_safe(prompt_kw, max_tokens=50)
     queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
@@ -200,62 +201,76 @@ async def handle_vacancy(message: Message):
         queries = fallback_extract_keywords(user_text)
 
     await status_msg.edit_text(
-        f"🔍 **Шаг 2/3:** Ищу прямые вакансии по маркерам: `{', '.join(queries[:2])}`..."
+        f"🌐 **Этап 2/3:** Сканирую базы работодателей по ключам:\n`{queries[0]}` | `{queries[1] if len(queries) > 1 else ''}`..."
     )
 
     raw_vacancies = []
     for q in queries[:2]:
-        raw_vacancies.extend(fetch_hh(q, count=6))
-        raw_vacancies.extend(fetch_habr(q, count=6))
+        raw_vacancies.extend(fetch_hh(q, count=7))
+        raw_vacancies.extend(fetch_habr(q, count=7))
         raw_vacancies.extend(fetch_web_safe(q, count=2))
 
     unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Не удалось найти прямые вакансии. Попробуйте передать текст с более четким названием технологий.")
+        await status_msg.edit_text("❌ Не удалось найти прямые вакансии. Попробуйте передать текст с более конкретным описанием стека.")
         return
 
-    await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} предложений и вычисляю прямого заказчика...")
+    await status_msg.edit_text(f"📊 **Этап 3/3:** Скоринг и подготовка аналитики по {len(unique_vacancies)} вакансиям...")
 
     compact_list = []
-    for idx, v in enumerate(unique_vacancies[:10], 1):
+    for idx, v in enumerate(unique_vacancies[:12], 1):
         compact_list.append(
-            f"{idx}. {v['company']} | {v['title']} | {v['source']} | URL: {v['url']} | Инфо: {v['desc']}"
+            f"[{idx}] Компания: {v['company']} | Роль: {v['title']} | Источник: {v['source']} | URL: {v['url']} | Описание: {v['desc']}"
         )
     vacancies_payload = "\n".join(compact_list)
 
-    prompt_match = f"""Ты — OSINT-аналитик сейлз-команды в IT-аутстаффинге.
-ОБЕЗЛИЧЕННЫЙ ЗАПРОС КЛИЕНТА (ОТ АГЕНТСТВА/КОНКУРЕНТА):
+    # Улучшенный промпт оформления: строгий OSINT-формат карточек
+    prompt_match = f"""Ты — ведущий OSINT-аналитик агентства IT-аутстаффинга.
+ИСХОДНЫЙ ТЕКСТ ЗАПРОСА КЛИЕНТА:
 \"\"\"{user_text[:800]}\"\"\"
 
-НАЙДЕННЫЕ ВАКАНСИИ ПРЯМЫХ КОМПАНИЙ:
+СПИСОК НАЙДЕННЫХ ВАКАНСИЙ РАБОТОДАТЕЛЕЙ:
 {vacancies_payload}
 
 ЗАДАЧА:
-Вычисли ТОП-3 компаний, которые с наибольшей вероятностью являются прямым конечным заказчиком или имеют идентичную горящую потребность.
+Выбери ТОП-3 наиболее вероятных прямых заказчиков. 
+Оформи вывод строго по шаблону ниже для каждого кандидата. Используй аккуратную разметку и разделители.
 
-Формат для каждой компании:
-🎯 **[Компания]** — Вероятность совпадения: **[X]%**
-🔹 Должность: [Название вакансии]
-🌐 Источник: [hh.ru / Хабр Карьера / Веб-поиск] | 💰 Зарплата: [Вилка или 'не указана']
-🔗 Ссылка: [URL]
-🕵️ **Маркеры совпадения:** (2 конкретных факта: почему это они, совпадение терминов/задач/стека)
-💡 **Как зайти сейлзу:** (кому писать и с каким оффером обращаться)
+---
+🏢 **[Название Компании]** (Вероятность: **XX%**)
+📌 **Вакансия:** [Название должности]
+💰 **Зарплатная вилка:** [Вилка или 'По договоренности']
+🔗 **Ссылка:** [Открыть вакансию](URL)
+🏛 **Источник:** [hh.ru / Хабр / Веб]
+
+🔍 **Факты совпадения:**
+* [Конкретное совпадение по технологиям или фреймворкам]
+* [Совпадение по продукту, задачам или терминологии из текста]
+
+🎯 **Стратегия захода для сейлза:**
+* **Кому писать:** [Роль ЛПР: CTO, Head of QA, Head of Analytics, Team Lead]
+* **Болевая точка:** [Какую проблему решает аутстафф в этом проекте]
+* **Оффер:** [Короткая фраза первого контакта]
+---
 """
 
-    result_text, err = call_groq_safe(prompt_match, max_tokens=1500)
+    result_text, err = call_groq_safe(prompt_match, max_tokens=1700)
     
     if not result_text:
         await status_msg.edit_text(f"⚠️ Ошибка вызова Groq API: {err}")
         return
 
-    if len(result_text) > 4000:
-        parts = [result_text[i:i+4000] for i in range(0, len(result_text), 4000)]
-        await status_msg.edit_text(parts[0])
+    # Заголовок отчёта
+    final_output = "📋 **РЕЗУЛЬТАТЫ OSINT-АНАЛИЗА ЗАКАЗЧИКА**\n\n" + result_text
+
+    if len(final_output) > 4000:
+        parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
+        await status_msg.edit_text(parts[0], parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
         for p in parts[1:]:
-            await message.answer(p)
+            await message.answer(p, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     else:
-        await status_msg.edit_text(result_text)
+        await status_msg.edit_text(final_output, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
 async def main():
