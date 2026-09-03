@@ -4,6 +4,7 @@ import re
 import threading
 from urllib.parse import quote_plus
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import defusedxml.ElementTree as ET
 import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
@@ -35,8 +36,6 @@ if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
 CLEAN_QUERY_RE = re.compile(r'[^\w\s\+\#\.\-]')
-HH_URL_RE = re.compile(r"hh\.ru/vacancy/(\d+)")
-HABR_URL_RE = re.compile(r"career\.habr\.com/vacancies/(\d+)")
 
 KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
@@ -107,40 +106,6 @@ def calculate_jaccard_similarity(set_a: set, set_b: set) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-# ----------------- ПАРСИНГ ПРЯМЫХ ССЫЛОК -----------------
-async def resolve_url_input(client: httpx.AsyncClient, text: str) -> tuple[str, str]:
-    hh_match = HH_URL_RE.search(text)
-    if hh_match:
-        vac_id = hh_match.group(1)
-        url = f"https://api.hh.ru/vacancies/{vac_id}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        try:
-            r = await client.get(url, headers=headers, timeout=3.0)
-            data = r.json()
-            title = data.get("name", "")
-            desc = clean_html(data.get("description", ""))
-            skills = " ".join([s.get("name", "") for s in data.get("key_skills", [])])
-            return f"Роль: {title}\nСтек: {skills}\nОписание: {desc}", f"hh.ru/vacancy/{vac_id}"
-        except Exception:
-            pass
-
-    habr_match = HABR_URL_RE.search(text)
-    if habr_match:
-        vac_id = habr_match.group(1)
-        url = f"https://career.habr.com/api/frontend/vacancies/{vac_id}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        try:
-            r = await client.get(url, headers=headers, timeout=3.0)
-            data = r.json()
-            title = data.get("title", "")
-            desc = clean_html(data.get("description", ""))
-            return f"Роль: {title}\nОписание: {desc}", f"career.habr.com/vacancies/{vac_id}"
-        except Exception:
-            pass
-
-    return text, ""
-
-
 # ----------------- GROQ CLIENT -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
     models = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile")
@@ -165,52 +130,44 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
     return "", last_err
 
 
-# ----------------- АСИНХРОННЫЕ ПАРСЕРЫ -----------------
-async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8, phrase_mode: bool = False) -> list:
-    url = "https://api.hh.ru/vacancies"
-    q_param = f'"{query}"' if phrase_mode else CLEAN_QUERY_RE.sub(" ", query).strip()
-    params = {"text": q_param, "area": 113, "per_page": count}
+# ----------------- ОТКРЫТЫЕ ИСТОЧНИКИ ВАКАНСИЙ -----------------
+
+# 1. hh.ru через открытый RSS-поток (без API-токенов)
+async def fetch_hh_rss(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
+    url = f"https://hh.ru/rss/vacancies?text={quote_plus(query)}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        r = await client.get(url, params=params, headers=headers, timeout=2.5)
-        data = r.json()
+        r = await client.get(url, headers=headers, timeout=3.0)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
         jobs = []
-        for item in data.get("items", []):
-            employer = item.get("employer", {})
-            company = employer.get("name", "Не указана")
+        for item in root.findall("./channel/item")[:count]:
+            title = item.findtext("title", "")
+            link = item.findtext("link", "")
+            description = clean_html(item.findtext("description", ""))
+            
+            # В заголовке RSS hh.ru обычно: "Вакансия (Компания)"
+            company_match = re.search(r"\((.*?)\)$", title)
+            company = company_match.group(1).strip() if company_match else "Не указана"
             if is_agency(company):
                 continue
-            sal = item.get("salary")
-            sal_str = f"{sal.get('from') or ''} - {sal.get('to') or ''} {sal.get('currency') or ''}".strip() if sal else "не указана"
-            desc = f"{item.get('snippet', {}).get('requirement', '')} {item.get('snippet', {}).get('responsibility', '')}"
+            
+            clean_title = re.sub(r"\s*\(.*?\)$", "", title).strip()
             jobs.append({
-                "id": item.get("id"),
-                "source": "hh.ru",
-                "title": item.get("name"),
+                "source": "hh.ru (RSS)",
+                "title": clean_title,
                 "company": company,
-                "salary": sal_str,
-                "url": item.get("alternate_url"),
-                "desc": clean_html(desc),
-                "is_ngram_hit": phrase_mode
+                "salary": "в описании",
+                "url": link,
+                "desc": description[:300]
             })
         return jobs
     except Exception:
         return []
 
 
-async def fetch_hh_full_details(client: httpx.AsyncClient, vacancy_id: str) -> str:
-    url = f"https://api.hh.ru/vacancies/{vacancy_id}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        r = await client.get(url, headers=headers, timeout=1.8)
-        data = r.json()
-        raw_desc = data.get("description", "")
-        key_skills = " ".join([s.get("name", "") for s in data.get("key_skills", [])])
-        return clean_html(f"{raw_desc} {key_skills}")[:350]
-    except Exception:
-        return ""
-
-
+# 2. Хабр Карьера (публичный JSON API)
 async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
@@ -230,20 +187,52 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
             full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
             skills = ", ".join([s.get("title", "") for s in item.get("skills", [])])
             jobs.append({
-                "id": None,
                 "source": "Хабр Карьера",
-                "title": item.get("title"),
+                "title": item.get("title", ""),
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
                 "desc": f"Стек: {skills}",
-                "is_ngram_hit": False
             })
         return jobs
     except Exception:
         return []
 
 
+# 3. «Работа России» (Trudvsem OpenData API - госреестр прямых работодателей)
+async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
+    clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
+    url = f"http://opendata.trudvsem.ru/api/v1/vacancies"
+    params = {"text": clean_q, "limit": count}
+    try:
+        r = await client.get(url, params=params, timeout=3.0)
+        data = r.json()
+        vacancies = data.get("results", {}).get("vacancies", [])
+        jobs = []
+        for v in vacancies:
+            vac = v.get("vacancy", {})
+            company = vac.get("company", {}).get("name", "Не указана")
+            if is_agency(company):
+                continue
+            sal_min = vac.get("salary_min", 0)
+            sal_max = vac.get("salary_max", 0)
+            sal_str = f"{sal_min} - {sal_max} руб." if (sal_min or sal_max) else "не указана"
+            duty = clean_html(vac.get("duty", ""))
+            requirement = clean_html(vac.get("requirement", {}).get("qualification", ""))
+            jobs.append({
+                "source": "Работа России",
+                "title": vac.get("job-name", ""),
+                "company": company,
+                "salary": sal_str,
+                "url": vac.get("vac_url", "https://trudvsem.ru"),
+                "desc": f"{requirement} {duty}"[:300]
+            })
+        return jobs
+    except Exception:
+        return []
+
+
+# 4. SuperJob API
 async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
     if not SUPERJOB_KEY:
         return []
@@ -267,20 +256,19 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
             sal_str = f"{p_from if p_from else ''} - {p_to if p_to else ''} {cur}".strip() if (p_from or p_to) else "не указана"
             desc = clean_html(item.get("candidat", "") or item.get("work", ""))
             jobs.append({
-                "id": None,
                 "source": "SuperJob",
                 "title": item.get("profession", ""),
                 "company": company,
                 "salary": sal_str,
                 "url": item.get("link", ""),
                 "desc": desc[:250],
-                "is_ngram_hit": False
             })
         return jobs
     except Exception:
         return []
 
 
+# 5. Telegram-каналы (Telethon)
 async def _scan_single_channel(channel: str, search_term: str) -> list:
     results = []
     try:
@@ -291,14 +279,12 @@ async def _scan_single_channel(channel: str, search_term: str) -> list:
                 company_match = re.search(r"(?:компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
                 company = company_match.group(1).strip() if company_match else f"@{channel}"
                 results.append({
-                    "id": None,
                     "source": f"Telegram (@{channel})",
                     "title": post_text[:40] + "...",
                     "company": company,
                     "salary": "в посте",
                     "url": post_url,
-                    "desc": post_text[:250],
-                    "is_ngram_hit": False
+                    "desc": post_text[:250]
                 })
     except Exception:
         pass
@@ -320,128 +306,102 @@ async def search_telegram_native(search_term: str) -> list:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Smart Matcher)**\n\n"
-        "Отправьте обезличенный бриф заявки или прямую ссылку на вакансию (hh.ru / Хабр).",
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "Отправьте текст брифа. Бот проверит базы **Хабр Карьеры, Работа России, SuperJob, hh.ru (RSS) и Telegram-каналы**.",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
-    user_input = message.text
-    status_msg = await message.answer("⚡️ Анализирую входящие данные...")
+    user_text = message.text
+    status_msg = await message.answer("⚡️ Извлекаю параметры поиска...")
+
+    prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 3 поисковых запроса через точку с запятой в одну строку:
+1. Профильная должность (без кавычек). Пример: DevOps инженер
+2. 2-3 ключевых технологии через пробел. Пример: Kubernetes Helm PostgreSQL
+3. 1 редкий маркер стека/задачи. Пример: OnPrem или ClickHouse
+Текст:
+{user_text[:600]}"""
+
+    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=50)
+    queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
+    
+    role_query = queries[0] if len(queries) > 0 else "Разработчик"
+    stack_query = queries[1] if len(queries) > 1 else "Kubernetes"
+    rare_term = queries[2] if len(queries) > 2 else stack_query.split()[0]
+
+    await status_msg.edit_text("⚡️ Опрашиваю открытые базы (Хабр, Работа России, SuperJob, hh RSS, TG)...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        processed_text, origin_url = await resolve_url_input(http_client, user_input)
-        if origin_url:
-            await status_msg.edit_text(f"🔗 Вакансия получена по ссылке `{origin_url}`. Извлекаю отпечатки задач...")
-
-        prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 4 параметра через точку с запятой в одну строку:
-1. Профильная должность (без кавычек). Пример: DevOps инженер
-2. Связка из 2-3 ключевых технологий через пробел. Пример: Kubernetes Helm PostgreSQL
-3. Самый специфичный термин стека или продукта (1-2 слова). Пример: Kafka или OnPrem
-4. Уникальная N-грамма: дословная редкая фраза из 3-5 слов из блока задач/обязанностей (без кавычек). Пример: диагностика нетиповых окружений
-Текст:
-{processed_text[:800]}"""
-
-        kw_res, _ = await call_groq_async(prompt_kw, max_tokens=65)
-        queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
-
-        role_query = queries[0] if len(queries) > 0 else "Разработчик"
-        stack_query = queries[1] if len(queries) > 1 else "Kubernetes"
-        tg_search_term = queries[2] if len(queries) > 2 else stack_query.split()[0]
-        ngram_phrase = queries[3] if len(queries) > 3 else ""
-
-        await status_msg.edit_text("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
-
         tasks = [
-            fetch_hh(http_client, role_query, 8),
             fetch_habr(http_client, stack_query, 8),
+            fetch_trudvsem(http_client, role_query, 6),
             fetch_superjob(http_client, stack_query, 5),
-            search_telegram_native(tg_search_term),
+            fetch_hh_rss(http_client, f"{role_query} {rare_term}", 6),
+            search_telegram_native(rare_term),
         ]
 
-        # Дополнительный точечный N-граммный запрос по hh.ru
-        if len(ngram_phrase.split()) >= 3:
-            tasks.append(fetch_hh(http_client, ngram_phrase, 5, phrase_mode=True))
-
         try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=4.0)
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=4.5)
         except Exception:
             results = []
 
-        raw_vacancies = [item for sublist in results for item in sublist]
-        unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
+    raw_vacancies = [item for sublist in results for item in sublist]
+    unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
-        if not unique_vacancies:
-            await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте передать текст с более конкретным описанием стека.")
-            return
+    if not unique_vacancies:
+        await status_msg.edit_text("❌ По открытым базам совпадений не найдено. Попробуйте уточнить ключевой стек.")
+        return
 
-        # Локальный пре-скоринг (Jaccard Similarity)
-        source_tech_set = extract_tech_set(processed_text)
-        for vac in unique_vacancies:
-            vac_tech_set = extract_tech_set(vac["title"] + " " + vac["desc"])
-            jaccard = calculate_jaccard_similarity(source_tech_set, vac_tech_set)
-            # Бонус 0.5 к рангу за точное N-граммное попадание
-            vac["rank_score"] = jaccard + (0.5 if vac.get("is_ngram_hit") else 0.0)
+    # Локальный пре-скоринг по пересечению терминов
+    source_tech_set = extract_tech_set(user_text)
+    for vac in unique_vacancies:
+        vac_tech_set = extract_tech_set(vac["title"] + " " + vac["desc"])
+        vac["rank_score"] = calculate_jaccard_similarity(source_tech_set, vac_tech_set)
 
-        # Отбираем ТОП-7 самых релевантных позиций
-        unique_vacancies.sort(key=lambda x: x["rank_score"], reverse=True)
-        top_vacancies = unique_vacancies[:7]
-
-        # Дозагрузка полных описаний hh.ru только для победителей пре-скоринга
-        hh_candidates = [v for v in top_vacancies if v.get("id") and v["source"] == "hh.ru"][:3]
-        if hh_candidates:
-            try:
-                full_texts = await asyncio.wait_for(
-                    asyncio.gather(*[fetch_hh_full_details(http_client, v["id"]) for v in hh_candidates]),
-                    timeout=1.8
-                )
-                for cand, full_desc in zip(hh_candidates, full_texts):
-                    if full_desc:
-                        cand["desc"] = full_desc
-            except Exception:
-                pass
+    unique_vacancies.sort(key=lambda x: x["rank_score"], reverse=True)
+    top_vacancies = unique_vacancies[:8]
 
     await status_msg.edit_text(f"🧠 Скоринг ТОП-{len(top_vacancies)} позиций через Groq LPU...")
 
     compact_list = [
-        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Совпадение отпечатка: {'ДА' if v.get('is_ngram_hit') else 'НЕТ'} | Детали: {v['desc'][:260]}"
+        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:240]}"
         for idx, v in enumerate(top_vacancies, 1)
     ]
     vacancies_payload = "\n".join(compact_list)
 
-    prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
-Агентство скопировало бриф прямого заказчика. Твоя цель — вычислить ТОП-3 работодателей, у которых взят этот проект.
+    prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков.
+Агентство скопировало бриф прямого работодателя. Вычисли ТОП-3 компаний, у которых взят этот проект.
 
 ОРИГИНАЛЬНЫЙ БРИФ:
-\"\"\"{processed_text[:700]}\"\"\"
+\"\"\"{user_text[:700]}\"\"\"
 
-ОТОБРАННЫЕ ВАКАНСИИ И ПУБЛИКАЦИИ:
+НАЙДЕННЫЕ ПОЗИЦИИ:
 {vacancies_payload}
 
 ПРАВИЛА ОЦЕНКИ:
-1. Если совпал 'отпечаток: ДА' — это 90-98% вероятности оригинала.
-2. Базовые технологии (Linux, Git, Docker, SQL) дают не выше 40%.
-3. Выведи строго ТОП-3.
+1. Базовые навыки (Git, Linux, Docker) дают скор не выше 40%.
+2. 🟢 Высокая вероятность (80-95%) — только за редкие связки, специфику задач и окружения.
+3. Отсекай кадровые агентства.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
-🏢 **КОМПАНИЯ:** [Название компании или канал]
+🏢 **КОМПАНИЯ:** [Название компании или канала]
 🎯 **Соответствие стека:** [XX]%
 🎲 **Вероятность статуса заказчика:** [🟢 Высокая (80-95%) / 🟡 Средняя (50-75%) / 🟠 Косвенная (30-45%)]
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
-🔗 **Вакансия/Пост:** [Открыть источник](URL)
-🏛 **Источник:** [hh.ru / Хабр / SuperJob / Telegram]
+🔗 **Ссылка:** [Открыть источник](URL)
+🏛 **Источник:** [Хабр / Работа России / hh.ru / SuperJob / Telegram]
 
 🔍 **Факторы совпадения:**
-• [Что конкретно совпало: редкие технологии, продуктовые задачи или дословные фразы]
+• [Что конкретно совпало: технологии, задачи проекта или окружение]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Точная роль ЛПР: Head of Infrastructure, CTO, Lead DevOps]
-• **Болевая точка:** [Какая острая проектная боль видна в тексте]
-• **Первый контакт:** [Готовый 1-2 предложения хук для сообщения в Telegram/LinkedIn]
+• **К кому идти:** [Роль ЛПР: CTO, Head of QA, Lead DevOps]
+• **Болевая точка:** [Какая острая инженерная задача описана]
+• **Первый контакт:** [Готовый короткий хук для сообщения в LinkedIn/TG]
 ══════════════════════════════
 """
 
