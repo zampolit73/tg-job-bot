@@ -64,7 +64,7 @@ def run_health_server():
     server.serve_forever()
 
 
-def call_groq_safe(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
+def call_groq_safe(prompt: str, max_tokens: int = 1700) -> tuple[str, str]:
     models = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
     last_err = ""
     for model_name in models:
@@ -85,7 +85,6 @@ def call_groq_safe(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
 
 
 def extract_best_shingle(text: str, n_words: int = 4) -> str:
-    """N-граммный шинглинг: извлекает уникальную текстовую цепочку для поиска первоисточника."""
     lines = text.split("\n")
     cleaned_phrases = []
     for line in lines:
@@ -93,9 +92,7 @@ def extract_best_shingle(text: str, n_words: int = 4) -> str:
         meaningful = [w for w in words if w not in RUSSIAN_STOPWORDS and len(w) > 2]
         if len(meaningful) >= n_words:
             cleaned_phrases.append(" ".join(meaningful[:n_words]))
-
     if cleaned_phrases:
-        # Выбираем фразу с наименее банальными словами (наибольшая средняя длина символов)
         cleaned_phrases.sort(key=lambda p: sum(len(w) for w in p.split()), reverse=True)
         return f'"{cleaned_phrases[0]}"'
     return ""
@@ -121,10 +118,10 @@ def is_agency(company_name: str) -> bool:
 def fetch_hh(query: str, count: int = 10) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "OSINTShingleHunter/6.0"}
+    headers = {"User-Agent": "FastOSINT/7.0"}
     jobs = []
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=6).json()
+        r = requests.get(url, params=params, headers=headers, timeout=4).json()
         for item in r.get("items", []):
             company = item.get("employer", {}).get("name", "Не указана")
             if is_agency(company):
@@ -138,7 +135,7 @@ def fetch_hh(query: str, count: int = 10) -> list:
                 "company": company,
                 "salary": sal_str,
                 "url": item.get("alternate_url"),
-                "desc": desc[:300],
+                "desc": desc[:250],
             })
     except Exception:
         pass
@@ -149,10 +146,10 @@ def fetch_habr(query: str, count: int = 10) -> list:
     clean_q = re.sub(r'[^\w\s\+\#\.\-]', ' ', query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
-    headers = {"User-Agent": "OSINTShingleHunter/6.0"}
+    headers = {"User-Agent": "FastOSINT/7.0"}
     jobs = []
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=6).json()
+        r = requests.get(url, params=params, headers=headers, timeout=4).json()
         for item in r.get("list", []):
             company = item.get("company", {}).get("title", "Не указана")
             if is_agency(company):
@@ -168,18 +165,18 @@ def fetch_habr(query: str, count: int = 10) -> list:
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
-                "desc": f"Стек: {skills[:250]}",
+                "desc": f"Стек: {skills[:200]}",
             })
     except Exception:
         pass
     return jobs
 
 
-def fetch_web_exact(query: str, count: int = 4) -> list:
+def fetch_web_exact(query: str, count: int = 3) -> list:
     jobs = []
     try:
         from duckduckgo_search import DDGS
-        ddgs = DDGS(timeout=5)
+        ddgs = DDGS(timeout=4)
         results = list(ddgs.text(query, max_results=count))
         for res in results:
             title = res.get("title", "")
@@ -191,7 +188,7 @@ def fetch_web_exact(query: str, count: int = 4) -> list:
                     "company": company_cand,
                     "salary": "не указана",
                     "url": res.get("href", ""),
-                    "desc": res.get("body", "")[:250],
+                    "desc": res.get("body", "")[:200],
                 })
     except Exception:
         pass
@@ -208,9 +205,8 @@ def build_lead_osint_url(company_name: str) -> str:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Deep OSINT Lead Hunter (Chain-of-Thought & Shingling)**\n\n"
-        "Отправьте мне текст входящего запроса/вакансии.\n"
-        "Я сформирую цифровой N-грамм слепок текста, отсеку галлюцинации двухэтапной проверкой и найду конечного заказчика.",
+        "⚡️ **Fast OSINT Lead Hunter**\n\n"
+        "Отправьте текст заявки/вакансии. Задействован параллельный опрос баз и точечный скоринг.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -218,9 +214,8 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("🧬 **Шаг 1/4:** Формирую N-грамм шинглы и поисковые токены...")
+    status_msg = await message.answer("⚡️ Сканирую стек и параллельно опрашиваю базы...")
 
-    # Локальный шинглинг (0 ms)
     exact_shingle = extract_best_shingle(user_text)
 
     prompt_kw = f"""Выдели ключевую роль и технологическое ядро.
@@ -228,85 +223,53 @@ async def handle_vacancy(message: Message):
 1. Запрос по роли для hh.ru с оператором NAME:(...). Например: NAME:("Product Analyst") или NAME:("C#").
 2. Стек из 2-3 инструментов. Например: 'ClickHouse Superset' или 'PostgreSQL EF Core'.
 Выведи ТОЛЬКО 2 запроса через точку с запятой:
-{user_text[:600]}"""
+{user_text[:500]}"""
 
-    kw_res, _ = call_groq_safe(prompt_kw, max_tokens=50)
+    kw_res, _ = call_groq_safe(prompt_kw, max_tokens=40)
     queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
     if not queries:
         queries = fallback_extract_keywords(user_text)
 
-    # Добавляем шингл в поисковые маркеры
-    search_labels = [f"`{queries[0]}`", f"`{queries[1]}`"]
+    # Параллельный запуск всех сетевых запросов
+    tasks = [
+        asyncio.to_thread(fetch_hh, queries[0], 8),
+        asyncio.to_thread(fetch_habr, queries[1] if len(queries) > 1 else queries[0], 8),
+        asyncio.to_thread(fetch_hh, queries[1] if len(queries) > 1 else queries[0], 6),
+    ]
     if exact_shingle:
-        search_labels.append(f"`{exact_shingle}`")
+        tasks.append(asyncio.to_thread(fetch_web_exact, exact_shingle, 3))
 
-    await status_msg.edit_text(
-        f"🌐 **Шаг 2/4:** Синхронный опрос баз и Exact Match веб-слепка:\n{' • '.join(search_labels)}...",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-    raw_vacancies = []
-    raw_vacancies.extend(fetch_hh(queries[0], count=8))
-    if len(queries) > 1:
-        raw_vacancies.extend(fetch_habr(queries[1], count=8))
-        raw_vacancies.extend(fetch_hh(queries[1], count=6))
-
-    # Поиск по N-грамм шинглу
-    if exact_shingle:
-        raw_vacancies.extend(fetch_web_exact(exact_shingle, count=3))
-
+    results = await asyncio.gather(*tasks)
+    raw_vacancies = [item for sublist in results for item in sublist]
     unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Не удалось найти релевантных открытых позиций по заданным критериям.")
+        await status_msg.edit_text("❌ Не удалось обнаружить открытых позиций работодателей. Уточните описание стека.")
         return
 
-    await status_msg.edit_text(
-        f"⚖️ **Шаг 3/4:** Провожу Chain-of-Thought проверку на расхождения стека для {len(unique_vacancies)} компаний...",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await status_msg.edit_text(f"🧠 Скоринг {len(unique_vacancies)} найденных позиций (отсев посредников и несовпадений)...")
 
     compact_list = []
     for idx, v in enumerate(unique_vacancies[:12], 1):
         compact_list.append(
-            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Инфо: {v['desc']}"
+            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc']}"
         )
     vacancies_payload = "\n".join(compact_list)
 
-    # 1 ЭТАП: Chain-of-Thought «Прокурор» (отсев ложных совпадений)
-    prompt_critique = f"""Ты — строгий технический верификатор. Твоя задача — отсеять ложные совпадения.
-ОРИГИНАЛЬНЫЙ ЗАПРОС:
+    # Единый промпт: строгая верификация и формирование карточек в один быстрый проход
+    prompt_match = f"""Ты — ведущий OSINT-аналитик IT-аутстаффинга. Твоя задача — найти ТОП-3 прямых конечных заказчиков.
+
+ИСХОДНЫЙ ЗАПРОС:
 \"\"\"{user_text[:700]}\"\"\"
 
-КАНДИДАТЫ:
+СПИСОК НАЙДЕННЫХ ВАКАНСИЙ:
 {vacancies_payload}
 
-ЗАДАЧА:
-Для каждой вакансии укажи 1 жесткое несовпадение (если отличается стек, уровень, домен или стек смежный). 
-Выдели топ-3 кандидатов, у которых МЕНЬШЕ ВСЕГО технических расхождений с оригиналом. Напиши кратко."""
+ПРАВИЛА ОТСЕВА:
+1. Оштрафуй и исключи вакансии, где кардинально отличается стек (например, другой язык/СУБД).
+2. Выдели ТОП-3 компаний с наименьшим количеством расхождений.
 
-    critique_res, _ = call_groq_safe(prompt_critique, max_tokens=600)
-
-    await status_msg.edit_text(
-        "📊 **Шаг 4/4:** Формирую финальные карточки заказчиков и расчет вероятностей...",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-    # 2 ЭТАП: Финальный расчет с учетом результатов верификации
-    prompt_final = f"""Ты — ведущий OSINT-аналитик агентства IT-аутстаффинга.
-ОРИГИНАЛЬНЫЙ ЗАПРОС:
-\"\"\"{user_text[:700]}\"\"\"
-
-СПИСОК ВАКАНСИЙ:
-{vacancies_payload}
-
-АНАЛИЗ РАСХОЖДЕНИЙ (ОТСЕВ ГАЛЛЮЦИНАЦИЙ):
-{critique_res}
-
-ЗАДАЧА:
-Сформируй ТОП-3 наиболее вероятных заказчиков, оштрафовав те компании, где были выявлены расхождения.
-Оформи ответ СТРОГО по шаблону:
-
+СТРОГИЙ ШАБЛОН ДЛЯ ВЫВОДА:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании]
 🎯 **Соответствие стека:** [XX]%
@@ -317,7 +280,7 @@ async def handle_vacancy(message: Message):
 🏛 **Источник:** [hh.ru / Хабр Карьера / Веб-поиск]
 
 🔍 **Факторы совпадения:**
-• [1-2 конкретных маркера: идентичность редких задач, совпадение формулировок или стека]
+• [1-2 конкретных маркера: совпадение редких задач, терминов или архитектуры]
 
 💡 **Стратегия выхода для сейлза:**
 • **К кому идти:** [Должность ЛПР: CTO / Head of Analytics / Team Lead]
@@ -326,13 +289,12 @@ async def handle_vacancy(message: Message):
 ══════════════════════════════
 """
 
-    result_text, err = call_groq_safe(prompt_final, max_tokens=1800)
+    result_text, err = call_groq_safe(prompt_match, max_tokens=1800)
 
     if not result_text:
-        await status_msg.edit_text(f"⚠️ Ошибка вызова Groq API: {err}")
+        await status_msg.edit_text(f"⚠️ Ошибка генерации отчета: {err}")
         return
 
-    # Добавление прямых ссылок на поиск ЛПР
     lines = result_text.split("\n")
     enhanced_lines = []
     current_company = ""
