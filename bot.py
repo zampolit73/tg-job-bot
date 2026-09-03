@@ -22,7 +22,6 @@ KNOWN_AGENCIES = [
 ]
 
 
-# Фоновый мини-сервер для прохождения health-check на Render
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -38,6 +37,27 @@ def run_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
+
+
+def call_groq(prompt: str, max_tokens: int = 1500) -> str:
+    """Вызов с автоподбором активной модели на Groq."""
+    models_to_try = [
+        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-20b",
+    ]
+    for model_name in models_to_try:
+        try:
+            res = groq_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=max_tokens
+            )
+            return res.choices[0].message.content
+        except Exception:
+            continue
+    return ""
 
 
 def is_agency(company_name: str) -> bool:
@@ -116,33 +136,23 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("🕵️ **Шаг 1/3:** Выделяю ключевые маркеры и поисковые комбинации...")
+    status_msg = await message.answer("🕵️ **Шаг 1/3:** Выделяю ключевые маркеры и поисковые запросы...")
 
-    # 1. Быстрое извлечение 2 поисковых фраз через Groq
+    # 1. Извлечение поисковых ключей
     prompt_kw = f"""На основе описания вакансии сформируй 2 коротких поисковых запроса (по 2-3 слова).
 Первый — точная роль со стеком (например: 'Product Analyst дашборды').
 Второй — специфика задач или продукта (например: 'промодвижок витрины данных').
 Выведи ТОЛЬКО эти 2 запроса через точку с запятой, без лишнего текста:
 {user_text}"""
 
-    try:
-        kw_completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt_kw}],
-            temperature=0.1,
-            max_tokens=60
-        )
-        kw_res = kw_completion.choices[0].message.content
-        queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 2]
-    except Exception:
-        queries = ["Аналитик данных", "Product Analyst"]
-
+    kw_res = call_groq(prompt_kw, max_tokens=60)
+    queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 2]
     if not queries:
         queries = ["Аналитик данных", "Product Analyst"]
 
     await status_msg.edit_text(f"🔍 **Шаг 2/3:** Ищу прямых работодателей по: `{', '.join(queries[:2])}`...")
 
-    # 2. Сбор вакансий из hh.ru и Хабр Карьеры
+    # 2. Сбор вакансий
     raw_vacancies = []
     for q in queries[:2]:
         raw_vacancies.extend(fetch_hh(q))
@@ -151,12 +161,12 @@ async def handle_vacancy(message: Message):
     unique_vacancies = list({v["url"]: v for v in raw_vacancies}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Не удалось найти открытые вакансии прямых работодателей. Попробуйте передать текст с более четким стеком/ролью.")
+        await status_msg.edit_text("❌ Не удалось найти открытые вакансии прямых работодателей. Попробуйте уточнить описание.")
         return
 
     await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} вакансий и вычисляю прямого заказчика...")
 
-    # 3. Детальный скоринг и аналитика для сейлза
+    # 3. Детальный скоринг
     prompt_match = f"""Ты — эксперт OSINT-аналитики для сейлз-команды в IT-аутстаффинге.
 ОБЕЗЛИЧЕННЫЙ ЗАПРОС КЛИЕНТА (ОТ АГЕНТСТВА/КОНКУРЕНТА):
 \"\"\"{user_text}\"\"\"
@@ -176,16 +186,9 @@ async def handle_vacancy(message: Message):
 💡 **Как зайти сейлзу:** (кому писать в компании и какую боль закрывать)
 """
 
-    try:
-        analysis_completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt_match}],
-            temperature=0.2,
-            max_tokens=2000
-        )
-        result_text = analysis_completion.choices[0].message.content
-    except Exception as e:
-        await status_msg.edit_text(f"Ошибка при анализе: {e}")
+    result_text = call_groq(prompt_match, max_tokens=1800)
+    if not result_text:
+        await status_msg.edit_text("Не удалось сформировать отчет. Попробуйте отправить вакансию еще раз.")
         return
 
     if len(result_text) > 4000:
