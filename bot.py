@@ -53,6 +53,9 @@ TARGET_TG_CHANNELS = [
     "qa_jobs", "jvmjobs", "forpython", "devjobs"
 ]
 
+# Флаг для отслеживания исчерпания суточной квоты Google
+google_quota_exhausted = False
+
 # ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -116,9 +119,10 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
 
 # ----------------- ИСТОЧНИКИ ДАННЫХ -----------------
 
-# 1. Google Programmable Search (X-Ray по целевым сайтам)
+# 1. Google Programmable Search с обработкой лимитов (Quota Fallback)
 async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+    global google_quota_exhausted
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or google_quota_exhausted:
         return []
     
     url = "https://www.googleapis.com/customsearch/v1"
@@ -132,9 +136,16 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
     }
     
     try:
-        r = await client.get(url, params=params, timeout=4.0)
+        r = await client.get(url, params=params, timeout=3.5)
+        
+        # Обработка превышения квоты запросов (429 Too Many Requests или 403 Quota Exceeded)
+        if r.status_code in (429, 403):
+            google_quota_exhausted = True
+            return []
+            
         if r.status_code != 200:
             return []
+            
         data = r.json()
         items = data.get("items", [])
         jobs = []
@@ -150,7 +161,7 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
                 continue
 
             jobs.append({
-                "source": "Google Custom Search",
+                "source": "Google X-Ray",
                 "title": title[:70],
                 "company": company,
                 "salary": "в описании",
@@ -163,7 +174,7 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
 
 
 # 2. Хабр Карьера (JSON API)
-async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
+async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
@@ -195,7 +206,7 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 6) -> l
 
 
 # 3. Работа России (госреестр работодателей)
-async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
+async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "http://opendata.trudvsem.ru/api/v1/vacancies"
     params = {"text": clean_q, "limit": count}
@@ -228,7 +239,7 @@ async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 5) 
 
 
 # 4. SuperJob API
-async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
+async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
     if not SUPERJOB_KEY:
         return []
     words = [w for w in CLEAN_QUERY_RE.sub(" ", query).split() if len(w) > 2][:2]
@@ -263,7 +274,7 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
         return []
 
 
-# 5. Telegram-каналы (Telethon)
+# 5. Telegram-каналы
 async def _scan_single_channel(channel: str, search_term: str) -> list:
     results = []
     try:
@@ -301,16 +312,19 @@ async def search_telegram_native(search_term: str) -> list:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Google Engine Enabled)**\n\n"
-        "Отправьте бриф вакансии. Бот использует поисковый индекс **Google**, базы Хабра, SuperJob, Работа России и матричный скоринг.",
+        "💼 **Multi-Source OSINT Lead Hunter (Smart Fallback Edition)**\n\n"
+        "Отправьте бриф. Бот выполняет поиск через Google Custom Search, а при исчерпании суточного лимита Google — автоматически продолжает поиск по Хабру, Работа России, SuperJob и Telegram.",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
+    global google_quota_exhausted
     user_text = message.text
-    status_msg = await message.answer("⚡️ [1/3] Извлечение сущностей проекта и маркеров окружения...")
+
+    google_status_str = " (Google отключен: лимит квоты)" if google_quota_exhausted else ""
+    status_msg = await message.answer(f"⚡️ [1/3] Извлечение профиля и сущностей проекта{google_status_str}...")
 
     # Шаг 1: Извлечение структурированного профиля
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
@@ -321,7 +335,7 @@ async def handle_vacancy(message: Message):
   "infra_type": "тип среды (OnPrem, Cloud, Bare-metal, Hybrid или Не указан)",
   "must_have": ["список", "только", "редких/специфичных", "технологий"],
   "core_challenge": "главная инженерная задача (1 предложение)",
-  "google_query": "3-4 ключевых слова для Google (роль + 2 технологии + ключевой маркер)",
+  "google_query": "3-4 ключевых слова для поиска (роль + 2 технологии + ключевой маркер)",
   "ngram_phrase": "дословная фраза из 3-4 слов из блока задач/требований"
 }}
 БРИФ:
@@ -347,19 +361,23 @@ async def handle_vacancy(message: Message):
     rare_term = rare_techs[0] if rare_techs else "Kubernetes"
     ngram_phrase = brief_profile.get("ngram_phrase", "")
 
-    await status_msg.edit_text("🔍 [2/3] Поиск через Google Custom Search и открытые базы...")
+    mode_info = "Хабр, Работа России, SuperJob, TG" if google_quota_exhausted else "Google CSE, Хабр, Работа России, SuperJob, TG"
+    await status_msg.edit_text(f"🔍 [2/3] Поиск кандидатов через [{mode_info}]...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
+        # Базовые открытые источники (работают всегда)
         tasks = [
-            search_google_custom(http_client, google_q, count=6),
-            fetch_habr(http_client, rare_term, 6),
-            fetch_trudvsem(http_client, role_query, 5),
-            fetch_superjob(http_client, rare_term, 5),
+            fetch_habr(http_client, rare_term, 8),
+            fetch_trudvsem(http_client, role_query, 6),
+            fetch_superjob(http_client, rare_term, 6),
             search_telegram_native(rare_term),
         ]
 
-        if len(ngram_phrase.split()) >= 3:
-            tasks.append(search_google_custom(http_client, f'"{ngram_phrase}"', count=3))
+        # Подключаем Google только если лимит не исчерпан
+        if not google_quota_exhausted and GOOGLE_API_KEY:
+            tasks.append(search_google_custom(http_client, google_q, count=6))
+            if len(ngram_phrase.split()) >= 3:
+                tasks.append(search_google_custom(http_client, f'"{ngram_phrase}"', count=3))
 
         try:
             results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
@@ -370,10 +388,10 @@ async def handle_vacancy(message: Message):
     unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ В поисковой выдаче и базах совпадений не найдено. Уточните стек в брифе.")
+        await status_msg.edit_text("❌ Вакансии не найдены ни в одном источнике. Попробуйте уточнить стек в брифе.")
         return
 
-    await status_msg.edit_text(f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:10])} кандидатов через Groq LPU...")
+    await status_msg.edit_text(f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:10])} кандидатов в Groq LPU...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -386,7 +404,6 @@ async def handle_vacancy(message: Message):
     ]
     candidates_payload = "\n".join(compact_candidates)
 
-    # Шаг 2: Жесткий матричный скоринг
     prompt_matrix = f"""Ты — беспощадный OSINT-аудитор. Твоя задача — отсеять ложные совпадения и вычислить истинного прямого заказчика.
 
 ЭТАЛОННЫЙ ПРОФИЛЬ ПРОЕКТА:
@@ -417,7 +434,7 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник](URL)
-🏛 **Источник:** [Google / Хабр / Работа России / SuperJob / Telegram]
+🏛 **Источник:** [Google X-Ray / Хабр / Работа России / SuperJob / Telegram]
 
 ⚖️ **Аудит по матрице (Почему такой скор):**
 • **Must-have стек:** [Что конкретно совпало из редких технологий, а чего не хватает]
@@ -449,7 +466,8 @@ async def handle_vacancy(message: Message):
         else:
             enhanced_lines.append(line)
 
-    final_output = "🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ**\n\n" + "\n".join(enhanced_lines)
+    fallback_badge = "\nℹ️ *Режим работы: Открытые API (квота Google исчерпана)*\n" if google_quota_exhausted else ""
+    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ**{fallback_badge}\n" + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
         parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
