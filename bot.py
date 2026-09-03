@@ -19,6 +19,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPERJOB_KEY = os.getenv("SUPERJOB_KEY")
 
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "10092ea56d2504c84")
+
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "")
@@ -92,7 +95,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
             kwargs = {
                 "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,  # Нулевая температура для максимальной строгости
+                "temperature": 0.0,
                 "max_tokens": max_tokens,
             }
             if json_mode:
@@ -112,41 +115,55 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
 
 
 # ----------------- ИСТОЧНИКИ ДАННЫХ -----------------
-async def fetch_hh_rss(client: httpx.AsyncClient, query: str, count: int = 8, phrase_mode: bool = False) -> list:
-    q_str = f'"{query}"' if phrase_mode else query
-    url = f"https://hh.ru/rss/vacancies?text={quote_plus(q_str)}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+# 1. Google Programmable Search (X-Ray по целевым сайтам)
+async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+        return []
+    
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": GOOGLE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "num": min(count, 10),
+        "gl": "ru",
+        "hl": "ru"
+    }
+    
     try:
-        r = await client.get(url, headers=headers, timeout=3.0)
+        r = await client.get(url, params=params, timeout=4.0)
         if r.status_code != 200:
             return []
-        root = ET.fromstring(r.content)
+        data = r.json()
+        items = data.get("items", [])
         jobs = []
-        for item in root.findall("./channel/item")[:count]:
-            title = item.findtext("title", "")
-            link = item.findtext("link", "")
-            desc = clean_html(item.findtext("description", ""))
-            
-            company_match = re.search(r"\((.*?)\)$", title)
-            company = company_match.group(1).strip() if company_match else "Не указана"
+        for item in items:
+            title = item.get("title", "")
+            link = item.get("link", "")
+            snippet = clean_html(item.get("snippet", ""))
+
+            company_match = re.search(r"(?:в компании|—)\s+([^|\-—\(\)]+)", title, re.IGNORECASE)
+            company = company_match.group(1).strip() if company_match else "Прямой работодатель"
+
             if is_agency(company):
                 continue
-            
-            clean_title = re.sub(r"\s*\(.*?\)$", "", title).strip()
+
             jobs.append({
-                "source": "hh.ru (RSS)",
-                "title": clean_title,
+                "source": "Google Custom Search",
+                "title": title[:70],
                 "company": company,
                 "salary": "в описании",
                 "url": link,
-                "desc": desc[:400]
+                "desc": snippet[:350]
             })
         return jobs
     except Exception:
         return []
 
 
-async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
+# 2. Хабр Карьера (JSON API)
+async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
@@ -177,7 +194,8 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
         return []
 
 
-async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
+# 3. Работа России (госреестр работодателей)
+async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "http://opendata.trudvsem.ru/api/v1/vacancies"
     params = {"text": clean_q, "limit": count}
@@ -202,13 +220,14 @@ async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 6) 
                 "company": company,
                 "salary": sal_str,
                 "url": vac.get("vac_url", "https://trudvsem.ru"),
-                "desc": f"{requirement} {duty}"[:400]
+                "desc": f"{requirement} {duty}"[:350]
             })
         return jobs
     except Exception:
         return []
 
 
+# 4. SuperJob API
 async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
     if not SUPERJOB_KEY:
         return []
@@ -237,13 +256,14 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
                 "company": company,
                 "salary": sal_str,
                 "url": item.get("link", ""),
-                "desc": desc[:350]
+                "desc": desc[:300]
             })
         return jobs
     except Exception:
         return []
 
 
+# 5. Telegram-каналы (Telethon)
 async def _scan_single_channel(channel: str, search_term: str) -> list:
     results = []
     try:
@@ -259,7 +279,7 @@ async def _scan_single_channel(channel: str, search_term: str) -> list:
                     "company": company,
                     "salary": "в посте",
                     "url": post_url,
-                    "desc": post_text[:350]
+                    "desc": post_text[:300]
                 })
     except Exception:
         pass
@@ -281,8 +301,8 @@ async def search_telegram_native(search_term: str) -> list:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Matrix Scoring Edition)**\n\n"
-        "Отправьте бриф. Бот выполнит нормализацию сущностей и жесткий матричный скоринг без ложных совпадений.",
+        "💼 **Multi-Source OSINT Lead Hunter (Google Engine Enabled)**\n\n"
+        "Отправьте бриф вакансии. Бот использует поисковый индекс **Google**, базы Хабра, SuperJob, Работа России и матричный скоринг.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -290,24 +310,24 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("⚡️ [1/3] Извлечение JSON-профиля проекта и маркеров...")
+    status_msg = await message.answer("⚡️ [1/3] Извлечение сущностей проекта и маркеров окружения...")
 
-    # ШАГ 1: Извлечение структурированного профиля
-    prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик. 
+    # Шаг 1: Извлечение структурированного профиля
+    prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
 Разбери входящий бриф на строгие сущности и верни JSON строго по схеме:
 {{
   "role": "название роли/позиции",
   "domain": "домен (Fintech, E-commerce, GameDev, Telecom, Retail или Общий)",
   "infra_type": "тип среды (OnPrem, Cloud, Bare-metal, Hybrid или Не указан)",
   "must_have": ["список", "только", "редких/специфичных", "технологий"],
-  "core_challenge": "главная архитектурная задача (1 предложение)",
-  "ngram_phrase": "дословная редкая фраза из 3-4 слов из задач",
-  "search_stack": "2-3 ключевых технологии через пробел для поиска"
+  "core_challenge": "главная инженерная задача (1 предложение)",
+  "google_query": "3-4 ключевых слова для Google (роль + 2 технологии + ключевой маркер)",
+  "ngram_phrase": "дословная фраза из 3-4 слов из блока задач/требований"
 }}
 БРИФ:
 \"\"\"{user_text[:900]}\"\"\""""
 
-    extract_raw, _ = await call_groq_async(prompt_extract, max_tokens=300, json_mode=True)
+    extract_raw, _ = await call_groq_async(prompt_extract, max_tokens=350, json_mode=True)
     try:
         brief_profile = json.loads(extract_raw)
     except Exception:
@@ -316,33 +336,33 @@ async def handle_vacancy(message: Message):
             "domain": "Общий",
             "infra_type": "Не указан",
             "must_have": [],
-            "core_challenge": "Разработка и поддержка сервисов",
-            "ngram_phrase": "",
-            "search_stack": user_text.split()[:2]
+            "core_challenge": "Разработка и сопровождение",
+            "google_query": "DevOps Kubernetes OnPrem",
+            "ngram_phrase": ""
         }
 
     role_query = brief_profile.get("role", "Разработчик")
-    stack_query = brief_profile.get("search_stack", "Kubernetes")
+    google_q = brief_profile.get("google_query", "DevOps Kubernetes")
     rare_techs = brief_profile.get("must_have", [])
-    rare_term = rare_techs[0] if rare_techs else stack_query.split()[0]
+    rare_term = rare_techs[0] if rare_techs else "Kubernetes"
     ngram_phrase = brief_profile.get("ngram_phrase", "")
 
-    await status_msg.edit_text(f"⚡️ [2/3] Поиск кандидатов в 5 источниках по стеку: `{stack_query}`...")
+    await status_msg.edit_text("🔍 [2/3] Поиск через Google Custom Search и открытые базы...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
-            fetch_habr(http_client, stack_query, 8),
-            fetch_trudvsem(http_client, role_query, 6),
-            fetch_superjob(http_client, stack_query, 5),
-            fetch_hh_rss(http_client, f"{role_query} {rare_term}", 6),
+            search_google_custom(http_client, google_q, count=6),
+            fetch_habr(http_client, rare_term, 6),
+            fetch_trudvsem(http_client, role_query, 5),
+            fetch_superjob(http_client, rare_term, 5),
             search_telegram_native(rare_term),
         ]
 
         if len(ngram_phrase.split()) >= 3:
-            tasks.append(fetch_hh_rss(http_client, ngram_phrase, 5, phrase_mode=True))
+            tasks.append(search_google_custom(http_client, f'"{ngram_phrase}"', count=3))
 
         try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=4.5)
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
         except Exception:
             results = []
 
@@ -350,10 +370,10 @@ async def handle_vacancy(message: Message):
     unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ В открытых базах совпадений не найдено. Уточните технические параметры в брифе.")
+        await status_msg.edit_text("❌ В поисковой выдаче и базах совпадений не найдено. Уточните стек в брифе.")
         return
 
-    await status_msg.edit_text(f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:10])} позиций (отсев ложных совпадений)...")
+    await status_msg.edit_text(f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:10])} кандидатов через Groq LPU...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -366,7 +386,7 @@ async def handle_vacancy(message: Message):
     ]
     candidates_payload = "\n".join(compact_candidates)
 
-    # ШАГ 2: Матричный скоринг с весовыми критериями
+    # Шаг 2: Жесткий матричный скоринг
     prompt_matrix = f"""Ты — беспощадный OSINT-аудитор. Твоя задача — отсеять ложные совпадения и вычислить истинного прямого заказчика.
 
 ЭТАЛОННЫЙ ПРОФИЛЬ ПРОЕКТА:
@@ -385,9 +405,9 @@ async def handle_vacancy(message: Message):
    - [35%] Полнота покрытия редкого стека ('must_have').
    - [15%] Специфика инфраструктуры ('infra_type').
    - [10%] Совпадение домена ('domain').
-3. Если совпала дословная N-грамма задач — вероятность 95-99%.
+3. Если совпала дословная фраза из задач или цитата — вероятность 95-99%.
 
-Выведи строго ТОП-3 кандидатов по убыванию реального скора. Если реальных совпадений нет — так и напиши.
+Выведи строго ТОП-3 кандидатов по убыванию реального скора.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
@@ -397,7 +417,7 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник](URL)
-🏛 **Источник:** [hh.ru / Хабр / Работа России / SuperJob / Telegram]
+🏛 **Источник:** [Google / Хабр / Работа России / SuperJob / Telegram]
 
 ⚖️ **Аудит по матрице (Почему такой скор):**
 • **Must-have стек:** [Что конкретно совпало из редких технологий, а чего не хватает]
