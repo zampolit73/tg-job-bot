@@ -7,7 +7,7 @@ from aiogram.types import Message
 
 # ----------------- КЛЮЧИ -----------------
 TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
-OPENROUTER_KEY = "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"
+OPENROUTER_KEY = "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"
 # ----------------------------------------
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -15,7 +15,7 @@ dp = Dispatcher()
 
 
 def call_ai(prompt: str) -> str:
-    """Запрос через OpenRouter к бесплатной модели Gemini."""
+    """Запрос через OpenRouter с автоперебором доступных бесплатных моделей."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
@@ -23,23 +23,38 @@ def call_ai(prompt: str) -> str:
         "HTTP-Referer": "https://render.com",
         "X-Title": "JobBot",
     }
-    payload = {
-        "model": "google/gemini-2.5-flash:free",
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        data = r.json()
-        if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
-        elif "error" in data:
-            return f"Ошибка API OpenRouter: {data['error'].get('message', data)}"
-        return "Модель не вернула ответ."
-    except Exception as e:
-        return f"Ошибка сети: {e}"
+
+    # Актуальные бесплатные модели
+    free_models = [
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "mistralai/mistral-small-24b-instruct-2501:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+    ]
+
+    last_error = ""
+    for model in free_models:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=35)
+            data = r.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                return data["choices"][0]["message"]["content"]
+            elif "error" in data:
+                last_error = data["error"].get("message", str(data))
+                continue
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    return f"Ошибка API OpenRouter: {last_error}"
 
 
 def fetch_hh(query: str, count: int = 8) -> list:
+    """Парсинг hh.ru по ключевым словам."""
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
     headers = {"User-Agent": "JobHunterBot/1.0"}
@@ -70,6 +85,7 @@ def fetch_hh(query: str, count: int = 8) -> list:
 
 
 def fetch_habr(query: str, count: int = 8) -> list:
+    """Парсинг Хабр Карьеры по ключевым словам."""
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": query, "per_page": count}
     headers = {"User-Agent": "JobHunterBot/1.0"}
@@ -119,6 +135,7 @@ async def handle_vacancy(message: Message):
         "⏳ Анализирую стек, собираю данные и считаю вероятности..."
     )
 
+    # 1. Извлечение ключевых слов через ИИ
     keywords_prompt = (
         f"Выдели 2-3 поисковых слова для этой вакансии (роль и стек, например 'Python FastAPI'). "
         f"В ответе напиши ТОЛЬКО эти слова:\n{user_text}"
@@ -130,13 +147,15 @@ async def handle_vacancy(message: Message):
         else "IT"
     )
 
+    # 2. Сбор вакансий из API
     raw_vacancies = fetch_hh(search_query) + fetch_habr(search_query)
     if not raw_vacancies:
         await status_msg.edit_text(
-            "Не удалось найти открытые вакансии по этому запросу."
+            "Не удалось найти открытые вакансии по этому запросу. Попробуйте уточнить текст."
         )
         return
 
+    # 3. Скоринг и сравнение
     matching_prompt = f"""
 Ты — эксперт по анализу рынка труда.
 Исходная вакансия:
@@ -158,11 +177,12 @@ async def handle_vacancy(message: Message):
 🕵️ Вероятность, что это та же компания: [Y]%
 💰 Зарплата: [Вилка или 'не указана']
 🔗 Ссылка: [URL]
-💡 Комментарий: (1 краткое предложение: суть сходства)
+💡 Комментарий: (1 краткое предложение сути сходства)
 """
 
     result_text = call_ai(matching_prompt)
 
+    # Разбивка на части, если ответ превышает лимит Telegram в 4096 символов
     if len(result_text) > 4000:
         parts = [
             result_text[i : i + 4000] for i in range(0, len(result_text), 4000)
@@ -179,6 +199,7 @@ async def handle_ping(request):
 
 
 async def main():
+    # Запуск фонового веб-сервера для удержания активного порта на Render
     port = int(os.environ.get("PORT", 10000))
     app = web.Application()
     app.router.add_get("/", handle_ping)
@@ -187,6 +208,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+    # Запуск бота
     await dp.start_polling(bot)
 
 
