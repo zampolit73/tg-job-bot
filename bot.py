@@ -10,6 +10,7 @@ import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from groq import AsyncGroq
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -53,7 +54,6 @@ TARGET_TG_CHANNELS = [
     "qa_jobs", "jvmjobs", "forpython", "devjobs"
 ]
 
-# Флаг для отслеживания исчерпания суточной квоты Google
 google_quota_exhausted = False
 
 # ----------------- HEALTH SERVER -----------------
@@ -89,6 +89,14 @@ def build_lead_osint_url(company_name: str, target_role: str = "CTO") -> str:
     return f"https://www.google.com/search?q={quote_plus(query)}"
 
 
+# Безопасное обновление текста статуса без зависаний
+async def safe_edit_status(msg: Message, text: str):
+    try:
+        await msg.edit_text(text)
+    except TelegramAPIError:
+        pass
+
+
 # ----------------- GROQ CLIENT -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool = False) -> tuple[str, str]:
     models = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile")
@@ -106,7 +114,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
 
             res = await asyncio.wait_for(
                 groq_client.chat.completions.create(**kwargs),
-                timeout=10.0
+                timeout=9.0
             )
             content = res.choices[0].message.content
             if content and content.strip():
@@ -118,8 +126,6 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
 
 
 # ----------------- ИСТОЧНИКИ ДАННЫХ -----------------
-
-# 1. Google Programmable Search с обработкой лимитов (Quota Fallback)
 async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
     global google_quota_exhausted
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or google_quota_exhausted:
@@ -136,18 +142,14 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
     }
     
     try:
-        r = await client.get(url, params=params, timeout=3.5)
-        
-        # Обработка превышения квоты запросов (429 Too Many Requests или 403 Quota Exceeded)
+        r = await client.get(url, params=params, timeout=3.0)
         if r.status_code in (429, 403):
             google_quota_exhausted = True
             return []
-            
         if r.status_code != 200:
             return []
             
-        data = r.json()
-        items = data.get("items", [])
+        items = r.json().get("items", [])
         jobs = []
         for item in items:
             title = item.get("title", "")
@@ -173,7 +175,6 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
         return []
 
 
-# 2. Хабр Карьера (JSON API)
 async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
@@ -181,9 +182,10 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         r = await client.get(url, params=params, headers=headers, timeout=2.5)
-        data = r.json()
+        if r.status_code != 200:
+            return []
         jobs = []
-        for item in data.get("list", []):
+        for item in r.json().get("list", []):
             company = item.get("company", {}).get("title", "Не указана")
             if is_agency(company):
                 continue
@@ -205,15 +207,15 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
         return []
 
 
-# 3. Работа России (госреестр работодателей)
-async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
+async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "http://opendata.trudvsem.ru/api/v1/vacancies"
     params = {"text": clean_q, "limit": count}
     try:
-        r = await client.get(url, params=params, timeout=3.0)
-        data = r.json()
-        vacancies = data.get("results", {}).get("vacancies", [])
+        r = await client.get(url, params=params, timeout=2.5)
+        if r.status_code != 200:
+            return []
+        vacancies = r.json().get("results", {}).get("vacancies", [])
         jobs = []
         for v in vacancies:
             vac = v.get("vacancy", {})
@@ -238,8 +240,7 @@ async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 6) 
         return []
 
 
-# 4. SuperJob API
-async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
+async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
     if not SUPERJOB_KEY:
         return []
     words = [w for w in CLEAN_QUERY_RE.sub(" ", query).split() if len(w) > 2][:2]
@@ -251,9 +252,10 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 6) 
     headers = {"User-Agent": "Mozilla/5.0", "X-Api-App-Id": SUPERJOB_KEY}
     try:
         r = await client.get(url, params=params, headers=headers, timeout=2.5)
-        data = r.json()
+        if r.status_code != 200:
+            return []
         jobs = []
-        for item in data.get("objects", []):
+        for item in r.json().get("objects", []):
             company = item.get("client", {}).get("title", "Не указана")
             if is_agency(company):
                 continue
@@ -274,7 +276,6 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 6) 
         return []
 
 
-# 5. Telegram-каналы
 async def _scan_single_channel(channel: str, search_term: str) -> list:
     results = []
     try:
@@ -303,17 +304,20 @@ async def search_telegram_native(search_term: str) -> list:
     clean_term = search_term.strip()
     if not clean_term:
         return []
-    tasks = [_scan_single_channel(ch, clean_term) for ch in TARGET_TG_CHANNELS[:5]]
-    results = await asyncio.gather(*tasks)
-    return [item for sublist in results for item in sublist]
+    try:
+        tasks = [_scan_single_channel(ch, clean_term) for ch in TARGET_TG_CHANNELS[:4]]
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3.0)
+        return [item for sub in results if isinstance(sub, list) for item in sub]
+    except Exception:
+        return []
 
 
 # ----------------- ХЭНДЛЕРЫ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Smart Fallback Edition)**\n\n"
-        "Отправьте бриф. Бот выполняет поиск через Google Custom Search, а при исчерпании суточного лимита Google — автоматически продолжает поиск по Хабру, Работа России, SuperJob и Telegram.",
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "Отправьте бриф. Бот выполнит каскадный поиск по открытым базам и Google X-Ray.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -322,26 +326,24 @@ async def cmd_start(message: Message):
 async def handle_vacancy(message: Message):
     global google_quota_exhausted
     user_text = message.text
-
-    google_status_str = " (Google отключен: лимит квоты)" if google_quota_exhausted else ""
-    status_msg = await message.answer(f"⚡️ [1/3] Извлечение профиля и сущностей проекта{google_status_str}...")
+    status_msg = await message.answer("⚡️ [1/3] Извлечение сущностей проекта...")
 
     # Шаг 1: Извлечение структурированного профиля
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
-Разбери входящий бриф на строгие сущности и верни JSON строго по схеме:
+Разбери бриф на сущности и верни JSON:
 {{
-  "role": "название роли/позиции",
-  "domain": "домен (Fintech, E-commerce, GameDev, Telecom, Retail или Общий)",
-  "infra_type": "тип среды (OnPrem, Cloud, Bare-metal, Hybrid или Не указан)",
-  "must_have": ["список", "только", "редких/специфичных", "технологий"],
-  "core_challenge": "главная инженерная задача (1 предложение)",
-  "google_query": "3-4 ключевых слова для поиска (роль + 2 технологии + ключевой маркер)",
-  "ngram_phrase": "дословная фраза из 3-4 слов из блока задач/требований"
+  "role": "название позиции",
+  "domain": "домен (Fintech, E-commerce, Retail или Общий)",
+  "infra_type": "тип среды (OnPrem, Cloud, Bare-metal или Не указан)",
+  "must_have": ["список", "редких", "технологий"],
+  "core_challenge": "главная задача (1 предложение)",
+  "google_query": "3-4 ключевых слова (роль + 2 технологии)",
+  "ngram_phrase": "дословная фраза из 3-4 слов из обязанностей"
 }}
 БРИФ:
 \"\"\"{user_text[:900]}\"\"\""""
 
-    extract_raw, _ = await call_groq_async(prompt_extract, max_tokens=350, json_mode=True)
+    extract_raw, _ = await call_groq_async(prompt_extract, max_tokens=300, json_mode=True)
     try:
         brief_profile = json.loads(extract_raw)
     except Exception:
@@ -350,48 +352,48 @@ async def handle_vacancy(message: Message):
             "domain": "Общий",
             "infra_type": "Не указан",
             "must_have": [],
-            "core_challenge": "Разработка и сопровождение",
-            "google_query": "DevOps Kubernetes OnPrem",
+            "core_challenge": "Разработка сервисов",
+            "google_query": user_text.split()[:3],
             "ngram_phrase": ""
         }
 
     role_query = brief_profile.get("role", "Разработчик")
-    google_q = brief_profile.get("google_query", "DevOps Kubernetes")
+    google_q = brief_profile.get("google_query", "Разработчик")
     rare_techs = brief_profile.get("must_have", [])
-    rare_term = rare_techs[0] if rare_techs else "Kubernetes"
+    rare_term = rare_techs[0] if rare_techs else "Backend"
     ngram_phrase = brief_profile.get("ngram_phrase", "")
 
-    mode_info = "Хабр, Работа России, SuperJob, TG" if google_quota_exhausted else "Google CSE, Хабр, Работа России, SuperJob, TG"
-    await status_msg.edit_text(f"🔍 [2/3] Поиск кандидатов через [{mode_info}]...")
+    mode_info = "Хабр, SuperJob, Работа России, TG" if google_quota_exhausted else "Google CSE, Хабр, SuperJob, TG"
+    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск кандидатов через [{mode_info}]...")
 
+    # Шаг 2: Параллельный опрос с защитой от зависания
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        # Базовые открытые источники (работают всегда)
         tasks = [
-            fetch_habr(http_client, rare_term, 8),
-            fetch_trudvsem(http_client, role_query, 6),
-            fetch_superjob(http_client, rare_term, 6),
+            fetch_habr(http_client, rare_term, 6),
+            fetch_trudvsem(http_client, role_query, 5),
+            fetch_superjob(http_client, rare_term, 5),
             search_telegram_native(rare_term),
         ]
 
-        # Подключаем Google только если лимит не исчерпан
         if not google_quota_exhausted and GOOGLE_API_KEY:
             tasks.append(search_google_custom(http_client, google_q, count=6))
             if len(ngram_phrase.split()) >= 3:
                 tasks.append(search_google_custom(http_client, f'"{ngram_phrase}"', count=3))
 
         try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5.0)
+            # Жесткий общий таймаут 4 секунды с возвратом частичных результатов
+            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.0)
+            valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception:
-            results = []
+            valid_results = []
 
-    raw_vacancies = [item for sublist in results for item in sublist]
-    unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
+    unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Вакансии не найдены ни в одном источнике. Попробуйте уточнить стек в брифе.")
+        await safe_edit_status(status_msg, "❌ Вакансии не найдены в открытых источниках. Попробуйте передать более развернутый бриф.")
         return
 
-    await status_msg.edit_text(f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:10])} кандидатов в Groq LPU...")
+    await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:8])} кандидатов в Groq LPU...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -400,33 +402,30 @@ async def handle_vacancy(message: Message):
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
         f"Описание: {v['desc']}\n"
-        for idx, v in enumerate(unique_vacancies[:10], 1)
+        for idx, v in enumerate(unique_vacancies[:8], 1)
     ]
     candidates_payload = "\n".join(compact_candidates)
 
-    prompt_matrix = f"""Ты — беспощадный OSINT-аудитор. Твоя задача — отсеять ложные совпадения и вычислить истинного прямого заказчика.
+    # Шаг 3: Матричный скоринг
+    prompt_matrix = f"""Ты — беспощадный OSINT-аудитор. Отсей ложные совпадения и найди оригинального заказчика.
 
-ЭТАЛОННЫЙ ПРОФИЛЬ ПРОЕКТА:
+ЭТАЛОННЫЙ ПРОФИЛЬ:
 {json.dumps(brief_profile, ensure_ascii=False, indent=2)}
 
-СПИСОК НАЙДЕННЫХ ВАКАНСИЙ:
+СПИСОК ВАКАНСИЙ:
 {candidates_payload}
 
-МАТРИЦА ОЦЕНКИ И ДИСКВАЛИФИКАЦИИ:
-1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР СРАЗУ <= 35%):
-   - Если в эталоне OnPrem/Bare-metal, а у кандидата Cloud (AWS/GCP/Azure).
-   - Если базовый стек не покрывает редкие 'must_have' требования из эталона.
-   - Если домен бизнеса кардинально противоречит (например, GameDev вместо Банкинга).
-2. ВЕСА ДЛЯ НАЧИСЛЕНИЯ БАЛЛОВ:
-   - [40%] Совпадение архитектурного вызова ('core_challenge').
-   - [35%] Полнота покрытия редкого стека ('must_have').
-   - [15%] Специфика инфраструктуры ('infra_type').
-   - [10%] Совпадение домена ('domain').
-3. Если совпала дословная фраза из задач или цитата — вероятность 95-99%.
+ПРАВИЛА:
+1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР <= 35%):
+   - Разные архитектуры (Cloud вместо OnPrem).
+   - Не совпал must_have стек.
+2. ВЕСА:
+   - [40%] Архитектурный вызов ('core_challenge').
+   - [35%] Полнота must_have стека.
+   - [25%] Специфика среды и домен.
+3. Дословная цитата задач в описании дает 95-99%.
 
-Выведи строго ТОП-3 кандидатов по убыванию реального скора.
-
-ОФОРМИ СТРОГО ПО ШАБЛОНУ:
+Выведи ТОП-3 кандидатов по шаблону:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании или канал]
 🎯 **Матричный скор:** [XX]%
@@ -434,23 +433,21 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник](URL)
-🏛 **Источник:** [Google X-Ray / Хабр / Работа России / SuperJob / Telegram]
+🏛 **Источник:** [Google / Хабр / Работа России / SuperJob / Telegram]
 
-⚖️ **Аудит по матрице (Почему такой скор):**
-• **Must-have стек:** [Что конкретно совпало из редких технологий, а чего не хватает]
-• **Архитектурный вызов:** [Совпала ли реальная проектная задача или это типовая поддержка]
-• **Инфраструктура/Домен:** [Совпадение по контуру (OnPrem/Cloud) и сфере бизнеса]
+⚖️ **Аудит по матрице:**
+• **Must-have стек:** [Что совпало, чего не хватает]
+• **Архитектурный вызов:** [Реальная проектная задача]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Точная роль ЛПР: Head of Infrastructure, CTO, Lead DevOps]
-• **Болевая точка:** [Главная инженерная боль]
-• **Холодный хук:** [1-2 предложения хук для первого контакта в LinkedIn/Telegram]
-══════════════════════════════
-"""
+• **К кому идти:** [Роль ЛПР: CTO, Lead DevOps, Head of Eng]
+• **Болевая точка:** [Главная боль проекта]
+• **Холодный хук:** [1-2 предложения хук для первого контакта]
+══════════════════════════════"""
 
-    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1600)
+    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1500)
     if not result_text:
-        await status_msg.edit_text(f"⚠️ Ошибка генерации: {err}")
+        await safe_edit_status(status_msg, f"⚠️ Ошибка обработки: {err}")
         return
 
     enhanced_lines = []
@@ -467,15 +464,15 @@ async def handle_vacancy(message: Message):
             enhanced_lines.append(line)
 
     fallback_badge = "\nℹ️ *Режим работы: Открытые API (квота Google исчерпана)*\n" if google_quota_exhausted else ""
-    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ**{fallback_badge}\n" + "\n".join(enhanced_lines)
+    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
         parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
-        await status_msg.edit_text(parts[0], parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await safe_edit_status(status_msg, parts[0])
         for p in parts[1:]:
             await message.answer(p, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     else:
-        await status_msg.edit_text(final_output, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await safe_edit_status(status_msg, final_output)
 
 
 async def main():
