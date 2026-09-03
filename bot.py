@@ -9,15 +9,23 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 from groq import AsyncGroq
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 # ----------------- КОНФИГУРАЦИЯ -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8982024680:AAGSIE8AbyboYoG1HcxLmI9-7ljX2JbTk7s")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
 SUPERJOB_KEY = "v3.r.137453308.2b27077a942fb8adcdba08488e08d669db756f70.9b015112521c7e90ef8c34fbc87e5b222fb2ea67"
 
+# Данные авторизации Telethon
+TG_API_ID = 34645565
+TG_API_HASH = "95a795c728a02edb5ed9bbe36289454d"
+TG_SESSION_STRING = "1ApWapzMBuyXchwXzM24tiq9__tlPtWNNFsgnWBO-LAu6w4mz6YLBZ3Vz45ToetY0XPXoZNacT90-QLNUMazCumsgEiqaXdnS9tJNXGCIqyK5fWEzkJcVCivWmNllXbjV9FlHYvEwqHFEXTPw0Cpi7HTHiiZpyj_XD2jwkPPr9r9eVlYNOizF3YXEnYEE1CFPgZvh3p2H1DeixKdZzFmxmuYWvhB9QJahw1Mn1JNEgEFriRKoGHcyDt4CKFC9Q7p8xZ3cy4OeMyYleClP8YzT6IWZ_8pXCb_HfUu2L_phhy46VFNI2A5gtbry-ktXwmJrFWnqLXpAzTSCfIJACwKDvC6REtmOxN4="
+
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
+telethon_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
@@ -40,6 +48,12 @@ TECH_KEYWORDS = (
     "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
 )
 
+# Профильные IT-каналы для внутреннего поиска по истории
+TARGET_TG_CHANNELS = [
+    "normrabota", "it_jobs", "devops_jobs", "job_finder_dev",
+    "qa_jobs", "jvmjobs", "forpython", "devjobs"
+]
+
 # ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -57,7 +71,7 @@ def run_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
-# ----------------- УТИЛИТЫ -----------------
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
@@ -217,39 +231,45 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
         return []
 
 
-async def fetch_telegram_channel(client: httpx.AsyncClient, channel: str, search_terms: list) -> list:
-    url = f"https://t.me/s/{channel}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+# ----------------- TELETHON SEARCH ПО КАНАЛАМ -----------------
+async def search_telegram_native(search_term: str) -> list:
     jobs = []
-    try:
-        r = await client.get(url, headers=headers, timeout=2.0)
-        raw_posts = re.findall(r'class="tgme_widget_message_text[^>]*>(.*?)</div>', r.text, flags=re.DOTALL)
-        for post in raw_posts[-10:]:
-            clean_text = clean_html(post)
-            post_lower = clean_text.lower()
-            matches = sum(1 for term in search_terms if term.lower() in post_lower)
-            if matches >= 2 or (len(search_terms) == 1 and matches >= 1):
-                jobs.append({
-                    "id": None,
-                    "source": f"Telegram (@{channel})",
-                    "title": f"Пост из @{channel}",
-                    "company": f"@{channel}",
-                    "salary": "в посте",
-                    "url": f"https://t.me/{channel}",
-                    "desc": clean_text[:250],
-                })
-                break
-    except Exception:
-        pass
+    if not telethon_client.is_connected():
+        return jobs
+
+    clean_term = search_term.strip()
+    if not clean_term:
+        return jobs
+
+    for channel in TARGET_TG_CHANNELS[:4]:
+        try:
+            async for message in telethon_client.iter_messages(channel, search=clean_term, limit=2):
+                if message.text:
+                    post_text = clean_html(message.text)
+                    post_url = f"https://t.me/{channel}/{message.id}"
+                    company_match = re.search(r"(?:компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
+                    company = company_match.group(1).strip() if company_match else f"@{channel}"
+
+                    jobs.append({
+                        "id": None,
+                        "source": f"Telegram (@{channel})",
+                        "title": post_text[:40] + "...",
+                        "company": company,
+                        "salary": "в посте",
+                        "url": post_url,
+                        "desc": post_text[:250],
+                    })
+        except Exception:
+            continue
     return jobs
 
 
-# ----------------- ХЭНДЛЕРЫ -----------------
+# ----------------- ОБРАБОТЧИКИ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте обезличенный бриф. Бот выполнит параллельный скоринг баз и выявит прямого заказчика.",
+        "💼 **Multi-Source OSINT Lead Hunter (MTProto Pro)**\n\n"
+        "Отправьте обезличенный бриф. Бот выполнит параллельный скоринг по **hh.ru, Хабр, SuperJob и Telegram-каналам**.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -262,7 +282,7 @@ async def handle_vacancy(message: Message):
     prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 3 запроса через точку с запятой в одну строку:
 1. Роль для hh.ru строго с оператором NAME:(...). Пример: NAME:("DevOps") или NAME:("Backend").
 2. Связка из 2-3 ключевых технологий через пробел. Пример: 'Kubernetes Helm PostgreSQL'.
-3. Самый редкий/специфичный термин задачи или продукта (1-2 слова). Пример: 'OnPrem' или 'промодвижок'.
+3. Самый специфичный термин стека или продукта для точного поиска (1-2 слова). Пример: 'Kafka' или 'OnPrem'.
 Текст:
 {user_text[:500]}"""
 
@@ -273,21 +293,18 @@ async def handle_vacancy(message: Message):
 
     role_query = queries[0]
     stack_query = queries[1]
-    tg_terms = [w for w in re.findall(r"[a-zA-Z0-9\+\#\-]+", stack_query) if len(w) > 2][:3]
+    tg_search_term = queries[2] if len(queries) > 2 else queries[1].split()[0]
 
-    # Клиент без привязки к h2
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             fetch_hh(http_client, role_query, 8),
             fetch_habr(http_client, stack_query, 8),
-            fetch_superjob(http_client, stack_query, 6),
-            fetch_telegram_channel(http_client, "normrabota", tg_terms),
-            fetch_telegram_channel(http_client, "it_jobs", tg_terms),
-            fetch_telegram_channel(http_client, "devops_jobs", tg_terms),
+            fetch_superjob(http_client, stack_query, 5),
+            search_telegram_native(tg_search_term),
         ]
-        
+
         try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=3.5)
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=4.0)
         except Exception:
             results = []
 
@@ -384,6 +401,10 @@ async def handle_vacancy(message: Message):
 
 async def main():
     threading.Thread(target=run_health_server, daemon=True).start()
+    try:
+        await telethon_client.start()
+    except Exception:
+        pass
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
