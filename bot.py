@@ -15,7 +15,7 @@ dp = Dispatcher()
 
 
 def call_ai(prompt: str) -> str:
-    """Запрос через OpenRouter с автоперебором доступных бесплатных моделей."""
+    """Запрос через OpenRouter к 100% активным бесплатным моделям."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY.strip()}",
@@ -24,11 +24,13 @@ def call_ai(prompt: str) -> str:
         "X-Title": "JobHunterBot",
     }
 
+    # Постоянно поддерживаемые бесплатные модели на OpenRouter
     free_models = [
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "mistralai/mistral-small-24b-instruct-2501:free",
-        "qwen/qwen-2.5-72b-instruct:free",
+        "deepseek/deepseek-chat:free",
+        "deepseek/deepseek-r1:free",
+        "google/gemma-2-9b-it:free",
+        "mistralai/mistral-7b-instruct:free",
+        "meta-llama/llama-3.2-3b-instruct:free",
     ]
 
     last_error = ""
@@ -38,7 +40,7 @@ def call_ai(prompt: str) -> str:
             "messages": [{"role": "user", "content": prompt}],
         }
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=30)
+            r = requests.post(url, headers=headers, json=payload, timeout=40)
             data = r.json()
             if "choices" in data and len(data["choices"]) > 0:
                 return data["choices"][0]["message"]["content"]
@@ -131,8 +133,8 @@ async def handle_vacancy(message: Message):
     )
 
     keywords_prompt = (
-        f"Выдели 2-3 поисковых слова для этой вакансии (роль и стек, например 'Python FastAPI'). "
-        f"В ответе напиши ТОЛЬКО эти слова:\n{user_text}"
+        f"Выдели 2-3 ключевых слова для поиска вакансий (роль и стек, например 'Python Django' или 'DevOps'). "
+        f"В ответе выведи ТОЛЬКО эти слова:\n{user_text}"
     )
     kw_result = call_ai(keywords_prompt)
     search_query = (
@@ -149,7 +151,7 @@ async def handle_vacancy(message: Message):
         return
 
     matching_prompt = f"""
-Ты — эксперт по анализу рынка труда.
+Ты — HR-эксперт.
 Исходная вакансия:
 {user_text}
 
@@ -160,7 +162,7 @@ async def handle_vacancy(message: Message):
 1. Рассчитай:
    - 🎯 Совпадение по роли/стеку: от 0% до 100%
    - 🕵️ Вероятность, что это та же компания: от 0% до 100%
-2. Выбери 3-5 наиболее релевантных вакансий (по убыванию совпадения).
+2. Выбери 3-5 наиболее подходящих предложений.
 3. Оформи строго по шаблону:
 🔹 [Должность]
 🏢 Компания: [Название]
@@ -169,7 +171,7 @@ async def handle_vacancy(message: Message):
 🕵️ Вероятность, что это та же компания: [Y]%
 💰 Зарплата: [Вилка или 'не указана']
 🔗 Ссылка: [URL]
-💡 Комментарий: (1 краткое предложение сути сходства)
+💡 Комментарий: (1 предложение: суть совпадения)
 """
 
     result_text = call_ai(matching_prompt)
