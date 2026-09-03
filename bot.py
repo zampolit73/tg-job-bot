@@ -1,9 +1,9 @@
 import asyncio
-import json
 import os
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 
@@ -15,41 +15,55 @@ OPENROUTER_KEY = "sk-or-v1-13a51f8fca432b3461f338838737145ffed1e29b430c2f255aa3c
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
-# Черный список явных рекрутинговых агентств и посредников (чтобы искать прямых клиентов)
 KNOWN_AGENCIES = [
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
     "агентство", "selecty", "ancor", "анкор", "кадры", "outstaff", "аутстафф"
 ]
 
 
-def call_ai(prompt: str, json_mode: bool = False) -> str:
-    """Запрос через OpenRouter с автомаршрутизацией по бесплатным моделям."""
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
+def call_ai_fast(prompt: str) -> str:
+    """Быстрый запрос к ИИ без зависаний с коротким таймаутом."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY.strip()}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://render.com",
-        "X-Title": "SalesClientFinderBot",
+        "X-Title": "SalesLeadHunterBot",
     }
 
-    models_to_try = [
-        "openrouter/free",
-        "openrouter/auto",
-        "mistralai/mistral-small-3-instruct:free",
+    models = [
         "google/gemma-2-9b-it:free",
+        "deepseek/deepseek-chat:free",
+        "mistralai/mistral-small-3-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
     ]
 
-    for model in models_to_try:
+    for model in models:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
+            "max_tokens": 1200,
         }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=35)
+            r = requests.post(url, headers=headers, json=payload, timeout=18)
             data = r.json()
             if "choices" in data and len(data["choices"]) > 0:
                 return data["choices"][0]["message"]["content"]
@@ -60,33 +74,25 @@ def call_ai(prompt: str, json_mode: bool = False) -> str:
 
 
 def is_agency(company_name: str) -> bool:
-    """Проверка, не является ли компания рекрутинговым агентством."""
     lower_name = company_name.lower()
-    return any(agency_word in lower_name for agency_word in KNOWN_AGENCIES)
+    return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-def fetch_hh(query: str, count: int = 15) -> list:
-    """Парсинг hh.ru с отсевом кадровых агентств."""
+def fetch_hh(query: str, count: int = 12) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "SalesLeadHunter/2.0"}
+    headers = {"User-Agent": "SalesLeadHunter/3.0"}
     jobs = []
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=8).json()
+        r = requests.get(url, params=params, headers=headers, timeout=6).json()
         for item in r.get("items", []):
             company = item.get("employer", {}).get("name", "Не указана")
-            # Отсекаем очевидных посредников
             if is_agency(company):
                 continue
-
             sal = item.get("salary")
             sal_str = "не указана"
             if sal:
-                f, t, c = (
-                    sal.get("from") or "",
-                    sal.get("to") or "",
-                    sal.get("currency") or "",
-                )
+                f, t, c = (sal.get("from") or "", sal.get("to") or "", sal.get("currency") or "")
                 sal_str = f"{f} - {t} {c}".strip()
 
             jobs.append({
@@ -102,24 +108,19 @@ def fetch_hh(query: str, count: int = 15) -> list:
     return jobs
 
 
-def fetch_habr(query: str, count: int = 15) -> list:
-    """Парсинг Хабр Карьеры с отсевом посредников."""
+def fetch_habr(query: str, count: int = 12) -> list:
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": query, "per_page": count}
-    headers = {"User-Agent": "SalesLeadHunter/2.0"}
+    headers = {"User-Agent": "SalesLeadHunter/3.0"}
     jobs = []
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=8).json()
+        r = requests.get(url, params=params, headers=headers, timeout=6).json()
         for item in r.get("list", []):
             company = item.get("company", {}).get("title", "Не указана")
             if is_agency(company):
                 continue
-
             sal = item.get("salary", {})
-            sal_str = "не указана"
-            if sal and sal.get("formatted"):
-                sal_str = sal.get("formatted")
-
+            sal_str = sal.get("formatted") if sal and sal.get("formatted") else "не указана"
             href = item.get("href", "")
             full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
 
@@ -140,112 +141,71 @@ def fetch_habr(query: str, count: int = 15) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **B2B Lead Finder: Детектор прямого заказчика**\n\n"
-        "Отправьте мне текст обезличенной вакансии конкурента или агентства.\n"
-        "Я проанализирую маркеры продукта, архитектуру, стек, исключу посредников "
-        "и вычислю прямые компании с открытой потребностью."
+        "Отправьте мне описание вакансии конкурента или агентства.\n"
+        "Я исключу посредников и найду прямые компании с открытой потребностью."
     )
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer(
-        "🕵️ **Шаг 1/3:** Выделяю уникальные проектные маркеры и поисковые комбинации..."
-    )
+    status_msg = await message.answer("🕵️ **Шаг 1/3:** Выделяю ключевые маркеры и поисковые запросы...")
 
-    # 1. Формирование нескольких точных поисковых запросов
-    extract_prompt = f"""
-Ты — OSINT-аналитик в B2B-продажах IT-услуг.
-Твоя цель: помочь сейлзу найти конечного клиента, чью вакансию перепродают аутстафферы/агентства.
+    # 1. Быстрое извлечение 2 поисковых фраз (без медленного json_mode)
+    prompt_kw = f"""На основе описания вакансии сформируй 2 коротких поисковых запроса (по 2-3 слова).
+Первый — точная роль со стеком (например: 'Product Analyst дашборды').
+Второй — специфика задач (например: 'промодвижок витрины данных').
+Выведи ТОЛЬКО эти 2 строки через точку с запятой:
+{user_text}"""
 
-Текст вакансии:
-{user_text}
+    kw_res = call_ai_fast(prompt_kw)
+    queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 2]
+    if not queries:
+        queries = ["Аналитик данных SQL", "Product Analyst"]
 
-Задачи:
-1. Выдели редкую связку стека (например, не просто 'Java', а 'Java Spring Cloud Kafka ClickHouse').
-2. Выдели отраслевые/бизнес маркеры (например, 'процессинг платежей', 'WMS логистика', 'highload e-commerce').
-3. Сформируй 2 коротких поисковых запроса (по 2-4 слова каждый).
+    await status_msg.edit_text(f"🔍 **Шаг 2/3:** Ищу прямых работодателей по: `{', '.join(queries[:2])}`...")
 
-Выведи ответ СТРОГО в формате JSON без markdown и пояснений:
-{{"queries": ["запрос_1", "запрос_2"]}}
-"""
-
-    search_queries = []
-    ai_extract = call_ai(extract_prompt, json_mode=True)
-    try:
-        # Очистка от лишних markdown-оберток если модель их добавила
-        clean_json = re.search(r"\{.*\}", ai_extract, re.DOTALL)
-        if clean_json:
-            parsed = json.loads(clean_json.group())
-            search_queries = parsed.get("queries", [])
-    except Exception:
-        pass
-
-    if not search_queries:
-        search_queries = ["Python FastAPI", "Backend Developer"]
-
-    await status_msg.edit_text(
-        f"🔍 **Шаг 2/3:** Ищу прямых работодателей по маркерам: `{', '.join(search_queries)}`..."
-    )
-
-    # 2. Сбор вакансий по нескольким веткам запросов
+    # 2. Сбор вакансий
     raw_vacancies = []
-    for q in search_queries:
-        raw_vacancies.extend(fetch_hh(q, count=10))
-        raw_vacancies.extend(fetch_habr(q, count=10))
+    for q in queries[:2]:
+        raw_vacancies.extend(fetch_hh(q))
+        raw_vacancies.extend(fetch_habr(q))
 
-    # Удаляем дубликаты по URL
     unique_vacancies = list({v["url"]: v for v in raw_vacancies}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text(
-            "❌ Не удалось найти релевантные вакансии прямых работодателей. Попробуйте передать более подробное описание с задачами и стеком."
-        )
+        await status_msg.edit_text("❌ Не удалось найти открытые вакансии прямых работодателей. Попробуйте передать текст с более четким стеком/ролью.")
         return
 
-    await status_msg.edit_text(
-        f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} вакансий, отсеиваю посредников и вычисляю конечного заказчика..."
-    )
+    await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} вакансий и вычисляю прямого клиента...")
 
-    # 3. Глубокий скоринг и детекция прямого клиента
-    deep_analysis_prompt = f"""
-Ты — эксперт по расследованию и детекции конечных заказчиков для B2B-аутстаффинга.
-
-ОБЕЗЛИЧЕННАЯ ВАКАНСИЯ АГЕНТСТВА/КОНКУРЕНТА:
+    # 3. Скоринг прямого заказчика
+    prompt_match = f"""Ты — OSINT-аналитик для сейлза в IT-аутстаффинге.
+ОБЕЗЛИЧЕННЫЙ ЗАПРОС КЛИЕНТА:
 \"\"\"{user_text}\"\"\"
 
-НАЙДЕННЫЕ ВАКАНСИИ ПРЯМЫХ КОМПАНИЙ:
-{unique_vacancies[:18]}
+ОТКРЫТЫЕ ВАКАНСИИ ПРЯМЫХ КОМПАНИЙ:
+{unique_vacancies[:12]}
 
-ТВОЯ ЦЕЛЬ:
-Определить, какая из этих компаний с наибольшей вероятностью является КОНЕЧНЫМ ЗАКАЗЧИКОМ (тем, кто на самом деле нанимает этих людей).
+ЗАДАЧА:
+Вычисли ТОП-3 компаний, которые с наибольшей вероятностью являются конечным заказчиком или имеют идентичную горящую потребность.
 
-Оценивай:
-1. Совпадение специфических обязанностей и описания проекта.
-2. Совпадение архитектуры и редких технологий.
-3. Совпадение вилок зарплат или грейда.
-
-ВЫВЕДИ ТОП-3 САМЫХ ПЕРСПЕКТИВНЫХ КОМПАНИЙ ДЛЯ ВЫХОДА СЕЙЛЗА:
-
-Формат каждого кандидата:
-🎯 **[Название компании]** — Вероятность, что это прямой заказчик: **[X]%**
-🔹 Должность в оригинале: [Название вакансии]
-🌐 Источник: [hh.ru или Хабр Карьера] | 💰 Зарплата: [Вилка или 'не указана']
+Формат для каждой компании:
+🎯 **[Компания]** — Вероятность совпадения: **[X]%**
+🔹 Должность: [Название вакансии]
+🌐 Источник: [hh.ru или Хабр Карьера] | 💰 Зарплата: [Вилка]
 🔗 Ссылка: [URL]
-🕵️ **Улики и маркеры совпадения:** (2-3 конкретных факта, почему это именно они: стек, домен, схожие формулировки задач)
-💡 **Рекомендация сейлзу:** (Как зайти: кого искать в LinkedIn/Telegram и под какую боль предлагать ресурсы)
-
-Если ни одна компания не похожа на 100% того же заказчика, укажи те, у которых аналогичный стек и горящая потребность прямо сейчас.
+🕵️ **Маркеры совпадения:** (почему это они: совпадение по продукту, задачам или стеку)
+💡 **Как зайти сейлзу:** (кому писать в компании и какую боль закрывать)
 """
 
-    result_text = call_ai(deep_analysis_prompt)
-
+    result_text = call_ai_fast(prompt_match)
     if not result_text:
-        await status_msg.edit_text("Ошибка при генерации аналитики. Попробуйте еще раз.")
+        await status_msg.edit_text("Не удалось сформировать отчет. Пожалуйста, отправьте вакансию еще раз.")
         return
 
     if len(result_text) > 4000:
-        parts = [result_text[i : i + 4000] for i in range(0, len(result_text), 4000)]
+        parts = [result_text[i:i+4000] for i in range(0, len(result_text), 4000)]
         await status_msg.edit_text(parts[0])
         for p in parts[1:]:
             await message.answer(p)
@@ -253,19 +213,8 @@ async def handle_vacancy(message: Message):
         await status_msg.edit_text(result_text)
 
 
-async def handle_ping(request):
-    return web.Response(text="Bot is running!")
-
-
 async def main():
-    port = int(os.environ.get("PORT", 10000))
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
+    threading.Thread(target=run_health_server, daemon=True).start()
     await dp.start_polling(bot)
 
 
