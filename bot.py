@@ -7,7 +7,6 @@ import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from groq import Groq
-from duckduckgo_search import DDGS
 
 # ----------------- КЛЮЧИ -----------------
 TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
@@ -30,7 +29,7 @@ TECH_KEYWORDS = [
     "devops", "kubernetes", "k8s", "docker", "ansible", "terraform",
     "qa", "тестировщик", "automation", "autotest", "selenium", "playwright",
     "data science", "ml", "системный аналитик", "бизнес-аналитик", "product manager",
-    "ios", "swift", "android", "flutter", "1c", "1с"
+    "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
 ]
 
 
@@ -52,6 +51,7 @@ def run_health_server():
 
 
 def call_groq(prompt: str, max_tokens: int = 1500) -> str:
+    """Вызов рабочей модели Groq с автопереключением."""
     models_to_try = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
     for model_name in models_to_try:
         try:
@@ -61,7 +61,9 @@ def call_groq(prompt: str, max_tokens: int = 1500) -> str:
                 temperature=0.1,
                 max_tokens=max_tokens
             )
-            return res.choices[0].message.content
+            content = res.choices[0].message.content
+            if content and len(content.strip()) > 0:
+                return content
         except Exception:
             continue
     return ""
@@ -75,7 +77,8 @@ def fallback_extract_keywords(text: str) -> list:
             found.append(tech)
     if found:
         return [" ".join(found[:3]), found[0]]
-    return [text.split("\n")[0][:35].strip(), "IT"]
+    first_phrase = text.split("\n")[0][:30].strip()
+    return [first_phrase if first_phrase else "IT Вакансия", "Разработчик"]
 
 
 def is_agency(company_name: str) -> bool:
@@ -83,11 +86,11 @@ def is_agency(company_name: str) -> bool:
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-# 1. HeadHunter
+# 1. HeadHunter API
 def fetch_hh(query: str, count: int = 10) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "MultiSourceHunter/1.0"}
+    headers = {"User-Agent": "MultiSourceHunter/2.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=5).json()
@@ -110,11 +113,11 @@ def fetch_hh(query: str, count: int = 10) -> list:
     return jobs
 
 
-# 2. Хабр Карьера
+# 2. Хабр Карьера API
 def fetch_habr(query: str, count: int = 10) -> list:
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": query, "per_page": count}
-    headers = {"User-Agent": "MultiSourceHunter/1.0"}
+    headers = {"User-Agent": "MultiSourceHunter/2.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=5).json()
@@ -139,31 +142,27 @@ def fetch_habr(query: str, count: int = 10) -> list:
     return jobs
 
 
-# 3. Веб-поисковик (DuckDuckGo: ищет по всему интернету, карьерным сайтам и блогам без API-ключей)
-def fetch_web_search(query: str, count: int = 5) -> list:
+# 3. Безопасный веб-поиск (с защитой от сбоев)
+def fetch_web_safe(query: str, count: int = 4) -> list:
     jobs = []
     try:
-        ddgs = DDGS()
-        # Ищем по ключевым словам и карьерным маркерам
-        search_query = f"{query} вакансия карьера"
-        results = list(ddgs.text(search_query, max_results=count))
+        from duckduckgo_search import DDGS
+        ddgs = DDGS(timeout=5)
+        results = list(ddgs.text(f"{query} вакансия", max_results=count))
         for res in results:
             title = res.get("title", "")
-            url = res.get("href", "")
-            snippet = res.get("body", "")
-
-            # Извлекаем потенциальное имя компании из заголовка
-            company_candidate = title.split("—")[0].split("-")[0].split(":")[0].strip()
-            if not is_agency(company_candidate):
+            company_cand = title.split("—")[0].split("-")[0].split(":")[0].strip()
+            if not is_agency(company_cand):
                 jobs.append({
-                    "source": "Веб-поиск (Google/Яндекс)",
+                    "source": "Веб-поиск",
                     "title": title,
-                    "company": company_candidate,
+                    "company": company_cand,
                     "salary": "не указана",
-                    "url": url,
-                    "desc": snippet,
+                    "url": res.get("href", ""),
+                    "desc": res.get("body", ""),
                 })
     except Exception:
+        # Если провайдер заблокировал веб-поиск, продолжаем без него
         pass
     return jobs
 
@@ -172,22 +171,20 @@ def fetch_web_search(query: str, count: int = 5) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source B2B Lead Finder**\n\n"
-        "Отправьте мне текст вакансии (требования, задачи, стек).\n"
-        "Я просканирую: **hh.ru**, **Хабр Карьеру** и **открытый веб-поиск**, "
-        "чтобы найти прямого заказчика."
+        "Отправьте мне текст любой вакансии.\n"
+        "Я найду прямых работодателей, исключу кадровые агентства и сформирую рекомендации для выхода на ЛПР."
     )
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("🕵️ **Шаг 1/3:** Сканирую стек и формирую поисковые запросы...")
+    status_msg = await message.answer("🕵️ **Шаг 1/3:** Выделяю маркеры проекта и поисковые связки...")
 
-    prompt_kw = f"""Определи ключевой стек и редкие фразы из текста вакансии.
-Сформируй 2 поисковых запроса:
-1. Роль и главный стек (например: 'C# .NET Backend').
-2. Уникальная фраза или связка библиотек из текста (например: 'мониторинг промодвижка' или 'ASP.NET Core SOLID').
-Выведи ТОЛЬКО 2 запроса через точку с запятой:
+    prompt_kw = f"""Выдели ключевую роль, стек и уникальные проектные термины.
+Сформируй ровно 2 поисковых запроса (по 2-3 слова).
+Пример: 'Аналитик дашборды; промодвижок витрины данных' или 'C# ASP.NET; REST API SOLID'.
+Выведи ТОЛЬКО 2 фразы через точку с запятой:
 {user_text}"""
 
     kw_res = call_groq(prompt_kw, max_tokens=60)
@@ -196,46 +193,46 @@ async def handle_vacancy(message: Message):
         queries = fallback_extract_keywords(user_text)
 
     await status_msg.edit_text(
-        f"🔍 **Шаг 2/3:** Опрашиваю hh.ru, Хабр и Веб по запросам: `{', '.join(queries[:2])}`..."
+        f"🔍 **Шаг 2/3:** Ищу прямые вакансии по маркерам: `{', '.join(queries[:2])}`..."
     )
 
     raw_vacancies = []
-    # Сбор по всем открытым источникам
     for q in queries[:2]:
         raw_vacancies.extend(fetch_hh(q, count=8))
         raw_vacancies.extend(fetch_habr(q, count=8))
-        raw_vacancies.extend(fetch_web_search(q, count=4))
+        raw_vacancies.extend(fetch_web_safe(q, count=3))
 
-    unique_vacancies = list({v["url"]: v for v in raw_vacancies}.values())
+    unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Не удалось найти данные по открытым источникам. Попробуйте передать текст с более четким стеком.")
+        await status_msg.edit_text("❌ Не удалось найти прямые вакансии. Попробуйте передать текст с более четким названием технологий.")
         return
 
-    await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} найденных ссылок из всех источников...")
+    await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} предложений и вычисляю прямого заказчика...")
 
     prompt_match = f"""Ты — OSINT-аналитик сейлз-команды в IT-аутстаффинге.
-ОБЕЗЛИЧЕННЫЙ ТЕКСТ ВАКАНСИИ:
+ОБЕЗЛИЧЕННЫЙ ЗАПРОС КЛИЕНТА (ОТ АГЕНТСТВА/КОНКУРЕНТА):
 \"\"\"{user_text}\"\"\"
 
-НАЙДЕННЫЕ ССЫЛКИ И ВАКАНСИИ ИЗ РАЗНЫХ ИСТОЧНИКОВ:
-{unique_vacancies[:15]}
+ОТКРЫТЫЕ ВАКАНСИИ ПРЯМЫХ КОМПАНИЙ:
+{unique_vacancies[:12]}
 
 ЗАДАЧА:
-Вычисли ТОП-3 компаний, которые с наибольшей вероятностью являются прямым конечным заказчиком или имеют аналогичную горящую потребность.
+Вычисли ТОП-3 компаний, которые с наибольшей вероятностью являются прямым конечным заказчиком или имеют идентичную горящую потребность.
 
 Формат для каждой компании:
 🎯 **[Компания]** — Вероятность совпадения: **[X]%**
-🔹 Название вакансии/страницы: [Название]
+🔹 Должность: [Название вакансии]
 🌐 Источник: [hh.ru / Хабр Карьера / Веб-поиск] | 💰 Зарплата: [Вилка или 'не указана']
 🔗 Ссылка: [URL]
-🕵️ **Маркеры совпадения:** (2-3 конкретных факта: совпадение редкого стека, формулировок задач, архитектуры)
+🕵️ **Маркеры совпадения:** (2-3 конкретных факта: почему это они, сходство задач, терминов промодвижка/витрин/дашбордов или стека)
 💡 **Как зайти сейлзу:** (кому писать и с каким оффером обращаться)
 """
 
     result_text = call_groq(prompt_match, max_tokens=1800)
+    
     if not result_text:
-        await status_msg.edit_text("Не удалось сформировать отчет. Попробуйте еще раз.")
+        await status_msg.edit_text("⚠️ Ошибка: Groq API временно не вернул ответ. Проверьте статус ключа в console.groq.com.")
         return
 
     if len(result_text) > 4000:
