@@ -7,7 +7,7 @@ from aiogram.types import Message
 
 # ----------------- КЛЮЧИ -----------------
 TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
-OPENROUTER_KEY = "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"
+OPENROUTER_KEY = "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"
 # ----------------------------------------
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
