@@ -7,7 +7,7 @@ from aiogram.types import Message
 
 # ----------------- КЛЮЧИ -----------------
 TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
-OPENROUTER_KEY = "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"
+OPENROUTER_KEY = "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"
 # ----------------------------------------
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -18,13 +18,12 @@ def call_ai(prompt: str) -> str:
     """Запрос через OpenRouter с автоперебором доступных бесплатных моделей."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_KEY.strip()}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://render.com",
-        "X-Title": "JobBot",
+        "X-Title": "JobHunterBot",
     }
 
-    # Актуальные бесплатные модели
     free_models = [
         "google/gemini-2.0-flash-exp:free",
         "meta-llama/llama-3.3-70b-instruct:free",
@@ -39,7 +38,7 @@ def call_ai(prompt: str) -> str:
             "messages": [{"role": "user", "content": prompt}],
         }
         try:
-            r = requests.post(url, headers=headers, json=payload, timeout=35)
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
             data = r.json()
             if "choices" in data and len(data["choices"]) > 0:
                 return data["choices"][0]["message"]["content"]
@@ -54,7 +53,6 @@ def call_ai(prompt: str) -> str:
 
 
 def fetch_hh(query: str, count: int = 8) -> list:
-    """Парсинг hh.ru по ключевым словам."""
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
     headers = {"User-Agent": "JobHunterBot/1.0"}
@@ -85,7 +83,6 @@ def fetch_hh(query: str, count: int = 8) -> list:
 
 
 def fetch_habr(query: str, count: int = 8) -> list:
-    """Парсинг Хабр Карьеры по ключевым словам."""
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": query, "per_page": count}
     headers = {"User-Agent": "JobHunterBot/1.0"}
@@ -110,9 +107,7 @@ def fetch_habr(query: str, count: int = 8) -> list:
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
-                "desc": " ".join(
-                    [s.get("title", "") for s in item.get("skills", [])]
-                ),
+                "desc": " ".join([s.get("title", "") for s in item.get("skills", [])]),
             })
     except Exception:
         pass
@@ -135,7 +130,6 @@ async def handle_vacancy(message: Message):
         "⏳ Анализирую стек, собираю данные и считаю вероятности..."
     )
 
-    # 1. Извлечение ключевых слов через ИИ
     keywords_prompt = (
         f"Выдели 2-3 поисковых слова для этой вакансии (роль и стек, например 'Python FastAPI'). "
         f"В ответе напиши ТОЛЬКО эти слова:\n{user_text}"
@@ -147,7 +141,6 @@ async def handle_vacancy(message: Message):
         else "IT"
     )
 
-    # 2. Сбор вакансий из API
     raw_vacancies = fetch_hh(search_query) + fetch_habr(search_query)
     if not raw_vacancies:
         await status_msg.edit_text(
@@ -155,7 +148,6 @@ async def handle_vacancy(message: Message):
         )
         return
 
-    # 3. Скоринг и сравнение
     matching_prompt = f"""
 Ты — эксперт по анализу рынка труда.
 Исходная вакансия:
@@ -182,7 +174,6 @@ async def handle_vacancy(message: Message):
 
     result_text = call_ai(matching_prompt)
 
-    # Разбивка на части, если ответ превышает лимит Telegram в 4096 символов
     if len(result_text) > 4000:
         parts = [
             result_text[i : i + 4000] for i in range(0, len(result_text), 4000)
@@ -199,7 +190,6 @@ async def handle_ping(request):
 
 
 async def main():
-    # Запуск фонового веб-сервера для удержания активного порта на Render
     port = int(os.environ.get("PORT", 10000))
     app = web.Application()
     app.router.add_get("/", handle_ping)
@@ -208,7 +198,6 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    # Запуск бота
     await dp.start_polling(bot)
 
 
