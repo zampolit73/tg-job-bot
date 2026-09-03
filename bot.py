@@ -28,7 +28,6 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
-# Инициализируем Telethon только если переданы креды
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
     telethon_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
@@ -36,6 +35,8 @@ if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
 CLEAN_QUERY_RE = re.compile(r'[^\w\s\+\#\.\-]')
+HH_URL_RE = re.compile(r"hh\.ru/vacancy/(\d+)")
+HABR_URL_RE = re.compile(r"career\.habr\.com/vacancies/(\d+)")
 
 KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
@@ -93,13 +94,51 @@ def build_lead_osint_url(company_name: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(query)}"
 
 
-def fallback_extract_keywords(text: str) -> list:
+def extract_tech_set(text: str) -> set:
     text_lower = text.lower()
-    found = [tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)]
-    if found:
-        return [found[0], " ".join(found[:3]), found[0]]
-    first_phrase = text.split("\n")[0][:30].strip()
-    return [first_phrase if first_phrase else "IT Вакансия", "Kubernetes DevOps", "CI/CD"]
+    return {tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)}
+
+
+def calculate_jaccard_similarity(set_a: set, set_b: set) -> float:
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a.intersection(set_b))
+    union = len(set_a.union(set_b))
+    return intersection / union if union > 0 else 0.0
+
+
+# ----------------- ПАРСИНГ ПРЯМЫХ ССЫЛОК -----------------
+async def resolve_url_input(client: httpx.AsyncClient, text: str) -> tuple[str, str]:
+    hh_match = HH_URL_RE.search(text)
+    if hh_match:
+        vac_id = hh_match.group(1)
+        url = f"https://api.hh.ru/vacancies/{vac_id}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        try:
+            r = await client.get(url, headers=headers, timeout=3.0)
+            data = r.json()
+            title = data.get("name", "")
+            desc = clean_html(data.get("description", ""))
+            skills = " ".join([s.get("name", "") for s in data.get("key_skills", [])])
+            return f"Роль: {title}\nСтек: {skills}\nОписание: {desc}", f"hh.ru/vacancy/{vac_id}"
+        except Exception:
+            pass
+
+    habr_match = HABR_URL_RE.search(text)
+    if habr_match:
+        vac_id = habr_match.group(1)
+        url = f"https://career.habr.com/api/frontend/vacancies/{vac_id}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        try:
+            r = await client.get(url, headers=headers, timeout=3.0)
+            data = r.json()
+            title = data.get("title", "")
+            desc = clean_html(data.get("description", ""))
+            return f"Роль: {title}\nОписание: {desc}", f"career.habr.com/vacancies/{vac_id}"
+        except Exception:
+            pass
+
+    return text, ""
 
 
 # ----------------- GROQ CLIENT -----------------
@@ -127,10 +166,10 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
 
 
 # ----------------- АСИНХРОННЫЕ ПАРСЕРЫ -----------------
-async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
+async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8, phrase_mode: bool = False) -> list:
     url = "https://api.hh.ru/vacancies"
-    clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
-    params = {"text": clean_q, "area": 113, "per_page": count}
+    q_param = f'"{query}"' if phrase_mode else CLEAN_QUERY_RE.sub(" ", query).strip()
+    params = {"text": q_param, "area": 113, "per_page": count}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         r = await client.get(url, params=params, headers=headers, timeout=2.5)
@@ -152,6 +191,7 @@ async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> lis
                 "salary": sal_str,
                 "url": item.get("alternate_url"),
                 "desc": clean_html(desc),
+                "is_ngram_hit": phrase_mode
             })
         return jobs
     except Exception:
@@ -197,6 +237,7 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
                 "salary": sal_str,
                 "url": full_url,
                 "desc": f"Стек: {skills}",
+                "is_ngram_hit": False
             })
         return jobs
     except Exception:
@@ -233,13 +274,13 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
                 "salary": sal_str,
                 "url": item.get("link", ""),
                 "desc": desc[:250],
+                "is_ngram_hit": False
             })
         return jobs
     except Exception:
         return []
 
 
-# ----------------- БЫСТРЫЙ ПАРАЛЛЕЛЬНЫЙ TELETHON SEARCH -----------------
 async def _scan_single_channel(channel: str, search_term: str) -> list:
     results = []
     try:
@@ -257,6 +298,7 @@ async def _scan_single_channel(channel: str, search_term: str) -> list:
                     "salary": "в посте",
                     "url": post_url,
                     "desc": post_text[:250],
+                    "is_ngram_hit": False
                 })
     except Exception:
         pass
@@ -269,8 +311,6 @@ async def search_telegram_native(search_term: str) -> list:
     clean_term = search_term.strip()
     if not clean_term:
         return []
-    
-    # Параллельный опрос всех целевых каналов одновременно
     tasks = [_scan_single_channel(ch, clean_term) for ch in TARGET_TG_CHANNELS[:5]]
     results = await asyncio.gather(*tasks)
     return [item for sublist in results for item in sublist]
@@ -280,40 +320,50 @@ async def search_telegram_native(search_term: str) -> list:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Secure Edition)**\n\n"
-        "Отправьте обезличенный бриф заявки. Бот выполнит параллельный скоринг баз и выявит прямого заказчика.",
+        "💼 **Multi-Source OSINT Lead Hunter (Smart Matcher)**\n\n"
+        "Отправьте обезличенный бриф заявки или прямую ссылку на вакансию (hh.ru / Хабр).",
         parse_mode=ParseMode.MARKDOWN
     )
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
-    user_text = message.text
-    status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
-
-    prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 3 поисковых запроса через точку с запятой в одну строку:
-1. Профильная должность/роль (без кавычек). Пример: DevOps инженер или Java разработчик.
-2. Связка из 2-3 ключевых технологий через пробел. Пример: Kubernetes Helm PostgreSQL.
-3. Самый специфичный термин стека или продукта (1-2 слова). Пример: Kafka или OnPrem.
-Текст:
-{user_text[:500]}"""
-
-    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=50)
-    queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
-    if not queries or len(queries) < 2:
-        queries = fallback_extract_keywords(user_text)
-
-    role_query = queries[0]
-    stack_query = queries[1]
-    tg_search_term = queries[2] if len(queries) > 2 else queries[1].split()[0]
+    user_input = message.text
+    status_msg = await message.answer("⚡️ Анализирую входящие данные...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
+        processed_text, origin_url = await resolve_url_input(http_client, user_input)
+        if origin_url:
+            await status_msg.edit_text(f"🔗 Вакансия получена по ссылке `{origin_url}`. Извлекаю отпечатки задач...")
+
+        prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 4 параметра через точку с запятой в одну строку:
+1. Профильная должность (без кавычек). Пример: DevOps инженер
+2. Связка из 2-3 ключевых технологий через пробел. Пример: Kubernetes Helm PostgreSQL
+3. Самый специфичный термин стека или продукта (1-2 слова). Пример: Kafka или OnPrem
+4. Уникальная N-грамма: дословная редкая фраза из 3-5 слов из блока задач/обязанностей (без кавычек). Пример: диагностика нетиповых окружений
+Текст:
+{processed_text[:800]}"""
+
+        kw_res, _ = await call_groq_async(prompt_kw, max_tokens=65)
+        queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
+
+        role_query = queries[0] if len(queries) > 0 else "Разработчик"
+        stack_query = queries[1] if len(queries) > 1 else "Kubernetes"
+        tg_search_term = queries[2] if len(queries) > 2 else stack_query.split()[0]
+        ngram_phrase = queries[3] if len(queries) > 3 else ""
+
+        await status_msg.edit_text("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
+
         tasks = [
             fetch_hh(http_client, role_query, 8),
             fetch_habr(http_client, stack_query, 8),
             fetch_superjob(http_client, stack_query, 5),
             search_telegram_native(tg_search_term),
         ]
+
+        # Дополнительный точечный N-граммный запрос по hh.ru
+        if len(ngram_phrase.split()) >= 3:
+            tasks.append(fetch_hh(http_client, ngram_phrase, 5, phrase_mode=True))
 
         try:
             results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=4.0)
@@ -327,7 +377,20 @@ async def handle_vacancy(message: Message):
             await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте передать текст с более конкретным описанием стека.")
             return
 
-        hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:4]
+        # Локальный пре-скоринг (Jaccard Similarity)
+        source_tech_set = extract_tech_set(processed_text)
+        for vac in unique_vacancies:
+            vac_tech_set = extract_tech_set(vac["title"] + " " + vac["desc"])
+            jaccard = calculate_jaccard_similarity(source_tech_set, vac_tech_set)
+            # Бонус 0.5 к рангу за точное N-граммное попадание
+            vac["rank_score"] = jaccard + (0.5 if vac.get("is_ngram_hit") else 0.0)
+
+        # Отбираем ТОП-7 самых релевантных позиций
+        unique_vacancies.sort(key=lambda x: x["rank_score"], reverse=True)
+        top_vacancies = unique_vacancies[:7]
+
+        # Дозагрузка полных описаний hh.ru только для победителей пре-скоринга
+        hh_candidates = [v for v in top_vacancies if v.get("id") and v["source"] == "hh.ru"][:3]
         if hh_candidates:
             try:
                 full_texts = await asyncio.wait_for(
@@ -340,11 +403,11 @@ async def handle_vacancy(message: Message):
             except Exception:
                 pass
 
-    await status_msg.edit_text(f"🧠 Скоринг {len(unique_vacancies)} позиций через Groq LPU...")
+    await status_msg.edit_text(f"🧠 Скоринг ТОП-{len(top_vacancies)} позиций через Groq LPU...")
 
     compact_list = [
-        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:260]}"
-        for idx, v in enumerate(unique_vacancies[:14], 1)
+        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Совпадение отпечатка: {'ДА' if v.get('is_ngram_hit') else 'НЕТ'} | Детали: {v['desc'][:260]}"
+        for idx, v in enumerate(top_vacancies, 1)
     ]
     vacancies_payload = "\n".join(compact_list)
 
@@ -352,15 +415,15 @@ async def handle_vacancy(message: Message):
 Агентство скопировало бриф прямого заказчика. Твоя цель — вычислить ТОП-3 работодателей, у которых взят этот проект.
 
 ОРИГИНАЛЬНЫЙ БРИФ:
-\"\"\"{user_text[:700]}\"\"\"
+\"\"\"{processed_text[:700]}\"\"\"
 
-НАЙДЕННЫЕ ВАКАНСИИ И ПУБЛИКАЦИИ:
+ОТОБРАННЫЕ ВАКАНСИИ И ПУБЛИКАЦИИ:
 {vacancies_payload}
 
 ПРАВИЛА ОЦЕНКИ:
-1. Базовые технологии (Linux, Git, Docker, SQL) не дают права ставить высокий скор (не выше 40%).
-2. Ставь 🟢 Высокую вероятность (80-95%) ТОЛЬКО за совпадение архитектурных задач, специфических окружений или редких связок.
-3. Отсекай компании с непрофильным стеком.
+1. Если совпал 'отпечаток: ДА' — это 90-98% вероятности оригинала.
+2. Базовые технологии (Linux, Git, Docker, SQL) дают не выше 40%.
+3. Выведи строго ТОП-3.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
