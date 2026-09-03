@@ -40,8 +40,6 @@ TECH_KEYWORDS = (
     "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
 )
 
-TG_CHANNELS = ["normrabota", "it_jobs", "devops_jobs", "job_finder_dev"]
-
 # ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -59,7 +57,7 @@ def run_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
+# ----------------- УТИЛИТЫ -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
@@ -186,7 +184,6 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
 
 
 async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
-    # Ограничиваем запрос первыми 2 словами для стабильной отдачи API SuperJob
     words = [w for w in CLEAN_QUERY_RE.sub(" ", query).split() if len(w) > 2][:2]
     clean_q = " ".join(words)
     if not clean_q:
@@ -226,12 +223,10 @@ async def fetch_telegram_channel(client: httpx.AsyncClient, channel: str, search
     jobs = []
     try:
         r = await client.get(url, headers=headers, timeout=2.0)
-        # Извлекаем все текстовые блоки постов через регулярное выражение
         raw_posts = re.findall(r'class="tgme_widget_message_text[^>]*>(.*?)</div>', r.text, flags=re.DOTALL)
         for post in raw_posts[-10:]:
             clean_text = clean_html(post)
             post_lower = clean_text.lower()
-            # Пост засчитывается, если найдено хотя бы 2 совпадения по терминам стека
             matches = sum(1 for term in search_terms if term.lower() in post_lower)
             if matches >= 2 or (len(search_terms) == 1 and matches >= 1):
                 jobs.append({
@@ -249,11 +244,11 @@ async def fetch_telegram_channel(client: httpx.AsyncClient, channel: str, search
     return jobs
 
 
-# ----------------- ХЭНДЛЕРЫ ДИАЛОГА -----------------
+# ----------------- ХЭНДЛЕРЫ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Optimized)**\n\n"
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
         "Отправьте обезличенный бриф. Бот выполнит параллельный скоринг баз и выявит прямого заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -264,7 +259,6 @@ async def handle_vacancy(message: Message):
     user_text = message.text
     status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
 
-    # Извлечение 3 поисковых векторов для максимального охвата
     prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 3 запроса через точку с запятой в одну строку:
 1. Роль для hh.ru строго с оператором NAME:(...). Пример: NAME:("DevOps") или NAME:("Backend").
 2. Связка из 2-3 ключевых технологий через пробел. Пример: 'Kubernetes Helm PostgreSQL'.
@@ -281,7 +275,8 @@ async def handle_vacancy(message: Message):
     stack_query = queries[1]
     tg_terms = [w for w in re.findall(r"[a-zA-Z0-9\+\#\-]+", stack_query) if len(w) > 2][:3]
 
-    async with httpx.AsyncClient(http2=True, follow_redirects=True) as http_client:
+    # Клиент без привязки к h2
+    async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             fetch_hh(http_client, role_query, 8),
             fetch_habr(http_client, stack_query, 8),
@@ -303,7 +298,6 @@ async def handle_vacancy(message: Message):
             await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте передать текст с более конкретным описанием стека.")
             return
 
-        # Дозагрузка полных описаний по ID для кандидатов hh.ru
         hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:4]
         if hh_candidates:
             try:
@@ -319,7 +313,6 @@ async def handle_vacancy(message: Message):
 
     await status_msg.edit_text(f"🧠 Скоринг {len(unique_vacancies)} позиций через Groq LPU...")
 
-    # Расширенный контекст: передаем топ-14 вакансий
     compact_list = [
         f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:260]}"
         for idx, v in enumerate(unique_vacancies[:14], 1)
