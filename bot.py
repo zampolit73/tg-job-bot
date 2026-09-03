@@ -7,44 +7,36 @@ from aiogram.types import Message
 
 # ----------------- КЛЮЧИ -----------------
 TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
-GEMINI_KEY = os.environ.get(
-    "GEMINI_API_KEY",
-    "AQ.Ab8RN6Jyloyq3bkfvMyL7OkXUQqsBBDGXnORlOmQmZGbvKEDYQ",
-)
+OPENROUTER_KEY = "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"
 # ----------------------------------------
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
 
-def call_gemini_rest(prompt: str) -> str:
-    """Прямой REST-запрос к Gemini API с поддержкой токенов формата AQ."""
-    # Передаем ключ и в заголовок Bearer, и в URL для гарантированной авторизации
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+def call_ai(prompt: str) -> str:
+    """Запрос через OpenRouter к бесплатной модели Gemini."""
+    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {GEMINI_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
         "Content-Type": "application/json",
+        "HTTP-Referer": "https://render.com",
+        "X-Title": "JobBot",
     }
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
+    payload = {
+        "model": "google/gemini-2.5-flash:free",
+        "messages": [{"role": "user", "content": prompt}],
+    }
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=25)
-        res_json = r.json()
-        if "candidates" in res_json:
-            return res_json["candidates"][0]["content"]["parts"][0]["text"]
-        elif "error" in res_json:
-            # Резервная попытка через light-модель
-            url_alt = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_KEY}"
-            r_alt = requests.post(
-                url_alt, headers=headers, json=payload, timeout=25
-            )
-            res_alt = r_alt.json()
-            if "candidates" in res_alt:
-                return res_alt["candidates"][0]["content"]["parts"][0]["text"]
-            return f"Ответ API: {res_json['error'].get('message', res_json)}"
-        return "Не удалось разобрать ответ нейросети."
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        data = r.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"]
+        elif "error" in data:
+            return f"Ошибка API OpenRouter: {data['error'].get('message', data)}"
+        return "Модель не вернула ответ."
     except Exception as e:
-        return f"Ошибка соединения с Gemini: {e}"
+        return f"Ошибка сети: {e}"
 
 
 def fetch_hh(query: str, count: int = 8) -> list:
@@ -115,7 +107,7 @@ def fetch_habr(query: str, count: int = 8) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет!\n\n"
-        "Отправь мне текст любой вакансии, а я найду аналогичные предложения на **hh.ru** и **Хабр Карьере**,\n"
+        "Отправь мне текст любой вакансии, а я найду похожие предложения на **hh.ru** и **Хабр Карьере**,\n"
         "рассчитаю **процент совпадения** и оценю **вероятность компании**!"
     )
 
@@ -127,11 +119,14 @@ async def handle_vacancy(message: Message):
         "⏳ Анализирую стек, собираю данные и считаю вероятности..."
     )
 
-    keywords_prompt = f"Выдели 2-3 поисковых слова для вакансии (роль и главный стек, например 'Python FastAPI'). Выведи ТОЛЬКО эти слова:\n{user_text}"
-    kw_result = call_gemini_rest(keywords_prompt)
+    keywords_prompt = (
+        f"Выдели 2-3 поисковых слова для этой вакансии (роль и стек, например 'Python FastAPI'). "
+        f"В ответе напиши ТОЛЬКО эти слова:\n{user_text}"
+    )
+    kw_result = call_ai(keywords_prompt)
     search_query = (
         kw_result.strip().replace("\n", " ")
-        if "Ответ API" not in kw_result
+        if "Ошибка" not in kw_result
         else "IT"
     )
 
@@ -143,30 +138,30 @@ async def handle_vacancy(message: Message):
         return
 
     matching_prompt = f"""
-    Ты — эксперт по подбору персонала.
-    Исходная вакансия:
-    {user_text}
+Ты — эксперт по анализу рынка труда.
+Исходная вакансия:
+{user_text}
 
-    Найденные вакансии:
-    {raw_vacancies}
+Найденные открытые вакансии:
+{raw_vacancies}
 
-    Задачи:
-    1. Рассчитай:
-       - 🎯 Совпадение по роли/стеку: от 0% до 100%
-       - 🕵️ Вероятность, что это та же компания: от 0% до 100%
-    2. Выбери 3-5 наиболее релевантных вакансий (по убыванию совпадения).
-    3. Оформи строго по шаблону:
-    🔹 [Должность]
-    🏢 Компания: [Название]
-    🌐 Источник: (hh.ru или Хабр Карьера)
-    🎯 Совпадение по роли: [X]%
-    🕵️ Вероятность, что это та же компания: [Y]%
-    💰 Зарплата: [Вилка или 'не указана']
-    🔗 Ссылка: [URL]
-    💡 Комментарий: (1 краткое предложение: суть сходства)
-    """
+Задачи:
+1. Рассчитай:
+   - 🎯 Совпадение по роли/стеку: от 0% до 100%
+   - 🕵️ Вероятность, что это та же компания: от 0% до 100%
+2. Выбери 3-5 наиболее релевантных вакансий (по убыванию совпадения).
+3. Оформи строго по шаблону:
+🔹 [Должность]
+🏢 Компания: [Название]
+🌐 Источник: (hh.ru или Хабр Карьера)
+🎯 Совпадение по роли: [X]%
+🕵️ Вероятность, что это та же компания: [Y]%
+💰 Зарплата: [Вилка или 'не указана']
+🔗 Ссылка: [URL]
+💡 Комментарий: (1 краткое предложение: суть сходства)
+"""
 
-    result_text = call_gemini_rest(matching_prompt)
+    result_text = call_ai(matching_prompt)
 
     if len(result_text) > 4000:
         parts = [
@@ -193,10 +188,6 @@ async def main():
     await site.start()
 
     await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 if __name__ == "__main__":
