@@ -22,7 +22,8 @@ groq_client = Groq(api_key=GROQ_API_KEY.strip())
 KNOWN_AGENCIES = [
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
     "агентство", "selecty", "ancor", "анкор", "кадры", "outstaff", "аутстафф",
-    "personnel", "talent", "staff", "headhunting", "подбор персонала"
+    "personnel", "talent", "staff", "headhunting", "подбор персонала",
+    "ibs", "icl", "aston", "bell integrator", "neoflex", "epam", "reksoft", "andersen"
 ]
 
 TECH_KEYWORDS = [
@@ -34,6 +35,16 @@ TECH_KEYWORDS = [
     "data science", "ml", "системный аналитик", "бизнес-аналитик", "product manager",
     "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
 ]
+
+RUSSIAN_STOPWORDS = {
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все", "она", "так",
+    "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по", "только", "ее", "мне", "было",
+    "вот", "от", "меня", "еще", "нет", "о", "из", "ему", "теперь", "когда", "даже", "ну", "вдруг",
+    "ли", "если", "уже", "или", "ни", "быть", "был", "него", "до", "вас", "нибудь", "опять", "уж",
+    "вам", "ведь", "там", "потом", "себя", "ничего", "ей", "может", "они", "тут", "где", "есть",
+    "надо", "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб", "без", "будет", "будто",
+    "про", "при", "опыт", "работа", "работы", "знание", "понимание", "обязанности", "требования"
+}
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -53,12 +64,8 @@ def run_health_server():
     server.serve_forever()
 
 
-def call_groq_safe(prompt: str, max_tokens: int = 2000) -> tuple[str, str]:
-    models = [
-        "llama-3.1-8b-instant",
-        "openai/gpt-oss-20b",
-        "qwen/qwen3.6-27b"
-    ]
+def call_groq_safe(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
+    models = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
     last_err = ""
     for model_name in models:
         try:
@@ -77,6 +84,23 @@ def call_groq_safe(prompt: str, max_tokens: int = 2000) -> tuple[str, str]:
     return "", last_err
 
 
+def extract_best_shingle(text: str, n_words: int = 4) -> str:
+    """N-граммный шинглинг: извлекает уникальную текстовую цепочку для поиска первоисточника."""
+    lines = text.split("\n")
+    cleaned_phrases = []
+    for line in lines:
+        words = re.findall(r"[a-zA-Zа-яА-ЯёЁ0-9\-]+", line.lower())
+        meaningful = [w for w in words if w not in RUSSIAN_STOPWORDS and len(w) > 2]
+        if len(meaningful) >= n_words:
+            cleaned_phrases.append(" ".join(meaningful[:n_words]))
+
+    if cleaned_phrases:
+        # Выбираем фразу с наименее банальными словами (наибольшая средняя длина символов)
+        cleaned_phrases.sort(key=lambda p: sum(len(w) for w in p.split()), reverse=True)
+        return f'"{cleaned_phrases[0]}"'
+    return ""
+
+
 def fallback_extract_keywords(text: str) -> list:
     found = []
     text_lower = text.lower()
@@ -84,9 +108,9 @@ def fallback_extract_keywords(text: str) -> list:
         if re.search(r"\b" + re.escape(tech) + r"\b", text_lower):
             found.append(tech)
     if found:
-        return [f"NAME:({found[0]})", " ".join(found[:3]), f'"{found[0]}"']
+        return [f"NAME:({found[0]})", " ".join(found[:3])]
     first_phrase = text.split("\n")[0][:30].strip()
-    return [first_phrase if first_phrase else "Разработчик", "IT", "Backend"]
+    return [first_phrase if first_phrase else "Разработчик", "IT"]
 
 
 def is_agency(company_name: str) -> bool:
@@ -94,11 +118,10 @@ def is_agency(company_name: str) -> bool:
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-# 1. HeadHunter API с поддержкой расширенных операторов поиска
 def fetch_hh(query: str, count: int = 10) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "DeepOSINTHunter/5.0"}
+    headers = {"User-Agent": "OSINTShingleHunter/6.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=6).json()
@@ -122,12 +145,11 @@ def fetch_hh(query: str, count: int = 10) -> list:
     return jobs
 
 
-# 2. Хабр Карьера API
 def fetch_habr(query: str, count: int = 10) -> list:
     clean_q = re.sub(r'[^\w\s\+\#\.\-]', ' ', query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
-    headers = {"User-Agent": "DeepOSINTHunter/5.0"}
+    headers = {"User-Agent": "OSINTShingleHunter/6.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=6).json()
@@ -153,20 +175,18 @@ def fetch_habr(query: str, count: int = 10) -> list:
     return jobs
 
 
-# 3. Веб-поиск (Exact Match по фразам в кавычках)
-def fetch_web_safe(query: str, count: int = 3) -> list:
+def fetch_web_exact(query: str, count: int = 4) -> list:
     jobs = []
     try:
         from duckduckgo_search import DDGS
         ddgs = DDGS(timeout=5)
-        search_str = query if '"' in query else f"{query} вакансия"
-        results = list(ddgs.text(search_str, max_results=count))
+        results = list(ddgs.text(query, max_results=count))
         for res in results:
             title = res.get("title", "")
             company_cand = title.split("—")[0].split("-")[0].split(":")[0].strip()
             if not is_agency(company_cand):
                 jobs.append({
-                    "source": "Веб-поиск",
+                    "source": "Веб-поиск (Exact Match)",
                     "title": title,
                     "company": company_cand,
                     "salary": "не указана",
@@ -179,7 +199,6 @@ def fetch_web_safe(query: str, count: int = 3) -> list:
 
 
 def build_lead_osint_url(company_name: str) -> str:
-    """Генерация прямой ссылки на поиск руководителей компании в LinkedIn через Google."""
     clean_company = re.sub(r'[\'\"«»]', '', company_name).strip()
     target_role = "CTO OR \"Team Lead\" OR \"Head of Analytics\" OR \"Engineering Manager\""
     query = f'site:linkedin.com/in "{clean_company}" ({target_role})'
@@ -189,10 +208,9 @@ def build_lead_osint_url(company_name: str) -> str:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Deep OSINT B2B Lead Hunter**\n\n"
-        "Отправьте мне текст заявки/вакансии (стек, требования, задачи).\n"
-        "Я запущу поиск по операторам hh.ru, Хабра и веб-цитатам, "
-        "определю конечного заказчика и сформирую ссылки на контакты ЛПР.",
+        "💼 **Deep OSINT Lead Hunter (Chain-of-Thought & Shingling)**\n\n"
+        "Отправьте мне текст входящего запроса/вакансии.\n"
+        "Я сформирую цифровой N-грамм слепок текста, отсеку галлюцинации двухэтапной проверкой и найду конечного заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -200,67 +218,94 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("🔍 **Шаг 1/3:** Глубокий OSINT-анализ и синтез точных операторов...")
+    status_msg = await message.answer("🧬 **Шаг 1/4:** Формирую N-грамм шинглы и поисковые токены...")
 
-    prompt_kw = f"""Ты — эксперт по поисковому синтаксису hh.ru и поисковых систем.
-Изучи текст и сформируй ровно 3 запроса через точку с запятой:
-1. Запрос для названия роли в hh.ru строго через оператор NAME:(...). Например: NAME:("Product Analyst") или NAME:("C#" OR ".NET").
-2. Ядро технологического стека (2-3 главных инструмента). Например: 'ClickHouse Superset SQL' или 'ASP.NET Core PostgreSQL'.
-3. Самая редкая уникальная цитата/словосочетание из текста в кавычках (Exact Match). Например: '"промодвижка"' или '"витрины данных"' или '"микросервисы gRPC"'.
+    # Локальный шинглинг (0 ms)
+    exact_shingle = extract_best_shingle(user_text)
 
-Выведи ТОЛЬКО эти 3 запроса через точку с запятой, без кавычек вокруг всего ответа:
-{user_text[:700]}"""
+    prompt_kw = f"""Выдели ключевую роль и технологическое ядро.
+Сформируй ровно 2 запроса через точку с запятой:
+1. Запрос по роли для hh.ru с оператором NAME:(...). Например: NAME:("Product Analyst") или NAME:("C#").
+2. Стек из 2-3 инструментов. Например: 'ClickHouse Superset' или 'PostgreSQL EF Core'.
+Выведи ТОЛЬКО 2 запроса через точку с запятой:
+{user_text[:600]}"""
 
-    kw_res, _ = call_groq_safe(prompt_kw, max_tokens=70)
+    kw_res, _ = call_groq_safe(prompt_kw, max_tokens=50)
     queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
-    if not queries or len(queries) < 2:
+    if not queries:
         queries = fallback_extract_keywords(user_text)
 
-    search_display = " • ".join([f"`{q}`" for q in queries[:3]])
+    # Добавляем шингл в поисковые маркеры
+    search_labels = [f"`{queries[0]}`", f"`{queries[1]}`"]
+    if exact_shingle:
+        search_labels.append(f"`{exact_shingle}`")
+
     await status_msg.edit_text(
-        f"🌐 **Шаг 2/3:** Сканирую базы по точным операторам:\n{search_display}\n\n*Задействованы: синтаксис hh.ru, Хабр и Exact-Match веб-поиск...*",
+        f"🌐 **Шаг 2/4:** Синхронный опрос баз и Exact Match веб-слепка:\n{' • '.join(search_labels)}...",
         parse_mode=ParseMode.MARKDOWN
     )
 
     raw_vacancies = []
-    # Запрос 1: в hh.ru с поддержкой синтаксиса NAME:
-    raw_vacancies.extend(fetch_hh(queries[0], count=10))
-    # Запрос 2: стек в Хабр и hh.ru
+    raw_vacancies.extend(fetch_hh(queries[0], count=8))
     if len(queries) > 1:
         raw_vacancies.extend(fetch_habr(queries[1], count=8))
         raw_vacancies.extend(fetch_hh(queries[1], count=6))
-    # Запрос 3: веб-поиск по редкой цитате в кавычках
-    if len(queries) > 2:
-        raw_vacancies.extend(fetch_web_safe(queries[2], count=4))
+
+    # Поиск по N-грамм шинглу
+    if exact_shingle:
+        raw_vacancies.extend(fetch_web_exact(exact_shingle, count=3))
 
     unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Не удалось найти открытые позиции по данным точным маркерам. Попробуйте передать текст с более развернутым описанием обязанностей.")
+        await status_msg.edit_text("❌ Не удалось найти релевантных открытых позиций по заданным критериям.")
         return
 
     await status_msg.edit_text(
-        f"📊 **Шаг 3/3:** Скоринг {len(unique_vacancies)} позиций и формирование карточек выхода на ЛПР...",
+        f"⚖️ **Шаг 3/4:** Провожу Chain-of-Thought проверку на расхождения стека для {len(unique_vacancies)} компаний...",
         parse_mode=ParseMode.MARKDOWN
     )
 
     compact_list = []
-    for idx, v in enumerate(unique_vacancies[:14], 1):
+    for idx, v in enumerate(unique_vacancies[:12], 1):
         compact_list.append(
-            f"[{idx}] Компания: {v['company']} | Роль: {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc']}"
+            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Инфо: {v['desc']}"
         )
     vacancies_payload = "\n".join(compact_list)
 
-    prompt_match = f"""Ты — ведущий OSINT-аналитик агентства IT-аутстаффинга.
-ТЕКСТ ОБЕЗЛИЧЕННОЙ ЗАЯВКИ:
-\"\"\"{user_text[:900]}\"\"\"
+    # 1 ЭТАП: Chain-of-Thought «Прокурор» (отсев ложных совпадений)
+    prompt_critique = f"""Ты — строгий технический верификатор. Твоя задача — отсеять ложные совпадения.
+ОРИГИНАЛЬНЫЙ ЗАПРОС:
+\"\"\"{user_text[:700]}\"\"\"
 
-СПИСОК НАЙДЕННЫХ ПОЗИЦИЙ РАБОТОДАТЕЛЕЙ:
+КАНДИДАТЫ:
 {vacancies_payload}
 
 ЗАДАЧА:
-Выбери ТОП-3 наиболее вероятных прямых заказчиков.
-Оформи ответ СТРОГО по следующему формату карточек для каждой компании:
+Для каждой вакансии укажи 1 жесткое несовпадение (если отличается стек, уровень, домен или стек смежный). 
+Выдели топ-3 кандидатов, у которых МЕНЬШЕ ВСЕГО технических расхождений с оригиналом. Напиши кратко."""
+
+    critique_res, _ = call_groq_safe(prompt_critique, max_tokens=600)
+
+    await status_msg.edit_text(
+        "📊 **Шаг 4/4:** Формирую финальные карточки заказчиков и расчет вероятностей...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # 2 ЭТАП: Финальный расчет с учетом результатов верификации
+    prompt_final = f"""Ты — ведущий OSINT-аналитик агентства IT-аутстаффинга.
+ОРИГИНАЛЬНЫЙ ЗАПРОС:
+\"\"\"{user_text[:700]}\"\"\"
+
+СПИСОК ВАКАНСИЙ:
+{vacancies_payload}
+
+АНАЛИЗ РАСХОЖДЕНИЙ (ОТСЕВ ГАЛЛЮЦИНАЦИЙ):
+{critique_res}
+
+ЗАДАЧА:
+Сформируй ТОП-3 наиболее вероятных заказчиков, оштрафовав те компании, где были выявлены расхождения.
+Оформи ответ СТРОГО по шаблону:
 
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании]
@@ -272,22 +317,22 @@ async def handle_vacancy(message: Message):
 🏛 **Источник:** [hh.ru / Хабр Карьера / Веб-поиск]
 
 🔍 **Факторы совпадения:**
-• [1-2 конкретных факта: совпадение формулировок задач, архитектуры, инструментов]
+• [1-2 конкретных маркера: идентичность редких задач, совпадение формулировок или стека]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Должность ЛПР: например, CTO / Head of Analytics / Team Lead]
+• **К кому идти:** [Должность ЛПР: CTO / Head of Analytics / Team Lead]
 • **Болевая точка:** [Какую текущую проблему в проекте закроет аутстафф]
 • **Первый контакт:** [Краткая фраза первого сообщения]
 ══════════════════════════════
 """
 
-    result_text, err = call_groq_safe(prompt_match, max_tokens=1900)
+    result_text, err = call_groq_safe(prompt_final, max_tokens=1800)
 
     if not result_text:
         await status_msg.edit_text(f"⚠️ Ошибка вызова Groq API: {err}")
         return
 
-    # Автоматическое добавление ссылки на поиск ЛПР в LinkedIn/Google
+    # Добавление прямых ссылок на поиск ЛПР
     lines = result_text.split("\n")
     enhanced_lines = []
     current_company = ""
