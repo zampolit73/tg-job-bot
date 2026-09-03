@@ -1,19 +1,20 @@
 import asyncio
 import os
-import re
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
+from groq import Groq
 
 # ----------------- КЛЮЧИ -----------------
 TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
-OPENROUTER_KEY = "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"
+GROQ_API_KEY = "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"
 # ----------------------------------------
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+groq_client = Groq(api_key=GROQ_API_KEY.strip())
 
 KNOWN_AGENCIES = [
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
@@ -21,6 +22,7 @@ KNOWN_AGENCIES = [
 ]
 
 
+# Фоновый мини-сервер для прохождения health-check на Render
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -38,50 +40,15 @@ def run_health_server():
     server.serve_forever()
 
 
-def call_ai_fast(prompt: str) -> str:
-    """Быстрый запрос к ИИ без зависаний с коротким таймаутом."""
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY.strip()}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://render.com",
-        "X-Title": "SalesLeadHunterBot",
-    }
-
-    models = [
-        "google/gemma-2-9b-it:free",
-        "deepseek/deepseek-chat:free",
-        "mistralai/mistral-small-3-instruct:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-    ]
-
-    for model in models:
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 1200,
-        }
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=18)
-            data = r.json()
-            if "choices" in data and len(data["choices"]) > 0:
-                return data["choices"][0]["message"]["content"]
-        except Exception:
-            continue
-
-    return ""
-
-
 def is_agency(company_name: str) -> bool:
     lower_name = company_name.lower()
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-def fetch_hh(query: str, count: int = 12) -> list:
+def fetch_hh(query: str, count: int = 15) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "SalesLeadHunter/3.0"}
+    headers = {"User-Agent": "SalesLeadHunter/5.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=6).json()
@@ -108,10 +75,10 @@ def fetch_hh(query: str, count: int = 12) -> list:
     return jobs
 
 
-def fetch_habr(query: str, count: int = 12) -> list:
+def fetch_habr(query: str, count: int = 15) -> list:
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": query, "per_page": count}
-    headers = {"User-Agent": "SalesLeadHunter/3.0"}
+    headers = {"User-Agent": "SalesLeadHunter/5.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=6).json()
@@ -141,31 +108,41 @@ def fetch_habr(query: str, count: int = 12) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **B2B Lead Finder: Детектор прямого заказчика**\n\n"
-        "Отправьте мне описание вакансии конкурента или агентства.\n"
-        "Я исключу посредников и найду прямые компании с открытой потребностью."
+        "Отправьте мне текст обезличенной вакансии конкурента или агентства.\n"
+        "Я найду прямые компании с открытой потребностью, оценю вероятность и дам рекомендации для сейла."
     )
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("🕵️ **Шаг 1/3:** Выделяю ключевые маркеры и поисковые запросы...")
+    status_msg = await message.answer("🕵️ **Шаг 1/3:** Выделяю ключевые маркеры и поисковые комбинации...")
 
-    # 1. Быстрое извлечение 2 поисковых фраз (без медленного json_mode)
+    # 1. Быстрое извлечение 2 поисковых фраз через Groq
     prompt_kw = f"""На основе описания вакансии сформируй 2 коротких поисковых запроса (по 2-3 слова).
 Первый — точная роль со стеком (например: 'Product Analyst дашборды').
-Второй — специфика задач (например: 'промодвижок витрины данных').
-Выведи ТОЛЬКО эти 2 строки через точку с запятой:
+Второй — специфика задач или продукта (например: 'промодвижок витрины данных').
+Выведи ТОЛЬКО эти 2 запроса через точку с запятой, без лишнего текста:
 {user_text}"""
 
-    kw_res = call_ai_fast(prompt_kw)
-    queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 2]
+    try:
+        kw_completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt_kw}],
+            temperature=0.1,
+            max_tokens=60
+        )
+        kw_res = kw_completion.choices[0].message.content
+        queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 2]
+    except Exception:
+        queries = ["Аналитик данных", "Product Analyst"]
+
     if not queries:
-        queries = ["Аналитик данных SQL", "Product Analyst"]
+        queries = ["Аналитик данных", "Product Analyst"]
 
     await status_msg.edit_text(f"🔍 **Шаг 2/3:** Ищу прямых работодателей по: `{', '.join(queries[:2])}`...")
 
-    # 2. Сбор вакансий
+    # 2. Сбор вакансий из hh.ru и Хабр Карьеры
     raw_vacancies = []
     for q in queries[:2]:
         raw_vacancies.extend(fetch_hh(q))
@@ -177,15 +154,15 @@ async def handle_vacancy(message: Message):
         await status_msg.edit_text("❌ Не удалось найти открытые вакансии прямых работодателей. Попробуйте передать текст с более четким стеком/ролью.")
         return
 
-    await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} вакансий и вычисляю прямого клиента...")
+    await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} вакансий и вычисляю прямого заказчика...")
 
-    # 3. Скоринг прямого заказчика
-    prompt_match = f"""Ты — OSINT-аналитик для сейлза в IT-аутстаффинге.
-ОБЕЗЛИЧЕННЫЙ ЗАПРОС КЛИЕНТА:
+    # 3. Детальный скоринг и аналитика для сейлза
+    prompt_match = f"""Ты — эксперт OSINT-аналитики для сейлз-команды в IT-аутстаффинге.
+ОБЕЗЛИЧЕННЫЙ ЗАПРОС КЛИЕНТА (ОТ АГЕНТСТВА/КОНКУРЕНТА):
 \"\"\"{user_text}\"\"\"
 
 ОТКРЫТЫЕ ВАКАНСИИ ПРЯМЫХ КОМПАНИЙ:
-{unique_vacancies[:12]}
+{unique_vacancies[:14]}
 
 ЗАДАЧА:
 Вычисли ТОП-3 компаний, которые с наибольшей вероятностью являются конечным заказчиком или имеют идентичную горящую потребность.
@@ -195,13 +172,20 @@ async def handle_vacancy(message: Message):
 🔹 Должность: [Название вакансии]
 🌐 Источник: [hh.ru или Хабр Карьера] | 💰 Зарплата: [Вилка]
 🔗 Ссылка: [URL]
-🕵️ **Маркеры совпадения:** (почему это они: совпадение по продукту, задачам или стеку)
+🕵️ **Маркеры совпадения:** (2-3 конкретных факта: почему это они, сходство задач, терминов, продукта)
 💡 **Как зайти сейлзу:** (кому писать в компании и какую боль закрывать)
 """
 
-    result_text = call_ai_fast(prompt_match)
-    if not result_text:
-        await status_msg.edit_text("Не удалось сформировать отчет. Пожалуйста, отправьте вакансию еще раз.")
+    try:
+        analysis_completion = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt_match}],
+            temperature=0.2,
+            max_tokens=2000
+        )
+        result_text = analysis_completion.choices[0].message.content
+    except Exception as e:
+        await status_msg.edit_text(f"Ошибка при анализе: {e}")
         return
 
     if len(result_text) > 4000:
