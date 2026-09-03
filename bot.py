@@ -20,9 +20,8 @@ dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
-WORD_RE = re.compile(r"[a-zA-Zа-яА-ЯёЁ0-9\-]+")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
-CLEAN_HABR_RE = re.compile(r'[^\w\s\+\#\.\-]')
+CLEAN_QUERY_RE = re.compile(r'[^\w\s\+\#\.\-]')
 
 KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
@@ -41,10 +40,9 @@ TECH_KEYWORDS = (
     "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
 )
 
-# Топ открытых каналов вакансий для прямого web-поиска
 TG_CHANNELS = ["normrabota", "it_jobs", "devops_jobs", "job_finder_dev"]
 
-# ----------------- HEALTH SERVER ДЛЯ RENDER -----------------
+# ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -61,18 +59,9 @@ def run_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
-# ----------------- УТИЛИТЫ -----------------
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
-
-
-def fallback_extract_keywords(text: str) -> list:
-    text_lower = text.lower()
-    found = [tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)]
-    if found:
-        return [f"NAME:({found[0]})", " ".join(found[:3])]
-    first_phrase = text.split("\n")[0][:30].strip()
-    return [first_phrase if first_phrase else "IT Вакансия", "DevOps Kubernetes"]
 
 
 def is_agency(company_name: str) -> bool:
@@ -87,7 +76,16 @@ def build_lead_osint_url(company_name: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(query)}"
 
 
-# ----------------- GROQ С ЖЕСТКИМ ТАЙМАУТОМ -----------------
+def fallback_extract_keywords(text: str) -> list:
+    text_lower = text.lower()
+    found = [tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)]
+    if found:
+        return [f"NAME:({found[0]})", " ".join(found[:3]), found[0]]
+    first_phrase = text.split("\n")[0][:30].strip()
+    return [first_phrase if first_phrase else "IT Вакансия", "Kubernetes DevOps", "CI/CD"]
+
+
+# ----------------- GROQ CLIENT -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
     models = ("llama-3.1-8b-instant", "openai/gpt-oss-20b")
     last_err = ""
@@ -111,7 +109,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
     return "", last_err
 
 
-# ----------------- ЧИСТЫЙ АСИНХРОННЫЙ ПОИСК (БЕЗ СТОРОННИХ БИБЛИОТЕК) -----------------
+# ----------------- АСИНХРОННЫЕ ПАРСЕРЫ -----------------
 async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
@@ -130,14 +128,12 @@ async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> lis
             desc = f"{item.get('snippet', {}).get('requirement', '')} {item.get('snippet', {}).get('responsibility', '')}"
             jobs.append({
                 "id": item.get("id"),
-                "employer_id": employer.get("id"),
                 "source": "hh.ru",
                 "title": item.get("name"),
                 "company": company,
                 "salary": sal_str,
                 "url": item.get("alternate_url"),
                 "desc": clean_html(desc),
-                "footprint": ""
             })
         return jobs
     except Exception:
@@ -158,7 +154,7 @@ async def fetch_hh_full_details(client: httpx.AsyncClient, vacancy_id: str) -> s
 
 
 async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
-    clean_q = CLEAN_HABR_RE.sub(" ", query).strip()
+    clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -176,9 +172,13 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
             full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
             skills = ", ".join([s.get("title", "") for s in item.get("skills", [])])
             jobs.append({
-                "id": None, "employer_id": None, "source": "Хабр Карьера",
-                "title": item.get("title"), "company": company, "salary": sal_str,
-                "url": full_url, "desc": f"Стек: {skills}", "footprint": ""
+                "id": None,
+                "source": "Хабр Карьера",
+                "title": item.get("title"),
+                "company": company,
+                "salary": sal_str,
+                "url": full_url,
+                "desc": f"Стек: {skills}",
             })
         return jobs
     except Exception:
@@ -186,7 +186,11 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
 
 
 async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
-    clean_q = CLEAN_HABR_RE.sub(" ", query).strip()
+    # Ограничиваем запрос первыми 2 словами для стабильной отдачи API SuperJob
+    words = [w for w in CLEAN_QUERY_RE.sub(" ", query).split() if len(w) > 2][:2]
+    clean_q = " ".join(words)
+    if not clean_q:
+        return []
     url = "https://api.superjob.ru/2.0/vacancies/"
     params = {"keyword": clean_q, "count": count}
     headers = {"User-Agent": "Mozilla/5.0", "X-Api-App-Id": SUPERJOB_KEY}
@@ -203,33 +207,41 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
             sal_str = f"{p_from if p_from else ''} - {p_to if p_to else ''} {cur}".strip() if (p_from or p_to) else "не указана"
             desc = clean_html(item.get("candidat", "") or item.get("work", ""))
             jobs.append({
-                "id": None, "employer_id": None, "source": "SuperJob",
-                "title": item.get("profession", ""), "company": company, "salary": sal_str,
-                "url": item.get("link", ""), "desc": desc[:250], "footprint": ""
+                "id": None,
+                "source": "SuperJob",
+                "title": item.get("profession", ""),
+                "company": company,
+                "salary": sal_str,
+                "url": item.get("link", ""),
+                "desc": desc[:250],
             })
         return jobs
     except Exception:
         return []
 
 
-# Прямой парсер Telegram через t.me/s/ без библиотек и капч
-async def fetch_telegram_direct(client: httpx.AsyncClient, channel: str, keyword: str) -> list:
+async def fetch_telegram_channel(client: httpx.AsyncClient, channel: str, search_terms: list) -> list:
     url = f"https://t.me/s/{channel}"
     headers = {"User-Agent": "Mozilla/5.0"}
     jobs = []
     try:
         r = await client.get(url, headers=headers, timeout=2.0)
-        text = r.text
-        # Ищем посты, содержащие ключевое слово
-        parts = text.split("tgme_widget_message_text")
-        key_lower = keyword.lower()
-        for p in parts[1:5]:
-            p_clean = clean_html(p[:1500])
-            if key_lower in p_clean.lower():
+        # Извлекаем все текстовые блоки постов через регулярное выражение
+        raw_posts = re.findall(r'class="tgme_widget_message_text[^>]*>(.*?)</div>', r.text, flags=re.DOTALL)
+        for post in raw_posts[-10:]:
+            clean_text = clean_html(post)
+            post_lower = clean_text.lower()
+            # Пост засчитывается, если найдено хотя бы 2 совпадения по терминам стека
+            matches = sum(1 for term in search_terms if term.lower() in post_lower)
+            if matches >= 2 or (len(search_terms) == 1 and matches >= 1):
                 jobs.append({
-                    "id": None, "employer_id": None, "source": f"Telegram (@{channel})",
-                    "title": f"Пост из @{channel}", "company": f"@{channel}", "salary": "в посте",
-                    "url": f"https://t.me/{channel}", "desc": p_clean[:250], "footprint": ""
+                    "id": None,
+                    "source": f"Telegram (@{channel})",
+                    "title": f"Пост из @{channel}",
+                    "company": f"@{channel}",
+                    "salary": "в посте",
+                    "url": f"https://t.me/{channel}",
+                    "desc": clean_text[:250],
                 })
                 break
     except Exception:
@@ -237,12 +249,12 @@ async def fetch_telegram_direct(client: httpx.AsyncClient, channel: str, keyword
     return jobs
 
 
-# ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
+# ----------------- ХЭНДЛЕРЫ ДИАЛОГА -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте обезличенный бриф. Бот мгновенно вычислит прямого работодателя.",
+        "💼 **Multi-Source OSINT Lead Hunter (Optimized)**\n\n"
+        "Отправьте обезличенный бриф. Бот выполнит параллельный скоринг баз и выявит прямого заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -252,26 +264,31 @@ async def handle_vacancy(message: Message):
     user_text = message.text
     status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
 
-    prompt_kw = f"""Выдели ключевую роль и технологический стек.
-Сформируй 2 запроса через точку с запятой:
-1. Запрос роли для hh.ru: NAME:(...). Пример: NAME:("DevOps")
-2. Главный стек: 2-3 термина. Пример: 'Kubernetes Helm CI/CD'
-Выведи ТОЛЬКО 2 запроса через точку с запятой:
-{user_text[:400]}"""
+    # Извлечение 3 поисковых векторов для максимального охвата
+    prompt_kw = f"""Ты — OSINT-аналитик IT-рынка. Сформируй ровно 3 запроса через точку с запятой в одну строку:
+1. Роль для hh.ru строго с оператором NAME:(...). Пример: NAME:("DevOps") или NAME:("Backend").
+2. Связка из 2-3 ключевых технологий через пробел. Пример: 'Kubernetes Helm PostgreSQL'.
+3. Самый редкий/специфичный термин задачи или продукта (1-2 слова). Пример: 'OnPrem' или 'промодвижок'.
+Текст:
+{user_text[:500]}"""
 
-    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=35)
+    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=50)
     queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
     if not queries or len(queries) < 2:
         queries = fallback_extract_keywords(user_text)
 
-    # Параллельный HTTP-сбор через быстрый единый пул соединений
+    role_query = queries[0]
+    stack_query = queries[1]
+    tg_terms = [w for w in re.findall(r"[a-zA-Z0-9\+\#\-]+", stack_query) if len(w) > 2][:3]
+
     async with httpx.AsyncClient(http2=True, follow_redirects=True) as http_client:
         tasks = [
-            fetch_hh(http_client, queries[0], 7),
-            fetch_habr(http_client, queries[1], 6),
-            fetch_superjob(http_client, queries[1], 5),
-            fetch_telegram_direct(http_client, "normrabota", queries[1].split()[0]),
-            fetch_telegram_direct(http_client, "it_jobs", queries[1].split()[0]),
+            fetch_hh(http_client, role_query, 8),
+            fetch_habr(http_client, stack_query, 8),
+            fetch_superjob(http_client, stack_query, 6),
+            fetch_telegram_channel(http_client, "normrabota", tg_terms),
+            fetch_telegram_channel(http_client, "it_jobs", tg_terms),
+            fetch_telegram_channel(http_client, "devops_jobs", tg_terms),
         ]
         
         try:
@@ -283,11 +300,11 @@ async def handle_vacancy(message: Message):
         unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
         if not unique_vacancies:
-            await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте уточнить описание стека.")
+            await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте передать текст с более конкретным описанием стека.")
             return
 
-        # Быстрая дозагрузка полных описаний топ-3 с hh.ru (до 1.5 сек)
-        hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:3]
+        # Дозагрузка полных описаний по ID для кандидатов hh.ru
+        hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:4]
         if hh_candidates:
             try:
                 full_texts = await asyncio.wait_for(
@@ -302,20 +319,26 @@ async def handle_vacancy(message: Message):
 
     await status_msg.edit_text(f"🧠 Скоринг {len(unique_vacancies)} позиций через Groq LPU...")
 
+    # Расширенный контекст: передаем топ-14 вакансий
     compact_list = [
-        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:220]}"
-        for idx, v in enumerate(unique_vacancies[:10], 1)
+        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:260]}"
+        for idx, v in enumerate(unique_vacancies[:14], 1)
     ]
     vacancies_payload = "\n".join(compact_list)
 
     prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
-Агентство скопировало бриф прямого заказчика. Вычисли ТОП-3 работодателей, у которых взят этот проект.
+Агентство скопировало бриф прямого заказчика. Твоя цель — вычислить ТОП-3 работодателей, у которых взят этот проект.
 
 ОРИГИНАЛЬНЫЙ БРИФ:
-\"\"\"{user_text[:600]}\"\"\"
+\"\"\"{user_text[:700]}\"\"\"
 
 НАЙДЕННЫЕ ВАКАНСИИ И ПУБЛИКАЦИИ:
 {vacancies_payload}
+
+ПРАВИЛА ОЦЕНКИ:
+1. Базовые технологии (Linux, Git, Docker, SQL) не дают права ставить высокий скор (не выше 40%).
+2. Ставь 🟢 Высокую вероятность (80-95%) ТОЛЬКО за совпадение архитектурных задач, специфических окружений или редких связок.
+3. Отсекай компании с непрофильным стеком.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
