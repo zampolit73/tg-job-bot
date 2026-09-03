@@ -41,17 +41,10 @@ TECH_KEYWORDS = (
     "ios", "swift", "android", "flutter", "1c", "1с", "sql", "clickhouse", "dwh"
 )
 
-RUSSIAN_STOPWORDS = frozenset({
-    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все", "она", "так",
-    "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по", "только", "ее", "мне", "было",
-    "вот", "от", "меня", "еще", "нет", "о", "из", "ему", "теперь", "когда", "даже", "ну", "вдруг",
-    "ли", "если", "уже", "или", "ни", "быть", "был", "него", "до", "вас", "нибудь", "опять", "уж",
-    "вам", "ведь", "там", "потом", "себя", "ничего", "ей", "может", "они", "тут", "где", "есть",
-    "надо", "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб", "без", "будет", "будто",
-    "про", "при", "опыт", "работа", "работы", "знание", "понимание", "обязанности", "требования"
-})
+# Топ открытых каналов вакансий для прямого web-поиска
+TG_CHANNELS = ["normrabota", "it_jobs", "devops_jobs", "job_finder_dev"]
 
-# ----------------- HEALTH SERVER -----------------
+# ----------------- HEALTH SERVER ДЛЯ RENDER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -73,25 +66,13 @@ def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
 
-def extract_best_shingle(text: str, n_words: int = 4) -> str:
-    cleaned_phrases = []
-    for line in text.splitlines():
-        words = [w for w in WORD_RE.findall(line.lower()) if w not in RUSSIAN_STOPWORDS and len(w) > 2]
-        if len(words) >= n_words:
-            cleaned_phrases.append(" ".join(words[:n_words]))
-    if cleaned_phrases:
-        cleaned_phrases.sort(key=lambda p: sum(len(w) for w in p.split()), reverse=True)
-        return f'"{cleaned_phrases[0]}"'
-    return ""
-
-
 def fallback_extract_keywords(text: str) -> list:
     text_lower = text.lower()
     found = [tech for tech in TECH_KEYWORDS if re.search(r"\b" + re.escape(tech) + r"\b", text_lower)]
     if found:
-        return [f"NAME:({found[0]})", " ".join(found[:3]), found[0]]
+        return [f"NAME:({found[0]})", " ".join(found[:3])]
     first_phrase = text.split("\n")[0][:30].strip()
-    return [first_phrase if first_phrase else "IT Вакансия", "Разработчик", "Backend"]
+    return [first_phrase if first_phrase else "IT Вакансия", "DevOps Kubernetes"]
 
 
 def is_agency(company_name: str) -> bool:
@@ -106,7 +87,7 @@ def build_lead_osint_url(company_name: str) -> str:
     return f"https://www.google.com/search?q={quote_plus(query)}"
 
 
-# ----------------- LLM CLIENT (СТРОГИЙ ТАЙМАУТ) -----------------
+# ----------------- GROQ С ЖЕСТКИМ ТАЙМАУТОМ -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
     models = ("llama-3.1-8b-instant", "openai/gpt-oss-20b")
     last_err = ""
@@ -119,7 +100,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
                     temperature=0.1,
                     max_tokens=max_tokens
                 ),
-                timeout=9.0
+                timeout=8.0
             )
             content = res.choices[0].message.content
             if content and content.strip():
@@ -130,7 +111,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500) -> tuple[str, str
     return "", last_err
 
 
-# ----------------- АСИНХРОННЫЕ ПАРСЕРЫ С ЖЕСТКИМ ТАЙМАУТОМ -----------------
+# ----------------- ЧИСТЫЙ АСИНХРОННЫЙ ПОИСК (БЕЗ СТОРОННИХ БИБЛИОТЕК) -----------------
 async def fetch_hh(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
@@ -167,30 +148,13 @@ async def fetch_hh_full_details(client: httpx.AsyncClient, vacancy_id: str) -> s
     url = f"https://api.hh.ru/vacancies/{vacancy_id}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
-        r = await client.get(url, headers=headers, timeout=2.0)
+        r = await client.get(url, headers=headers, timeout=1.8)
         data = r.json()
         raw_desc = data.get("description", "")
         key_skills = " ".join([s.get("name", "") for s in data.get("key_skills", [])])
         return clean_html(f"{raw_desc} {key_skills}")[:350]
     except Exception:
         return ""
-
-
-async def verify_hh_company_footprint(client: httpx.AsyncClient, employer_id: str, context_keyword: str) -> str:
-    if not employer_id or not context_keyword:
-        return ""
-    url = "https://api.hh.ru/vacancies"
-    params = {"employer_id": employer_id, "text": context_keyword, "per_page": 2}
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        r = await client.get(url, params=params, headers=headers, timeout=2.0)
-        items = r.json().get("items", [])
-        if items:
-            other_titles = ", ".join([it.get("name", "") for it in items[:2]])
-            return f" (Смежный наём: {other_titles})"
-    except Exception:
-        pass
-    return ""
 
 
 async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
@@ -248,56 +212,37 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
         return []
 
 
-# ----------------- БЕЗОПАСНЫЙ ВЕБ-ПОИСК БЕЗ ЗАВИСАНИЙ -----------------
-def safe_sync_ddg(query: str, count: int, mode: str) -> list:
-    """Обертка с принудительным тайм-аутом, исключающая бесконечные зависания на Render."""
-    from duckduckgo_search import DDGS
+# Прямой парсер Telegram через t.me/s/ без библиотек и капч
+async def fetch_telegram_direct(client: httpx.AsyncClient, channel: str, keyword: str) -> list:
+    url = f"https://t.me/s/{channel}"
+    headers = {"User-Agent": "Mozilla/5.0"}
     jobs = []
     try:
-        # Лимит времени на сетевой сокет внутри библиотеки - 2 секунды
-        with DDGS(timeout=2.0) as ddgs:
-            results = list(ddgs.text(query, max_results=count))
-            for res in results:
-                url, title, body = res.get("href", ""), res.get("title", ""), res.get("body", "")
-                if mode == "tg" and "t.me/" in url:
-                    m = re.search(r"t\.me/([^/]+)", url)
-                    c_name = f"@{m.group(1)}" if m else "Telegram"
-                    jobs.append({
-                        "id": None, "employer_id": None, "source": f"Telegram ({c_name})", "title": title[:50],
-                        "company": c_name, "salary": "в посте", "url": url, "desc": body[:250], "footprint": ""
-                    })
-                elif mode == "ats":
-                    domain = "Huntflow" if "huntflow" in url else "Potok" if "potok" in url else "Talantix"
-                    cand = title.split("—")[0].split("-")[0].split("|")[0].strip()
-                    jobs.append({
-                        "id": None, "employer_id": None, "source": f"ATS ({domain})", "title": title[:50],
-                        "company": cand, "salary": "в вакансии", "url": url, "desc": body[:250], "footprint": ""
-                    })
-                elif mode == "archive" and "hh.ru/vacancy" in url:
-                    cand = title.split("—")[0].split("-")[0].split(":")[0].strip()
-                    jobs.append({
-                        "id": None, "employer_id": None, "source": "Кэш hh.ru", "title": title[:50],
-                        "company": cand, "salary": "в архиве", "url": url, "desc": f"[Архив]: {body[:250]}", "footprint": ""
-                    })
+        r = await client.get(url, headers=headers, timeout=2.0)
+        text = r.text
+        # Ищем посты, содержащие ключевое слово
+        parts = text.split("tgme_widget_message_text")
+        key_lower = keyword.lower()
+        for p in parts[1:5]:
+            p_clean = clean_html(p[:1500])
+            if key_lower in p_clean.lower():
+                jobs.append({
+                    "id": None, "employer_id": None, "source": f"Telegram (@{channel})",
+                    "title": f"Пост из @{channel}", "company": f"@{channel}", "salary": "в посте",
+                    "url": f"https://t.me/{channel}", "desc": p_clean[:250], "footprint": ""
+                })
+                break
     except Exception:
         pass
     return jobs
-
-
-async def fast_web_search(query: str, count: int, mode: str) -> list:
-    try:
-        # Если DDG не укладывается в 2.5 секунды — задача сбрасывается и поиск продолжается
-        return await asyncio.wait_for(asyncio.to_thread(safe_sync_ddg, query, count, mode), timeout=2.5)
-    except Exception:
-        return []
 
 
 # ----------------- ОБРАБОТЧИКИ СООБЩЕНИЙ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Turbo)**\n\n"
-        "Отправьте текст заявки. Поиск проходит по hh.ru, Хабр, SuperJob, Telegram и ATS без задержек.",
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "Отправьте обезличенный бриф. Бот мгновенно вычислит прямого работодателя.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -305,91 +250,72 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram, ATS)...")
+    status_msg = await message.answer("⚡️ Сканирую базы (hh.ru, Хабр, SuperJob, Telegram)...")
 
-    exact_shingle = extract_best_shingle(user_text)
+    prompt_kw = f"""Выдели ключевую роль и технологический стек.
+Сформируй 2 запроса через точку с запятой:
+1. Запрос роли для hh.ru: NAME:(...). Пример: NAME:("DevOps")
+2. Главный стек: 2-3 термина. Пример: 'Kubernetes Helm CI/CD'
+Выведи ТОЛЬКО 2 запроса через точку с запятой:
+{user_text[:400]}"""
 
-    prompt_kw = f"""Выдели роль и стек без общих слов (Senior, удаленно).
-Сформируй 3 запроса через точку с запятой:
-1. Запрос роли для hh.ru: NAME:(...). Пример: NAME:("DevOps").
-2. Редкая связка 2-3 инструментов стека. Пример: 'Minio OnPremise Kafka'.
-3. Продуктовая специфика/задачи. Пример: 'траблшутинг окружений'.
-Выведи ТОЛЬКО 3 запроса через точку с запятой в одну строку:
-{user_text[:500]}"""
-
-    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=45)
+    kw_res, _ = await call_groq_async(prompt_kw, max_tokens=35)
     queries = [q.strip() for q in kw_res.split(";") if len(q.strip()) > 1]
     if not queries or len(queries) < 2:
         queries = fallback_extract_keywords(user_text)
 
-    tg_query = exact_shingle if exact_shingle else queries[1]
-    ats_query = queries[2] if len(queries) > 2 else queries[1]
-
-    # Сбор данных с жестким ограничением общего времени ожидания в 4 секунды
-    try:
-        async with httpx.AsyncClient(http2=True) as http_client:
-            tasks = [
-                fetch_hh(http_client, queries[0], 6),
-                fetch_habr(http_client, queries[1], 6),
-                fetch_superjob(http_client, queries[1], 4),
-                fast_web_search(f"site:t.me {tg_query} вакансия", 3, "tg"),
-                fast_web_search(f"site:hh.ru/vacancy {exact_shingle if exact_shingle else queries[1]}", 3, "archive"),
-                fast_web_search(f'(site:huntflow.io OR site:potok.io) "{ats_query}"', 3, "ats"),
-            ]
-            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=4.0)
-    except asyncio.TimeoutError:
-        results = []
-
-    raw_vacancies = [item for sublist in results for item in sublist]
-    unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
-
-    if not unique_vacancies:
-        await status_msg.edit_text("❌ Не удалось найти совпадений по открытым базам. Попробуйте уточнить описание стека.")
-        return
-
-    # Быстрое фоновое обогащение для топ-3 позиций hh.ru (не дольше 2 секунд)
-    hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:3]
-    if hh_candidates:
+    # Параллельный HTTP-сбор через быстрый единый пул соединений
+    async with httpx.AsyncClient(http2=True, follow_redirects=True) as http_client:
+        tasks = [
+            fetch_hh(http_client, queries[0], 7),
+            fetch_habr(http_client, queries[1], 6),
+            fetch_superjob(http_client, queries[1], 5),
+            fetch_telegram_direct(http_client, "normrabota", queries[1].split()[0]),
+            fetch_telegram_direct(http_client, "it_jobs", queries[1].split()[0]),
+        ]
+        
         try:
-            async with httpx.AsyncClient(http2=True) as http_client:
-                enrich_tasks = [fetch_hh_full_details(http_client, v["id"]) for v in hh_candidates]
-                fp_tasks = [
-                    verify_hh_company_footprint(http_client, v["employer_id"], queries[1].split()[0])
-                    for v in hh_candidates
-                ]
-                full_texts, footprints = await asyncio.wait_for(
-                    asyncio.gather(asyncio.gather(*enrich_tasks), asyncio.gather(*fp_tasks)),
-                    timeout=2.0
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=3.5)
+        except Exception:
+            results = []
+
+        raw_vacancies = [item for sublist in results for item in sublist]
+        unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
+
+        if not unique_vacancies:
+            await status_msg.edit_text("❌ Вакансии не найдены. Попробуйте уточнить описание стека.")
+            return
+
+        # Быстрая дозагрузка полных описаний топ-3 с hh.ru (до 1.5 сек)
+        hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:3]
+        if hh_candidates:
+            try:
+                full_texts = await asyncio.wait_for(
+                    asyncio.gather(*[fetch_hh_full_details(http_client, v["id"]) for v in hh_candidates]),
+                    timeout=1.8
                 )
-                for cand, full_desc, fp in zip(hh_candidates, full_texts, footprints):
+                for cand, full_desc in zip(hh_candidates, full_texts):
                     if full_desc:
                         cand["desc"] = full_desc
-                    if fp:
-                        cand["footprint"] = fp
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     await status_msg.edit_text(f"🧠 Скоринг {len(unique_vacancies)} позиций через Groq LPU...")
 
     compact_list = [
-        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:220]}{v.get('footprint', '')}"
+        f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:220]}"
         for idx, v in enumerate(unique_vacancies[:10], 1)
     ]
     vacancies_payload = "\n".join(compact_list)
 
-    prompt_match = f"""Ты — строгий OSINT-следователь по деанонимизации IT-заказчиков в аутстаффинге.
-Вычисли ТОП-3 прямых работодателей, у которых агентство скопировало эту заявку.
+    prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
+Агентство скопировало бриф прямого заказчика. Вычисли ТОП-3 работодателей, у которых взят этот проект.
 
 ОРИГИНАЛЬНЫЙ БРИФ:
-\"\"\"{user_text[:700]}\"\"\"
+\"\"\"{user_text[:600]}\"\"\"
 
 НАЙДЕННЫЕ ВАКАНСИИ И ПУБЛИКАЦИИ:
 {vacancies_payload}
-
-ПРАВИЛА:
-1. За общий базовый стек (Linux, Docker, SQL) — вероятность НЕ ВЫШЕ 35%.
-2. Ставь 🟢 Высокую вероятность (80-95%) ТОЛЬКО за совпадение редких связок, терминов или формулировок задач.
-3. Отметка 'Смежный наём' — сильное подтверждение прямого заказчика.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
@@ -399,7 +325,7 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Вакансия/Пост:** [Открыть источник](URL)
-🏛 **Источник:** [hh.ru / Хабр / SuperJob / Telegram / ATS / Кэш hh.ru]
+🏛 **Источник:** [hh.ru / Хабр / SuperJob / Telegram]
 
 🔍 **Факторы совпадения:**
 • [Что конкретно совпало: редкие технологии, продуктовые задачи или дословные фразы]
@@ -407,7 +333,7 @@ async def handle_vacancy(message: Message):
 💡 **Стратегия выхода для сейлза:**
 • **К кому идти:** [Точная роль ЛПР: Head of Infrastructure, CTO, Lead DevOps]
 • **Болевая точка:** [Какая острая проектная боль видна в тексте]
-• **Первый контакт:** [Готовый хук для сообщения в 1-2 предложения]
+• **Первый контакт:** [Готовый 1-2 предложения хук для сообщения в Telegram/LinkedIn]
 ══════════════════════════════
 """
 
