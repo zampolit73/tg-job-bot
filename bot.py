@@ -50,9 +50,13 @@ def run_health_server():
     server.serve_forever()
 
 
-def call_groq_safe(prompt: str, max_tokens: int = 1200) -> tuple[str, str]:
-    """Вызов Groq с возвратом (результат, текст_ошибки)."""
-    models = ["llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+def call_groq_safe(prompt: str, max_tokens: int = 1500) -> tuple[str, str]:
+    """Вызов актуальных рабочих моделей Groq."""
+    models = [
+        "openai/gpt-oss-20b",
+        "qwen/qwen3.6-27b",
+        "llama-3.1-8b-instant",
+    ]
     last_err = ""
     for model_name in models:
         try:
@@ -88,6 +92,7 @@ def is_agency(company_name: str) -> bool:
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
+# 1. HeadHunter API
 def fetch_hh(query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
@@ -108,13 +113,14 @@ def fetch_hh(query: str, count: int = 8) -> list:
                 "company": company,
                 "salary": sal_str,
                 "url": item.get("alternate_url"),
-                "desc": desc[:250],  # компактно для экономии токенов
+                "desc": desc[:250],
             })
     except Exception:
         pass
     return jobs
 
 
+# 2. Хабр Карьера API
 def fetch_habr(query: str, count: int = 8) -> list:
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": query, "per_page": count}
@@ -144,6 +150,7 @@ def fetch_habr(query: str, count: int = 8) -> list:
     return jobs
 
 
+# 3. Веб-поиск
 def fetch_web_safe(query: str, count: int = 3) -> list:
     jobs = []
     try:
@@ -171,7 +178,7 @@ def fetch_web_safe(query: str, count: int = 3) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source B2B Lead Finder**\n\n"
-        "Отправьте мне текст вакансии.\n"
+        "Отправьте мне текст любой вакансии.\n"
         "Я найду прямых работодателей, исключу кадровые агентства и сформирую рекомендации для выхода на ЛПР."
     )
 
@@ -210,7 +217,6 @@ async def handle_vacancy(message: Message):
 
     await status_msg.edit_text(f"🧠 **Шаг 3/3:** Анализирую {len(unique_vacancies)} предложений и вычисляю прямого заказчика...")
 
-    # Формируем компактный список для исключения переполнения токенов
     compact_list = []
     for idx, v in enumerate(unique_vacancies[:10], 1):
         compact_list.append(
@@ -233,7 +239,7 @@ async def handle_vacancy(message: Message):
 🔹 Должность: [Название вакансии]
 🌐 Источник: [hh.ru / Хабр Карьера / Веб-поиск] | 💰 Зарплата: [Вилка или 'не указана']
 🔗 Ссылка: [URL]
-🕵️ **Маркеры совпадения:** (2 конкретных факта: совпадение терминов/задач/стека)
+🕵️ **Маркеры совпадения:** (2 конкретных факта: почему это они, совпадение терминов/задач/стека)
 💡 **Как зайти сейлзу:** (кому писать и с каким оффером обращаться)
 """
 
