@@ -9,7 +9,7 @@ from aiogram.types import Message
 from groq import Groq
 
 # ----------------- КЛЮЧИ -----------------
-TELEGRAM_BOT_TOKEN = "8982024680:AAEwZQsfwx_BpdW5goe1ux3O94MT34Wfi3M"
+TELEGRAM_BOT_TOKEN = "8982024680:AAGSIE8AbyboYoG1HcxLmI9-7ljX2JbTk7s"
 GROQ_API_KEY = "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"
 # ----------------------------------------
 
@@ -142,7 +142,7 @@ def fetch_habr(query: str, count: int = 10) -> list:
     return jobs
 
 
-# 3. Безопасный веб-поиск (с защитой от сбоев)
+# 3. Веб-поиск с защитой от сбоев
 def fetch_web_safe(query: str, count: int = 4) -> list:
     jobs = []
     try:
@@ -162,7 +162,6 @@ def fetch_web_safe(query: str, count: int = 4) -> list:
                     "desc": res.get("body", ""),
                 })
     except Exception:
-        # Если провайдер заблокировал веб-поиск, продолжаем без него
         pass
     return jobs
 
@@ -246,6 +245,8 @@ async def handle_vacancy(message: Message):
 
 async def main():
     threading.Thread(target=run_health_server, daemon=True).start()
+    # Сбрасываем старые зависшие апдейты Telegram перед стартом
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
