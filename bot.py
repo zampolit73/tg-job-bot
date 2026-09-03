@@ -64,7 +64,7 @@ def run_health_server():
     server.serve_forever()
 
 
-def call_groq_safe(prompt: str, max_tokens: int = 1800) -> tuple[str, str]:
+def call_groq_safe(prompt: str, max_tokens: int = 1900) -> tuple[str, str]:
     models = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
     last_err = ""
     for model_name in models:
@@ -82,6 +82,11 @@ def call_groq_safe(prompt: str, max_tokens: int = 1800) -> tuple[str, str]:
             last_err = str(e)
             continue
     return "", last_err
+
+
+def clean_html(raw_html: str) -> str:
+    clean = re.sub(r"<[^>]+>", " ", raw_html)
+    return " ".join(clean.split())
 
 
 def extract_best_shingle(text: str, n_words: int = 4) -> str:
@@ -115,16 +120,11 @@ def is_agency(company_name: str) -> bool:
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-def clean_html(raw_html: str) -> str:
-    clean = re.sub(r"<[^>]+>", " ", raw_html)
-    return " ".join(clean.split())
-
-
-# 1. Быстрый сбор списка вакансий с hh.ru
+# 1. Поиск в hh.ru
 def fetch_hh(query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "DeepOSINTHunter/8.0"}
+    headers = {"User-Agent": "MultiOSINTHunter/9.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=4).json()
@@ -149,10 +149,10 @@ def fetch_hh(query: str, count: int = 8) -> list:
     return jobs
 
 
-# 2. Мгновенная параллельная дозагрузка ПОЛНОГО текста по ID
+# Дозагрузка 100% текста hh.ru по ID
 def fetch_hh_full_details(vacancy_id: str) -> str:
     url = f"https://api.hh.ru/vacancies/{vacancy_id}"
-    headers = {"User-Agent": "DeepOSINTHunter/8.0"}
+    headers = {"User-Agent": "MultiOSINTHunter/9.0"}
     try:
         r = requests.get(url, headers=headers, timeout=3).json()
         raw_desc = r.get("description", "")
@@ -162,12 +162,12 @@ def fetch_hh_full_details(vacancy_id: str) -> str:
         return ""
 
 
-# 3. Хабр Карьера API
+# 2. Хабр Карьера API
 def fetch_habr(query: str, count: int = 8) -> list:
     clean_q = re.sub(r'[^\w\s\+\#\.\-]', ' ', query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
-    headers = {"User-Agent": "DeepOSINTHunter/8.0"}
+    headers = {"User-Agent": "MultiOSINTHunter/9.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=4).json()
@@ -187,32 +187,73 @@ def fetch_habr(query: str, count: int = 8) -> list:
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
-                "desc": f"Стек и навыки: {skills}",
+                "desc": f"Стек: {skills}",
             })
     except Exception:
         pass
     return jobs
 
 
-# 4. Веб-поиск по точному шинглу
-def fetch_web_exact(query: str, count: int = 3) -> list:
+# 3. SuperJob API (Enterprise, Ритейл, Госсектор)
+def fetch_superjob(query: str, count: int = 6) -> list:
+    clean_q = re.sub(r'[^\w\s\+\#\.\-]', ' ', query).strip()
+    url = "https://api.superjob.ru/2.0/vacancies/"
+    params = {"keyword": clean_q, "count": count}
+    headers = {
+        "User-Agent": "MultiOSINTHunter/9.0",
+        "X-Api-App-Id": "v3.r.137453308.2b27077a942fb8adcdba08488e08d669db756f70.9b015112521c7e90ef8c34fbc87e5b222fb2ea67"
+    }
+    jobs = []
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=4).json()
+        for item in r.get("objects", []):
+            client = item.get("client", {})
+            company = client.get("title", "Не указана")
+            if is_agency(company):
+                continue
+            p_from = item.get("payment_from", 0)
+            p_to = item.get("payment_to", 0)
+            cur = item.get("currency", "")
+            sal_str = f"{p_from if p_from else ''} - {p_to if p_to else ''} {cur}".strip() if (p_from or p_to) else "не указана"
+            desc = clean_html(item.get("candidat", "") or item.get("work", ""))
+            jobs.append({
+                "id": None,
+                "source": "SuperJob",
+                "title": item.get("profession", ""),
+                "company": company,
+                "salary": sal_str,
+                "url": item.get("link", ""),
+                "desc": desc[:350],
+            })
+    except Exception:
+        pass
+    return jobs
+
+
+# 4. Telegram Dorking (site:t.me) — поиск прямых постов в каналах
+def fetch_telegram_posts(query: str, count: int = 4) -> list:
     jobs = []
     try:
         from duckduckgo_search import DDGS
         ddgs = DDGS(timeout=4)
-        results = list(ddgs.text(query, max_results=count))
+        search_query = f"site:t.me {query} вакансия"
+        results = list(ddgs.text(search_query, max_results=count))
         for res in results:
             title = res.get("title", "")
-            company_cand = title.split("—")[0].split("-")[0].split(":")[0].strip()
-            if not is_agency(company_cand):
+            url = res.get("href", "")
+            body = res.get("body", "")
+            if "t.me/" in url:
+                # Извлекаем имя канала
+                channel_match = re.search(r"t\.me/([^/]+)", url)
+                channel_name = f"@{channel_match.group(1)}" if channel_match else "Telegram канал"
                 jobs.append({
                     "id": None,
-                    "source": "Веб-поиск (Exact Match)",
-                    "title": title,
-                    "company": company_cand,
-                    "salary": "не указана",
-                    "url": res.get("href", ""),
-                    "desc": res.get("body", "")[:350],
+                    "source": f"Telegram ({channel_name})",
+                    "title": title[:50],
+                    "company": channel_name,
+                    "salary": "в посте",
+                    "url": url,
+                    "desc": body[:350],
                 })
     except Exception:
         pass
@@ -220,7 +261,7 @@ def fetch_web_exact(query: str, count: int = 3) -> list:
 
 
 def build_lead_osint_url(company_name: str) -> str:
-    clean_company = re.sub(r'[\'\"«»]', '', company_name).strip()
+    clean_company = re.sub(r'[\'\"«»@]', '', company_name).strip()
     target_role = "CTO OR \"Team Lead\" OR \"Head of Analytics\" OR \"Engineering Manager\""
     query = f'site:linkedin.com/in "{clean_company}" ({target_role})'
     return f"https://www.google.com/search?q={quote_plus(query)}"
@@ -229,9 +270,9 @@ def build_lead_osint_url(company_name: str) -> str:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **OSINT B2B Lead De-Anonymizer**\n\n"
-        "Отправьте обезличенный текст вакансии/заявки от посредника.\n"
-        "Я просканирую открытые источники, сопоставлю глубокие контексты задач и вычислю конечного заказчика.",
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "Отправьте обезличенный текст вакансии/заявки.\n"
+        "Я просканирую **hh.ru, Хабр, SuperJob и Telegram-каналы (site:t.me)**, чтобы вычислить прямого работодателя.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -239,7 +280,7 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("⚡️ **Шаг 1/2:** Извлекаю маркеры и параллельно сканирую базы...")
+    status_msg = await message.answer("⚡️ **Шаг 1/2:** Синтез маркеров и параллельный опрос hh.ru, Хабр, SuperJob, Telegram...")
 
     exact_shingle = extract_best_shingle(user_text)
 
@@ -255,24 +296,25 @@ async def handle_vacancy(message: Message):
     if not queries:
         queries = fallback_extract_keywords(user_text)
 
-    # 1. Параллельный первичный поиск
+    # Параллельный сбор по всем базам
+    tg_search_query = exact_shingle if exact_shingle else queries[1] if len(queries) > 1 else queries[0]
+    
     tasks = [
         asyncio.to_thread(fetch_hh, queries[0], 8),
         asyncio.to_thread(fetch_habr, queries[1] if len(queries) > 1 else queries[0], 8),
-        asyncio.to_thread(fetch_hh, queries[1] if len(queries) > 1 else queries[0], 6),
+        asyncio.to_thread(fetch_superjob, queries[1] if len(queries) > 1 else queries[0], 6),
+        asyncio.to_thread(fetch_telegram_posts, tg_search_query, 4),
     ]
-    if exact_shingle:
-        tasks.append(asyncio.to_thread(fetch_web_exact, exact_shingle, 3))
 
     results = await asyncio.gather(*tasks)
     raw_vacancies = [item for sublist in results for item in sublist]
     unique_vacancies = list({v["url"]: v for v in raw_vacancies if v.get("url")}.values())
 
     if not unique_vacancies:
-        await status_msg.edit_text("❌ Не удалось обнаружить открытых позиций работодателей. Уточните описание стека.")
+        await status_msg.edit_text("❌ Не удалось обнаружить прямых позиций. Уточните описание стека.")
         return
 
-    # 2. Мгновенная параллельная дозагрузка ПОЛНОГО текста для топ-hh вакансий
+    # Дозагрузка полных описаний hh.ru
     hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:5]
     if hh_candidates:
         full_text_tasks = [asyncio.to_thread(fetch_hh_full_details, v["id"]) for v in hh_candidates]
@@ -281,44 +323,44 @@ async def handle_vacancy(message: Message):
             if full_desc:
                 cand["desc"] = full_desc
 
-    await status_msg.edit_text(f"🧠 **Шаг 2/2:** OSINT-сопоставление полных текстов {len(unique_vacancies)} вакансий...")
+    await status_msg.edit_text(f"🧠 **Шаг 2/2:** OSINT-сопоставление {len(unique_vacancies)} позиций из 4 источников...")
 
     compact_list = []
-    for idx, v in enumerate(unique_vacancies[:12], 1):
+    for idx, v in enumerate(unique_vacancies[:14], 1):
         compact_list.append(
-            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Описание: {v['desc'][:450]}"
+            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc'][:400]}"
         )
     vacancies_payload = "\n".join(compact_list)
 
     prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
-Агентство прислало обезличенный запрос. Твоя задача — вычислить ТОП-3 прямых работодателей, у которых украдена/скопирована эта заявка.
+Агентство прислало обезличенный запрос. Твоя задача — вычислить ТОП-3 прямых работодателей, у которых взят этот проект.
 
 ОРИГИНАЛЬНЫЙ ОБЕЗЛИЧЕННЫЙ ЗАПРОС:
 \"\"\"{user_text[:800]}\"\"\"
 
-НАЙДЕННЫЕ ПОЛНЫЕ ВАКАНСИИ РАБОТОДАТЕЛЕЙ:
+НАЙДЕННЫЕ ВАКАНСИИ И ПОСТЫ (hh.ru, Хабр, SuperJob, Telegram):
 {vacancies_payload}
 
-АЛГОРИТМ ОЦЕНКИ:
-1. Ищи совпадение редких внутренних терминов, названий модулей, подсистем (например: промодвижок, витрины данных, специфика алертинга).
-2. Оштрафуй те компании, где просто совпал популярный стек, но задачи совсем другие.
-3. Присвой статус прямого заказчика только тем, у кого сходятся продуктовые задачи.
+ПРАВИЛА ОЦЕНКИ:
+1. Ищи совпадение уникальных задач, формулировок и архитектуры проектов.
+2. Если совпал пост в Telegram или SuperJob — приоритезируй его как прямой первоисточник.
+3. Отсекай компании с чужим стеком.
 
 ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
-🏢 **КОМПАНИЯ:** [Название компании]
+🏢 **КОМПАНИЯ:** [Название компании или канал первоисточника]
 🎯 **Соответствие стека:** [XX]%
 🎲 **Вероятность статуса заказчика:** [🟢 Высокая (80-95%) / 🟡 Средняя (50-75%) / 🟠 Косвенная (30-45%)]
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
-🔗 **Вакансия:** [Открыть страницу с вакансией](URL)
-🏛 **Источник:** [hh.ru / Хабр Карьера / Веб-поиск]
+🔗 **Вакансия/Пост:** [Открыть источник](URL)
+🏛 **Источник:** [hh.ru / Хабр Карьера / SuperJob / Telegram]
 
 🔍 **Факторы совпадения:**
-• [1-2 конкретных маркера: точные формулировки задач, совпадение архитектуры или терминов]
+• [1-2 конкретных маркера: совпадение редких задач, терминов или архитектуры]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Должность ЛПР: CTO / Head of Analytics / Team Lead]
+• **К кому идти:** [Должность ЛПР или контакт из Telegram]
 • **Болевая точка:** [Какую текущую проблему в проекте закроет аутстафф]
 • **Первый контакт:** [Краткая фраза первого сообщения]
 ══════════════════════════════
@@ -327,7 +369,7 @@ async def handle_vacancy(message: Message):
     result_text, err = call_groq_safe(prompt_match, max_tokens=1800)
 
     if not result_text:
-        await status_msg.edit_text(f"⚠️ Ошибка генерации отчета: {err}")
+        await status_msg.edit_text(f"⚠️ Ошибка генерации: {err}")
         return
 
     lines = result_text.split("\n")
@@ -338,7 +380,7 @@ async def handle_vacancy(message: Message):
         if "🏢 **КОМПАНИЯ:**" in line:
             current_company = line.replace("🏢 **КОМПАНИЯ:**", "").strip()
             enhanced_lines.append(line)
-        elif "• **К кому идти:**" in line and current_company:
+        elif "• **К кому идти:**" in line and current_company and not current_company.startswith("@"):
             osint_url = build_lead_osint_url(current_company)
             enhanced_lines.append(line)
             enhanced_lines.append(f"• **Поиск контактов ЛПР:** [Найти профили в LinkedIn/Google]({osint_url})")
