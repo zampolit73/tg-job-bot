@@ -1,3 +1,4 @@
-aiogram
-google-genai
-requests
+aiogram>=3.0.0
+groq>=0.9.0
+httpx>=0.27.0
+duckduckgo_search>=6.0.0
