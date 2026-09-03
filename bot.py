@@ -64,7 +64,7 @@ def run_health_server():
     server.serve_forever()
 
 
-def call_groq_safe(prompt: str, max_tokens: int = 1700) -> tuple[str, str]:
+def call_groq_safe(prompt: str, max_tokens: int = 1800) -> tuple[str, str]:
     models = ["llama-3.1-8b-instant", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
     last_err = ""
     for model_name in models:
@@ -115,10 +115,16 @@ def is_agency(company_name: str) -> bool:
     return any(w in lower_name for w in KNOWN_AGENCIES)
 
 
-def fetch_hh(query: str, count: int = 10) -> list:
+def clean_html(raw_html: str) -> str:
+    clean = re.sub(r"<[^>]+>", " ", raw_html)
+    return " ".join(clean.split())
+
+
+# 1. Быстрый сбор списка вакансий с hh.ru
+def fetch_hh(query: str, count: int = 8) -> list:
     url = "https://api.hh.ru/vacancies"
     params = {"text": query, "area": 113, "per_page": count}
-    headers = {"User-Agent": "FastOSINT/7.0"}
+    headers = {"User-Agent": "DeepOSINTHunter/8.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=4).json()
@@ -130,23 +136,38 @@ def fetch_hh(query: str, count: int = 10) -> list:
             sal_str = f"{sal.get('from') or ''} - {sal.get('to') or ''} {sal.get('currency') or ''}".strip() if sal else "не указана"
             desc = f"{item.get('snippet', {}).get('requirement', '')} {item.get('snippet', {}).get('responsibility', '')}"
             jobs.append({
+                "id": item.get("id"),
                 "source": "hh.ru",
                 "title": item.get("name"),
                 "company": company,
                 "salary": sal_str,
                 "url": item.get("alternate_url"),
-                "desc": desc[:250],
+                "desc": clean_html(desc),
             })
     except Exception:
         pass
     return jobs
 
 
-def fetch_habr(query: str, count: int = 10) -> list:
+# 2. Мгновенная параллельная дозагрузка ПОЛНОГО текста по ID
+def fetch_hh_full_details(vacancy_id: str) -> str:
+    url = f"https://api.hh.ru/vacancies/{vacancy_id}"
+    headers = {"User-Agent": "DeepOSINTHunter/8.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=3).json()
+        raw_desc = r.get("description", "")
+        key_skills = " ".join([s.get("name", "") for s in r.get("key_skills", [])])
+        return clean_html(f"{raw_desc} {key_skills}")[:600]
+    except Exception:
+        return ""
+
+
+# 3. Хабр Карьера API
+def fetch_habr(query: str, count: int = 8) -> list:
     clean_q = re.sub(r'[^\w\s\+\#\.\-]', ' ', query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
-    headers = {"User-Agent": "FastOSINT/7.0"}
+    headers = {"User-Agent": "DeepOSINTHunter/8.0"}
     jobs = []
     try:
         r = requests.get(url, params=params, headers=headers, timeout=4).json()
@@ -160,18 +181,20 @@ def fetch_habr(query: str, count: int = 10) -> list:
             full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
             skills = ", ".join([s.get("title", "") for s in item.get("skills", [])])
             jobs.append({
+                "id": None,
                 "source": "Хабр Карьера",
                 "title": item.get("title"),
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
-                "desc": f"Стек: {skills[:200]}",
+                "desc": f"Стек и навыки: {skills}",
             })
     except Exception:
         pass
     return jobs
 
 
+# 4. Веб-поиск по точному шинглу
 def fetch_web_exact(query: str, count: int = 3) -> list:
     jobs = []
     try:
@@ -183,12 +206,13 @@ def fetch_web_exact(query: str, count: int = 3) -> list:
             company_cand = title.split("—")[0].split("-")[0].split(":")[0].strip()
             if not is_agency(company_cand):
                 jobs.append({
+                    "id": None,
                     "source": "Веб-поиск (Exact Match)",
                     "title": title,
                     "company": company_cand,
                     "salary": "не указана",
                     "url": res.get("href", ""),
-                    "desc": res.get("body", "")[:200],
+                    "desc": res.get("body", "")[:350],
                 })
     except Exception:
         pass
@@ -205,8 +229,9 @@ def build_lead_osint_url(company_name: str) -> str:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "⚡️ **Fast OSINT Lead Hunter**\n\n"
-        "Отправьте текст заявки/вакансии. Задействован параллельный опрос баз и точечный скоринг.",
+        "💼 **OSINT B2B Lead De-Anonymizer**\n\n"
+        "Отправьте обезличенный текст вакансии/заявки от посредника.\n"
+        "Я просканирую открытые источники, сопоставлю глубокие контексты задач и вычислю конечного заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -214,13 +239,13 @@ async def cmd_start(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     user_text = message.text
-    status_msg = await message.answer("⚡️ Сканирую стек и параллельно опрашиваю базы...")
+    status_msg = await message.answer("⚡️ **Шаг 1/2:** Извлекаю маркеры и параллельно сканирую базы...")
 
     exact_shingle = extract_best_shingle(user_text)
 
     prompt_kw = f"""Выдели ключевую роль и технологическое ядро.
 Сформируй ровно 2 запроса через точку с запятой:
-1. Запрос по роли для hh.ru с оператором NAME:(...). Например: NAME:("Product Analyst") или NAME:("C#").
+1. Роль для hh.ru с оператором NAME:(...). Например: NAME:("Product Analyst") или NAME:("C#").
 2. Стек из 2-3 инструментов. Например: 'ClickHouse Superset' или 'PostgreSQL EF Core'.
 Выведи ТОЛЬКО 2 запроса через точку с запятой:
 {user_text[:500]}"""
@@ -230,7 +255,7 @@ async def handle_vacancy(message: Message):
     if not queries:
         queries = fallback_extract_keywords(user_text)
 
-    # Параллельный запуск всех сетевых запросов
+    # 1. Параллельный первичный поиск
     tasks = [
         asyncio.to_thread(fetch_hh, queries[0], 8),
         asyncio.to_thread(fetch_habr, queries[1] if len(queries) > 1 else queries[0], 8),
@@ -247,29 +272,39 @@ async def handle_vacancy(message: Message):
         await status_msg.edit_text("❌ Не удалось обнаружить открытых позиций работодателей. Уточните описание стека.")
         return
 
-    await status_msg.edit_text(f"🧠 Скоринг {len(unique_vacancies)} найденных позиций (отсев посредников и несовпадений)...")
+    # 2. Мгновенная параллельная дозагрузка ПОЛНОГО текста для топ-hh вакансий
+    hh_candidates = [v for v in unique_vacancies if v.get("id") and v["source"] == "hh.ru"][:5]
+    if hh_candidates:
+        full_text_tasks = [asyncio.to_thread(fetch_hh_full_details, v["id"]) for v in hh_candidates]
+        full_texts = await asyncio.gather(*full_text_tasks)
+        for cand, full_desc in zip(hh_candidates, full_texts):
+            if full_desc:
+                cand["desc"] = full_desc
+
+    await status_msg.edit_text(f"🧠 **Шаг 2/2:** OSINT-сопоставление полных текстов {len(unique_vacancies)} вакансий...")
 
     compact_list = []
     for idx, v in enumerate(unique_vacancies[:12], 1):
         compact_list.append(
-            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Детали: {v['desc']}"
+            f"ID {idx}: {v['company']} | {v['title']} | Источник: {v['source']} | URL: {v['url']} | Описание: {v['desc'][:450]}"
         )
     vacancies_payload = "\n".join(compact_list)
 
-    # Единый промпт: строгая верификация и формирование карточек в один быстрый проход
-    prompt_match = f"""Ты — ведущий OSINT-аналитик IT-аутстаффинга. Твоя задача — найти ТОП-3 прямых конечных заказчиков.
+    prompt_match = f"""Ты — ведущий OSINT-аналитик по деанонимизации IT-заказчиков в аутстаффинге.
+Агентство прислало обезличенный запрос. Твоя задача — вычислить ТОП-3 прямых работодателей, у которых украдена/скопирована эта заявка.
 
-ИСХОДНЫЙ ЗАПРОС:
-\"\"\"{user_text[:700]}\"\"\"
+ОРИГИНАЛЬНЫЙ ОБЕЗЛИЧЕННЫЙ ЗАПРОС:
+\"\"\"{user_text[:800]}\"\"\"
 
-СПИСОК НАЙДЕННЫХ ВАКАНСИЙ:
+НАЙДЕННЫЕ ПОЛНЫЕ ВАКАНСИИ РАБОТОДАТЕЛЕЙ:
 {vacancies_payload}
 
-ПРАВИЛА ОТСЕВА:
-1. Оштрафуй и исключи вакансии, где кардинально отличается стек (например, другой язык/СУБД).
-2. Выдели ТОП-3 компаний с наименьшим количеством расхождений.
+АЛГОРИТМ ОЦЕНКИ:
+1. Ищи совпадение редких внутренних терминов, названий модулей, подсистем (например: промодвижок, витрины данных, специфика алертинга).
+2. Оштрафуй те компании, где просто совпал популярный стек, но задачи совсем другие.
+3. Присвой статус прямого заказчика только тем, у кого сходятся продуктовые задачи.
 
-СТРОГИЙ ШАБЛОН ДЛЯ ВЫВОДА:
+ОФОРМИ СТРОГО ПО ШАБЛОНУ:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании]
 🎯 **Соответствие стека:** [XX]%
@@ -280,7 +315,7 @@ async def handle_vacancy(message: Message):
 🏛 **Источник:** [hh.ru / Хабр Карьера / Веб-поиск]
 
 🔍 **Факторы совпадения:**
-• [1-2 конкретных маркера: совпадение редких задач, терминов или архитектуры]
+• [1-2 конкретных маркера: точные формулировки задач, совпадение архитектуры или терминов]
 
 💡 **Стратегия выхода для сейлза:**
 • **К кому идти:** [Должность ЛПР: CTO / Head of Analytics / Team Lead]
@@ -310,7 +345,7 @@ async def handle_vacancy(message: Message):
         else:
             enhanced_lines.append(line)
 
-    final_header = "🎯 **ОТЧЁТ ПО ВЫЧИСЛЕНИЮ ПРЯМОГО ЗАКАЗЧИКА**\n\n"
+    final_header = "🎯 **ОТЧЁТ ПО ДЕАНОНИМИЗАЦИИ ПРЯМОГО ЗАКАЗЧИКА**\n\n"
     final_output = final_header + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
