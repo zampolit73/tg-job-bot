@@ -44,6 +44,9 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
+# Динамический список проверенных моделей Groq
+AVAILABLE_GROQ_MODELS = []
+
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
     telethon_client = TelegramClient(StringSession(TG_SESSION_STRING), TG_API_ID, TG_API_HASH)
@@ -121,12 +124,45 @@ async def safe_edit_status(msg: Message, text: str):
         pass
 
 
-# ----------------- GROQ CLIENT (АКТУАЛЬНЫЕ МОДЕЛИ) -----------------
+# ----------------- ДИНАМИЧЕСКИЙ ВЫБОР МОДЕЛЕЙ GROQ -----------------
+async def update_available_groq_models():
+    """Запрашивает у API список моделей, доступных именно вашему аккаунту"""
+    global AVAILABLE_GROQ_MODELS
+    try:
+        models_data = await groq_client.models.list()
+        valid_ids = [m.id for m in models_data.data if m.active]
+        # Приоритет: llama, qwen, gemma, остальные чат-модели
+        sorted_models = sorted(
+            valid_ids,
+            key=lambda x: (
+                0 if "llama" in x.lower() and "70b" in x.lower() else
+                1 if "llama" in x.lower() else
+                2 if "qwen" in x.lower() else
+                3 if "gemma" in x.lower() else 4
+            )
+        )
+        if sorted_models:
+            AVAILABLE_GROQ_MODELS = sorted_models
+            logger.info(f"Доступные модели Groq: {AVAILABLE_GROQ_MODELS[:4]}")
+            return
+    except Exception as e:
+        logger.warning(f"Не удалось получить список моделей через API: {e}")
+
+    # Запасной статический список
+    AVAILABLE_GROQ_MODELS = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "gemma2-9b-it"
+    ]
+
+
 async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool = False) -> tuple[str, str]:
-    # Актуальные стабильные модели Groq
-    models = ("llama-3.3-70b-versatile", "llama-3.1-8b-instant")
+    global AVAILABLE_GROQ_MODELS
+    if not AVAILABLE_GROQ_MODELS:
+        await update_available_groq_models()
+
     last_err = ""
-    for model_name in models:
+    for model_name in AVAILABLE_GROQ_MODELS[:5]:
         try:
             kwargs = {
                 "model": model_name,
@@ -146,7 +182,20 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
                 return content, ""
         except Exception as e:
             last_err = str(e)
-            logger.warning(f"Ошибка Groq на модели {model_name}: {e}. Переключение на резервную модель...")
+            logger.warning(f"Модель {model_name} вернула ошибку: {e}. Пробуем следующий вариант...")
+            # Если ошибка вызвана json_mode, пробуем ту же модель без него
+            if json_mode and "json" in str(e).lower():
+                try:
+                    kwargs.pop("response_format", None)
+                    res = await asyncio.wait_for(
+                        groq_client.chat.completions.create(**kwargs),
+                        timeout=12.0
+                    )
+                    content = res.choices[0].message.content
+                    if content and content.strip():
+                        return content, ""
+                except Exception:
+                    pass
             continue
     return "", last_err
 
@@ -354,9 +403,9 @@ async def search_telegram_native(search_term: str) -> list:
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Hydration & Dork Engine)**\n\n"
-        "Отправьте бриф. Бот формирует каскадные дорки, опрашивает открытые базы и Google X-Ray, "
-        "выкачивает страницы вакансий целиком и проводит матричный скоринг.",
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "Отправьте бриф вакансии. Бот автоматически подберет активную модель нейросети, "
+        "сформирует каскадные дорки, выкачает страницы и выполнит скоринг.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -367,9 +416,8 @@ async def handle_vacancy(message: Message):
     user_text = message.text
     logger.info(f"Получен бриф ({len(user_text)} симв.)")
 
-    status_msg = await message.answer("⚡️ [1/4] Генерация 3 поисковых гипотез и извлечение сущностей...")
+    status_msg = await message.answer("⚡️ [1/4] Извлечение сущностей проекта...")
 
-    # Шаг 1: Groq формирует поисковые дорки
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
 Разбери бриф и верни JSON со строгой структурой:
 {{
@@ -378,9 +426,9 @@ async def handle_vacancy(message: Message):
   "infra_type": "тип среды (OnPrem, Cloud или Не указан)",
   "must_have": ["список", "только", "редких", "технологий"],
   "core_challenge": "главная проектная задача (1 предложение)",
-  "dork_exact_quote": "дословная фраза из 3-5 слов из блока обязанностей (без кавычек)",
-  "dork_tech_cluster": "роль + 2 редкие технологии для общего поиска",
-  "dork_ats_search": "название ключевого редкого фреймворка или термина для поиска по ATS"
+  "dork_exact_quote": "дословная фраза из 3-5 слов из обязанностей без кавычек",
+  "dork_tech_cluster": "роль + 2 технологии для поиска",
+  "dork_ats_search": "название ключевого фреймворка"
 }}
 БРИФ:
 \"\"\"{user_text[:900]}\"\"\""""
@@ -401,13 +449,12 @@ async def handle_vacancy(message: Message):
         }
 
     rare_techs = brief_profile.get("must_have", [])
-    primary_tech = rare_techs[0] if rare_techs else brief_profile.get("dork_ats_search", "Backend")
+    primary_tech = rare_techs[0] if rare_techs else brief_profile.get("dork_ats_search", "Angular")
     exact_quote = brief_profile.get("dork_exact_quote", "")
     cluster_query = brief_profile.get("dork_tech_cluster", primary_tech)
 
-    await safe_edit_status(status_msg, "🔍 [2/4] Запуск 3 поисковых волн (Google X-Ray, Хабр, ATS, SuperJob, TG)...")
+    await safe_edit_status(status_msg, "🔍 [2/4] Запуск поисковых волн (Google X-Ray, Хабр, ATS, SuperJob, TG)...")
 
-    # Шаг 2: Каскадный поиск
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             fetch_habr(http_client, primary_tech, 6),
@@ -416,14 +463,11 @@ async def handle_vacancy(message: Message):
         ]
 
         if not google_quota_exhausted and GOOGLE_API_KEY:
-            # Волна 1: Точная цитата
             if len(exact_quote.split()) >= 3:
                 tasks.append(search_google_custom(http_client, f'"{exact_quote}"', count=3))
 
-            # Волна 2: Технический кластер
             tasks.append(search_google_custom(http_client, cluster_query, count=5))
 
-            # Волна 3: Прямой поиск по ATS-системам
             ats_query = f"(site:huntflow.io OR site:potok.io) {primary_tech} {brief_profile.get('role', '')}"
             tasks.append(search_google_custom(http_client, ats_query, count=4))
 
@@ -440,15 +484,13 @@ async def handle_vacancy(message: Message):
             await safe_edit_status(status_msg, "❌ Совпадений не найдено. Попробуйте передать бриф с более конкретным техническим описанием.")
             return
 
-        # Шаг 3: Выкачка полного тела страниц
-        await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка полных страниц {len(unique_vacancies[:6])} кандидатов (Full Body Extraction)...")
+        await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка полных страниц {len(unique_vacancies[:6])} кандидатов (Full Body)...")
         hydrated_vacancies = await hydrate_all_vacancies(http_client, unique_vacancies)
 
     if not hydrated_vacancies:
         hydrated_vacancies = unique_vacancies[:6]
 
-    # Шаг 4: Матричный скоринг
-    await safe_edit_status(status_msg, f"🧠 [4/4] Матричный аудит {len(hydrated_vacancies[:6])} кандидатов через Groq LPU...")
+    await safe_edit_status(status_msg, f"🧠 [4/4] Матричный скоринг {len(hydrated_vacancies[:6])} кандидатов через Groq LPU...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -456,7 +498,7 @@ async def handle_vacancy(message: Message):
         f"Должность: {v['title']}\n"
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
-        f"Полный текст вакансии: {v['desc']}\n"
+        f"Полный текст: {v['desc']}\n"
         for idx, v in enumerate(hydrated_vacancies[:6], 1)
     ]
     candidates_payload = "\n".join(compact_candidates)
@@ -472,14 +514,14 @@ async def handle_vacancy(message: Message):
 ПРАВИЛА ОЦЕНКИ:
 1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР <= 35%):
    - Если кандидат является аутстафф/рекрутинг-посредником (фразы 'наш партнер', 'клиент' и т.д.).
-   - Не совпал стек фреймворков или инфраструктура.
+   - Не совпал стек фреймворков или архитектура.
 2. ВЕСА ДЛЯ НАЧИСЛЕНИЯ БАЛЛОВ:
-   - [45%] Архитектурный вызов ('core_challenge') и схожесть реальных проектных задач.
+   - [45%] Архитектурный вызов ('core_challenge') и схожесть реальных задач.
    - [35%] Покрытие редкого стека ('must_have').
    - [20%] Домен бизнеса.
 3. Если совпала дословная цитата обязанностей — вероятность 95-99%.
 
-Выведи ТОП-3 кандидатов по шаблону:
+Выведи ТОП-3 кандидатов строго по шаблону:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название прямого заказчика или канал]
 🎯 **Матричный скор:** [XX]%
@@ -491,7 +533,7 @@ async def handle_vacancy(message: Message):
 
 ⚖️ **Аудит по матрице:**
 • **Must-have стек:** [Что конкретно совпало, чего нет]
-• **Архитектурный вызов:** [Сравнение реальных задач проекта]
+• **Архитектурный вызов:** [Сравнение задач проекта]
 • **Проверка на аутстафф:** [Прямой заказчик или посредник]
 
 💡 **Стратегия выхода для сейлза:**
@@ -519,7 +561,7 @@ async def handle_vacancy(message: Message):
             enhanced_lines.append(line)
 
     fallback_badge = "\nℹ️ *Режим: Открытые API (квота Google исчерпана)*\n" if google_quota_exhausted else ""
-    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ (FULL BODY HYDRATED)**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
+    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
         parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
@@ -551,6 +593,10 @@ async def init_telethon():
 async def main():
     logger.info("Инициализация сервиса...")
     threading.Thread(target=run_health_server, daemon=True).start()
+
+    # Получаем список доступных моделей Groq
+    await update_available_groq_models()
+
     await init_telethon()
 
     try:
