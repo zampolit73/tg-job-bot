@@ -123,9 +123,10 @@ async def safe_edit_status(msg: Message, text: str):
         pass
 
 
-# ----------------- GROQ CLIENT -----------------
+# ----------------- GROQ CLIENT (ИСПРАВЛЕННЫЙ СПИСОК МОДЕЛЕЙ) -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool = False) -> tuple[str, str]:
-    models = ("openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile")
+    # Актуальные модели с поддержкой JSON и высокой скоростью инференса
+    models = ("llama-3.1-8b-instant", "llama3-70b-8192", "mixtral-8x7b-32768")
     last_err = ""
     for model_name in models:
         try:
@@ -166,11 +167,9 @@ async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
         r = await client.get(url, headers=headers, timeout=2.5)
         if r.status_code == 200:
             text = clean_html(r.text)
-            # Извлекаем плотный информационный блок (1 500 символов)
             clean_snippet = " ".join(text.split()[:300])
             if len(clean_snippet) > 200:
                 job["desc"] = clean_snippet
-                # Повторная проверка на скрытый аутстафф в полном теле страницы
                 if is_agency(job["company"], clean_snippet):
                     job["is_agency"] = True
     except Exception:
@@ -179,7 +178,6 @@ async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
 
 
 async def hydrate_all_vacancies(client: httpx.AsyncClient, vacancies: list) -> list:
-    """Параллельная подгрузка полных страниц для ТОП-6 кандидатов"""
     tasks = [hydrate_single_vacancy(client, v) for v in vacancies[:6]]
     hydrated = await asyncio.gather(*tasks, return_exceptions=True)
     clean_list = []
@@ -372,7 +370,7 @@ async def handle_vacancy(message: Message):
 
     status_msg = await message.answer("⚡️ [1/4] Генерация 3 поисковых гипотез и извлечение сущностей...")
 
-    # Шаг 1: Groq формирует 3 разных дорка для поиска
+    # Шаг 1: Формирование поисковых дорков через Groq
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
 Разбери бриф и верни JSON со строгой структурой:
 {{
@@ -410,7 +408,7 @@ async def handle_vacancy(message: Message):
 
     await safe_edit_status(status_msg, "🔍 [2/4] Запуск 3 поисковых волн (Google X-Ray, Хабр, ATS, SuperJob, TG)...")
 
-    # Шаг 2: Параллельный опрос источников по каскадным доркам
+    # Шаг 2: Каскадный параллельный опрос
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             fetch_habr(http_client, primary_tech, 6),
@@ -419,14 +417,14 @@ async def handle_vacancy(message: Message):
         ]
 
         if not google_quota_exhausted and GOOGLE_API_KEY:
-            # Волна 1: Точная N-грамма обязанностей в кавычках
+            # Волна 1: Точная цитата
             if len(exact_quote.split()) >= 3:
                 tasks.append(search_google_custom(http_client, f'"{exact_quote}"', count=3))
 
             # Волна 2: Технический кластер
             tasks.append(search_google_custom(http_client, cluster_query, count=5))
 
-            # Волна 3: Поиск прямо по ATS-системам (Huntflow / Potok)
+            # Волна 3: Поиск прямо по ATS-системам
             ats_query = f"(site:huntflow.io OR site:potok.io) {primary_tech} {brief_profile.get('role', '')}"
             tasks.append(search_google_custom(http_client, ats_query, count=4))
 
@@ -443,14 +441,14 @@ async def handle_vacancy(message: Message):
             await safe_edit_status(status_msg, "❌ Совпадений не найдено. Попробуйте передать бриф с более конкретным техническим описанием.")
             return
 
-        # Шаг 3: Полнотекстовая гидратация страниц (выкачиваем полное тело страниц)
+        # Шаг 3: Выкачка полного тела страниц
         await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка полных страниц {len(unique_vacancies[:6])} кандидатов (Full Body Extraction)...")
         hydrated_vacancies = await hydrate_all_vacancies(http_client, unique_vacancies)
 
     if not hydrated_vacancies:
         hydrated_vacancies = unique_vacancies[:6]
 
-    # Шаг 4: Матричный скоринг через Groq
+    # Шаг 4: Матричный скоринг
     await safe_edit_status(status_msg, f"🧠 [4/4] Матричный аудит {len(hydrated_vacancies[:6])} кандидатов через Groq LPU...")
 
     compact_candidates = [
@@ -490,7 +488,7 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник](URL)
-🏛 **Источник:** [Google ATS / Google X-Ray / Хабр / SuperJob / Telegram]
+🏛 **Источник:** [Google ATS / Google Search / Хабр / SuperJob / Telegram]
 
 ⚖️ **Аудит по матрице:**
 • **Must-have стек:** [Что конкретно совпало, чего нет]
