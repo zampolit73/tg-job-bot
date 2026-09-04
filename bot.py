@@ -17,6 +17,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from groq import AsyncGroq
 from telethon import TelegramClient, events
 from telethon.tl.types import User
+from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.sessions import StringSession
 
 # ----------------- ЛОГИРОВАНИЕ -----------------
@@ -48,8 +49,9 @@ ACTIVE_GROQ_MODEL = None
 BOT_USER_ID = None
 db_pool = None
 
-# Локальный кэш исключенных ID для мгновенной проверки
-IGNORED_CHATS_CACHE = set()
+# Активные папки (id -> title) и объединенные ID чатов
+ACTIVE_FOLDERS = {}  # {folder_id: folder_title}
+ALLOWED_CHAT_IDS = set()
 
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
@@ -91,7 +93,7 @@ def run_health_server():
 
 # ----------------- РАБОТА С SUPABASE -----------------
 async def init_db():
-    global db_pool, IGNORED_CHATS_CACHE
+    global db_pool, ACTIVE_FOLDERS
     if not DATABASE_URL:
         logger.warning("DATABASE_URL не задан, работа с БД отключена.")
         return
@@ -110,43 +112,30 @@ async def init_db():
         )
         logger.info("Подключение к Supabase PostgreSQL успешно установлено!")
 
-        # Загружаем сохраненный черный список из БД
+        # Восстанавливаем выбранные папки из БД
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT chat_id FROM ignored_chats;")
-            IGNORED_CHATS_CACHE = {r["chat_id"] for r in rows}
-            logger.info(f"Загружено исключенных чатов из БД: {len(IGNORED_CHATS_CACHE)}")
+            rows = await conn.fetch("SELECT folder_id, folder_title FROM active_folders;")
+            ACTIVE_FOLDERS = {r["folder_id"]: r["folder_title"] for r in rows}
+            logger.info(f"Загружено сохраненных папок из БД: {list(ACTIVE_FOLDERS.values())}")
     except Exception as e:
         logger.error(f"Не удалось подключиться к Supabase: {e}")
         db_pool = None
 
 
-async def toggle_ignore_chat(chat_id: int, chat_title: str) -> bool:
-    """Переключает статус чата: игнорировать / сканировать. Возвращает True, если чат теперь игнорируется."""
-    global IGNORED_CHATS_CACHE
+async def sync_folder_to_db(folder_id: int, folder_title: str, add: bool):
     if not db_pool:
-        if chat_id in IGNORED_CHATS_CACHE:
-            IGNORED_CHATS_CACHE.remove(chat_id)
-            return False
-        else:
-            IGNORED_CHATS_CACHE.add(chat_id)
-            return True
-
+        return
     try:
         async with db_pool.acquire() as conn:
-            if chat_id in IGNORED_CHATS_CACHE:
-                await conn.execute("DELETE FROM ignored_chats WHERE chat_id = $1;", chat_id)
-                IGNORED_CHATS_CACHE.remove(chat_id)
-                return False
-            else:
+            if add:
                 await conn.execute(
-                    "INSERT INTO ignored_chats (chat_id, chat_title) VALUES ($1, $2) ON CONFLICT DO NOTHING;",
-                    chat_id, chat_title
+                    "INSERT INTO active_folders (folder_id, folder_title) VALUES ($1, $2) ON CONFLICT (folder_id) DO UPDATE SET folder_title = $2;",
+                    folder_id, folder_title
                 )
-                IGNORED_CHATS_CACHE.add(chat_id)
-                return True
+            else:
+                await conn.execute("DELETE FROM active_folders WHERE folder_id = $1;", folder_id)
     except Exception as e:
-        logger.error(f"Ошибка изменения статуса игнорирования чата: {e}")
-        return chat_id in IGNORED_CHATS_CACHE
+        logger.error(f"Ошибка синхронизации папки с БД: {e}")
 
 
 async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: str, url: str):
@@ -195,6 +184,73 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
     except Exception as e:
         logger.warning(f"Ошибка поиска в Supabase: {e}")
     return results
+
+
+# ----------------- РАБОТА С ПАПКАМИ TELEGRAM (МУЛЬТИВЫБОР) -----------------
+async def refresh_all_allowed_chats():
+    """Пересчитывает чаты из всех выбранных папок."""
+    global ALLOWED_CHAT_IDS
+    if not telethon_client or not telethon_client.is_connected():
+        return
+
+    if not ACTIVE_FOLDERS:
+        ALLOWED_CHAT_IDS = set()
+        logger.info("Папки не выбраны: поиск по всем группам без ограничений.")
+        return
+
+    try:
+        filters_result = await telethon_client(GetDialogFiltersRequest())
+        chat_ids = set()
+
+        for f in filters_result.filters:
+            f_id = getattr(f, 'id', None)
+            if f_id in ACTIVE_FOLDERS:
+                peers = getattr(f, 'include_peers', []) + getattr(f, 'pinned_peers', [])
+                for peer in peers:
+                    try:
+                        entity = await telethon_client.get_entity(peer)
+                        chat_ids.add(entity.id)
+                    except Exception:
+                        continue
+
+        ALLOWED_CHAT_IDS = chat_ids
+        logger.info(f"Объединено чатов из {len(ACTIVE_FOLDERS)} выбранных папок: {len(ALLOWED_CHAT_IDS)}")
+    except Exception as e:
+        logger.error(f"Ошибка пересчета чатов папок: {e}")
+
+
+async def build_folders_keyboard() -> tuple[str, InlineKeyboardMarkup]:
+    filters_result = await telethon_client(GetDialogFiltersRequest())
+    keyboard = []
+
+    # Кнопка сброса
+    reset_icon = "🔘" if not ACTIVE_FOLDERS else "⚪️"
+    keyboard.append([InlineKeyboardButton(text=f"{reset_icon} Все чаты (без ограничений)", callback_data="f_toggle:0")])
+
+    for f in filters_result.filters:
+        f_id = getattr(f, 'id', None)
+        f_title = getattr(f, 'title', None)
+        if hasattr(f_title, 'text'):
+            f_title = f_title.text
+
+        if f_id and f_title:
+            is_active = f_id in ACTIVE_FOLDERS
+            icon = "☑️" if is_active else "◻️"
+            btn_text = f"{icon} {f_title}"
+            keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"f_toggle:{f_id}")])
+
+    if ACTIVE_FOLDERS:
+        selected_names = ", ".join([f"`{name}`" for name in ACTIVE_FOLDERS.values()])
+        status_text = f"📂 Выбрано папок: **{len(ACTIVE_FOLDERS)}** ({selected_names})\n💬 Всего чатов в охвате: **{len(ALLOWED_CHAT_IDS)}**"
+    else:
+        status_text = "🌐 Режим: **Все чаты без ограничений**"
+
+    text = (
+        f"📁 **ВЫБОР ПАПОК ДЛЯ СКАНИРОВАНИЯ (МУЛЬТИВЫБОР)**\n\n"
+        f"{status_text}\n\n"
+        f"Нажимайте на папки, чтобы включить (☑️) или выключить (◻️) их из поиска:"
+    )
+    return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
@@ -332,60 +388,60 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
     found_posts = []
     seen_ids = set()
 
-    for term in search_terms:
-        clean_t = re.sub(r'[^\w\s]', '', term).strip()
-        if len(clean_t) < 3:
-            continue
+    chats_to_search = list(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else [None]
 
-        try:
-            logger.info(f"Поиск в группах/каналах по маркеру: '{clean_t}'...")
-            async for message in telethon_client.iter_messages(None, search=clean_t, limit=12):
-                if not message.text or len(message.text) < 40:
-                    continue
+    for target_chat in chats_to_search:
+        for term in search_terms:
+            clean_t = re.sub(r'[^\w\s]', '', term).strip()
+            if len(clean_t) < 3:
+                continue
 
-                if message.chat_id == bot_id or message.chat_id in IGNORED_CHATS_CACHE:
-                    continue
+            try:
+                async for message in telethon_client.iter_messages(target_chat, search=clean_t, limit=12):
+                    if not message.text or len(message.text) < 40:
+                        continue
 
-                chat = await message.get_chat()
+                    if message.chat_id == bot_id:
+                        continue
 
-                # Игнорируем личные диалоги 1 на 1
-                if isinstance(chat, User) or getattr(chat, 'is_user', False):
-                    continue
+                    chat = await message.get_chat()
+                    if isinstance(chat, User) or getattr(chat, 'is_user', False):
+                        continue
 
-                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Channel'))
-                if "matcher" in chat_title.lower() or "bot" in chat_title.lower():
-                    continue
+                    chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Channel'))
+                    if "matcher" in chat_title.lower() or "bot" in chat_title.lower():
+                        continue
 
-                unique_key = f"{message.chat_id}_{message.id}"
-                if unique_key in seen_ids:
-                    continue
-                seen_ids.add(unique_key)
+                    unique_key = f"{message.chat_id}_{message.id}"
+                    if unique_key in seen_ids:
+                        continue
+                    seen_ids.add(unique_key)
 
-                post_text = clean_html(message.text)
-                overlap = calculate_overlap_score(raw_brief, post_text)
+                    post_text = clean_html(message.text)
+                    overlap = calculate_overlap_score(raw_brief, post_text)
 
-                if getattr(chat, 'username', None):
-                    msg_url = f"https://t.me/{chat.username}/{message.id}"
-                else:
-                    clean_id = str(chat.id).replace("-100", "")
-                    msg_url = f"https://t.me/c/{clean_id}/{message.id}"
+                    if getattr(chat, 'username', None):
+                        msg_url = f"https://t.me/{chat.username}/{message.id}"
+                    else:
+                        clean_id = str(chat.id).replace("-100", "")
+                        msg_url = f"https://t.me/c/{clean_id}/{message.id}"
 
-                asyncio.create_task(save_vacancy_to_db(chat_title, message.id, message.chat_id, post_text, msg_url))
+                    asyncio.create_task(save_vacancy_to_db(chat_title, message.id, message.chat_id, post_text, msg_url))
 
-                company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
-                company = company_match.group(1).strip() if company_match else chat_title
+                    company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
+                    company = company_match.group(1).strip() if company_match else chat_title
 
-                found_posts.append({
-                    "source": f"TG Группа: {chat_title[:25]}",
-                    "title": f"Пост в {chat_title[:25]}",
-                    "company": company,
-                    "salary": "в тексте",
-                    "url": msg_url,
-                    "desc": post_text[:300],
-                    "overlap": overlap
-                })
-        except Exception as e:
-            logger.warning(f"Ошибка при поиске маркера '{clean_t}': {e}")
+                    found_posts.append({
+                        "source": f"TG: {chat_title[:25]}",
+                        "title": f"Пост в {chat_title[:25]}",
+                        "company": company,
+                        "salary": "в тексте",
+                        "url": msg_url,
+                        "desc": post_text[:300],
+                        "overlap": overlap
+                    })
+            except Exception as e:
+                logger.warning(f"Ошибка поиска: {e}")
 
     found_posts.sort(key=lambda x: x.get("overlap", 0), reverse=True)
     return found_posts[:4]
@@ -439,7 +495,8 @@ def register_telethon_listener():
             if event.is_private or not event.text or len(event.text) < 40:
                 return
 
-            if event.chat_id in IGNORED_CHATS_CACHE:
+            # Если заданы папки, слушаем ТОЛЬКО чаты из выбранных папок
+            if ALLOWED_CHAT_IDS and event.chat_id not in ALLOWED_CHAT_IDS:
                 return
 
             text_lower = event.text.lower()
@@ -453,76 +510,72 @@ def register_telethon_listener():
             pass
 
 
-# ----------------- ИНТЕРФЕЙС УПРАВЛЕНИЯ ЧАТАМИ -----------------
-async def build_chats_keyboard() -> tuple[str, InlineKeyboardMarkup]:
-    dialogs = await telethon_client.get_dialogs(limit=35)
-    keyboard = []
-    text_lines = [
-        "⚙️ **Управление источниками поиска**\n",
-        "Нажмите на чат, чтобы включить или исключить его из поиска:\n",
-        "• ✅ — чат сканируется",
-        "• ⛔️ — чат исключен (игнорируется)\n"
-    ]
-
-    for d in dialogs:
-        if d.is_group or d.is_channel:
-            c_id = d.id
-            name = d.name[:25]
-            is_ignored = c_id in IGNORED_CHATS_CACHE
-            icon = "⛔️" if is_ignored else "✅"
-            button_text = f"{icon} {name}"
-            cb_data = f"tg_ign:{c_id}"
-            keyboard.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
-
-    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-    return "\n".join(text_lines), markup
-
-
 # ----------------- ХЭНДЛЕРЫ AIOGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
         "💼 Multi-Source OSINT Lead Hunter\n\n"
         "Команды:\n"
-        "• /manage_chats — интерактивное меню с кнопками для исключения ненужных чатов\n"
-        "• /debug_tg — статус базы и подключение к Telegram\n\n"
+        "• /set_folder — интерактивный выбор папок Telegram (можно отметить сразу несколько)\n"
+        "• /debug_tg — статус базы и список активных папок\n\n"
         "Отправьте бриф вакансии в чат для поиска лидов.",
         parse_mode=None
     )
 
 
-@dp.message(F.text == "/manage_chats")
-async def cmd_manage_chats(message: Message):
+@dp.message(F.text == "/set_folder")
+async def cmd_set_folder(message: Message):
+    """Показывает список всех папок Telegram с чекбоксами."""
     if not telethon_client or not telethon_client.is_connected():
         await message.answer("⚠️ Telethon не подключен к Telegram.", parse_mode=None)
         return
 
-    status = await message.answer("🔄 Загружаю список каналов...")
+    status = await message.answer("🔄 Загружаю ваши папки...")
     try:
-        text, markup = await build_chats_keyboard()
+        await refresh_all_allowed_chats()
+        text, markup = await build_folders_keyboard()
         await status.edit_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await status.edit_text(f"⚠️ Ошибка формирования клавиатуры: {e}", parse_mode=None)
+        await status.edit_text(f"⚠️ Ошибка получения папок: {e}", parse_mode=None)
 
 
-@dp.callback_query(F.data.startswith("tg_ign:"))
-async def handle_toggle_chat(call: CallbackQuery):
-    chat_id = int(call.data.split(":")[1])
+@dp.callback_query(F.data.startswith("f_toggle:"))
+async def handle_folder_toggle_callback(call: CallbackQuery):
+    filter_id = int(call.data.split(":")[1])
+    global ACTIVE_FOLDERS
+
+    if filter_id == 0:
+        # Сброс всех папок
+        for f_id in list(ACTIVE_FOLDERS.keys()):
+            await sync_folder_to_db(f_id, "", add=False)
+        ACTIVE_FOLDERS.clear()
+        await refresh_all_allowed_chats()
+        await call.answer("Режим сброшен: сканируются все группы ✅", show_alert=False)
+    else:
+        # Включение / выключение конкретной папки
+        filters_result = await telethon_client(GetDialogFiltersRequest())
+        f_title = f"Папка {filter_id}"
+        for f in filters_result.filters:
+            if getattr(f, 'id', None) == filter_id:
+                title_obj = getattr(f, 'title', None)
+                f_title = title_obj.text if hasattr(title_obj, 'text') else str(title_obj)
+                break
+
+        if filter_id in ACTIVE_FOLDERS:
+            del ACTIVE_FOLDERS[filter_id]
+            await sync_folder_to_db(filter_id, f_title, add=False)
+            await call.answer(f"Папка '{f_title}' выключена ◻️", show_alert=False)
+        else:
+            ACTIVE_FOLDERS[filter_id] = f_title
+            await sync_folder_to_db(filter_id, f_title, add=True)
+            await call.answer(f"Папка '{f_title}' включена ☑️", show_alert=False)
+
+        await refresh_all_allowed_chats()
+
+    # Обновляем сообщение и клавиатуру
     try:
-        chat = await telethon_client.get_entity(chat_id)
-        chat_title = getattr(chat, 'title', str(chat_id))
-    except Exception:
-        chat_title = str(chat_id)
-
-    # Переключаем статус в базе данных и кэше
-    is_now_ignored = await toggle_ignore_chat(chat_id, chat_title)
-    status_label = "исключен из поиска ⛔️" if is_now_ignored else "снова активен ✅"
-    await call.answer(f"Чат {status_label}", show_alert=False)
-
-    # Обновляем кнопки на экране
-    try:
-        text, markup = await build_chats_keyboard()
-        await call.message.edit_reply_markup(reply_markup=markup)
+        text, markup = await build_folders_keyboard()
+        await call.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
     except Exception:
         pass
 
@@ -535,21 +588,19 @@ async def cmd_debug(message: Message):
         return
     try:
         me = await telethon_client.get_me()
-        dialogs = await telethon_client.get_dialogs(limit=15)
-        active_lines = []
-        for d in dialogs:
-            if (d.is_group or d.is_channel) and d.id not in IGNORED_CHATS_CACHE:
-                active_lines.append(f"- {d.name}")
+        if ACTIVE_FOLDERS:
+            folders_str = ", ".join([f"**{name}**" for name in ACTIVE_FOLDERS.values()])
+            folder_info = f"📁 Активные папки: {folders_str}\n💬 Чатов в охвате: **{len(ALLOWED_CHAT_IDS)}**"
+        else:
+            folder_info = "🌐 Охват: **Все чаты без фильтра**"
 
-        chats_list = "\n".join(active_lines[:6]) if active_lines else "Нет активных групп"
         response = (
             f"🗄 База данных Supabase: {db_status}\n"
             f"👤 Telethon аккаунт: {me.first_name} (@{me.username})\n"
-            f"🚫 Исключено чатов: {len(IGNORED_CHATS_CACHE)}\n"
-            f"📂 Активные рабочие группы:\n{chats_list}\n\n"
+            f"{folder_info}\n\n"
             f"🔒 Защита приватности: Личные переписки (1 на 1) исключены."
         )
-        await message.answer(response, parse_mode=None)
+        await message.answer(response, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {e}", parse_mode=None)
 
@@ -583,7 +634,8 @@ async def handle_vacancy(message: Message):
 
     search_terms = detected_markers[:3]
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск в Supabase и рабочих группах по {search_terms}...")
+    scope_desc = f"в {len(ACTIVE_FOLDERS)} папках ({len(ALLOWED_CHAT_IDS)} чатов)" if ACTIVE_FOLDERS else "в Telegram"
+    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск в Supabase и {scope_desc} по {search_terms}...")
 
     # 1. Поиск в Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
@@ -606,7 +658,7 @@ async def handle_vacancy(message: Message):
         unique_vacancies = list({v["url"]: v for v in all_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений в базе и рабочих группах не найдено.")
+            await safe_edit_status(status_msg, "❌ Совпадений в базе и выбранных папках не найдено.")
             return
 
     await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:3])} кандидатов...")
@@ -751,6 +803,8 @@ async def init_telethon():
         else:
             logger.info("Telethon успешно авторизован! Регистрация фонового слушателя...")
             register_telethon_listener()
+            # Пересчитываем чаты папок при старте
+            await refresh_all_allowed_chats()
     except Exception as e:
         logger.warning(f"Telethon пропущен: {e}")
         telethon_client = None
