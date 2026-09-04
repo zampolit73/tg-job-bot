@@ -99,7 +99,7 @@ def run_health_server():
     server.serve_forever()
 
 
-# ----------------- ФУНКЦИИ ХЕШИРОВАНИЯ И ДЕДУПЛИКАЦИИ -----------------
+# ----------------- СЕМАНТИЧЕСКИЙ ОТПЕЧАТОК -----------------
 def generate_content_hash(text: str) -> str:
     clean_text = HTML_TAG_RE.sub(" ", text.lower())
     words = re.findall(r'[a-zа-я0-9\+\#]{3,}', clean_text)
@@ -234,7 +234,8 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
                     "desc": p_text[:400],
                     "overlap": overlap,
                     "fwd_source": fwd_info,
-                    "content_hash": c_hash
+                    "content_hash": c_hash,
+                    "is_external": False
                 })
     except Exception as e:
         logger.warning(f"Ошибка поиска в Supabase: {e}")
@@ -411,8 +412,7 @@ async def extract_forward_metadata(message) -> str:
 
 
 # ----------------- ИНТЕГРАЦИЯ TELEGRAM DORKS (OSINT) -----------------
-async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
-    """Бесплатный OSINT-поиск открытых постов в Telegram через зеркало t.me/s/."""
+async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str, raw_brief: str) -> list:
     try:
         clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
         search_query = f'site:t.me/s/ "{clean_q}" "вакансия"'
@@ -423,7 +423,7 @@ async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
         }
         data = {"q": search_query, "b": ""}
 
-        r = await client.post(url, data=data, headers=headers, timeout=3.5)
+        r = await client.post(url, data=data, headers=headers, timeout=4.0)
         if r.status_code != 200:
             return []
 
@@ -433,7 +433,7 @@ async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
         )
 
         jobs = []
-        for enc_url, snippet in raw_results[:4]:
+        for enc_url, snippet in raw_results[:5]:
             decoded_url = unquote(enc_url)
             match = re.search(r"t\.me/(?:s/)?([a-zA-Z0-9_]+)/(\d+)", decoded_url)
             if not match:
@@ -449,6 +449,7 @@ async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
 
             company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", desc, re.IGNORECASE)
             company = company_match.group(1).strip() if company_match else f"@{channel_username}"
+            overlap = calculate_overlap_score(raw_brief, desc)
 
             jobs.append({
                 "source": f"TG Web: @{channel_username}",
@@ -457,9 +458,10 @@ async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
                 "salary": "в тексте",
                 "url": post_url,
                 "desc": desc[:350],
-                "overlap": 0.0,
+                "overlap": overlap,
                 "fwd_source": "",
-                "content_hash": generate_content_hash(desc)
+                "content_hash": generate_content_hash(desc),
+                "is_external": True
             })
 
         return jobs
@@ -539,13 +541,13 @@ async def call_groq_async(prompt: str, max_tokens: int = 2500, json_mode: bool =
 
 
 # ----------------- ПАРСИНГ ВНЕШНИХ ИСТОЧНИКОВ -----------------
-async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
+async def fetch_habr(client: httpx.AsyncClient, query: str, raw_brief: str, count: int = 5) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = await client.get(url, params=params, headers=headers, timeout=2.5)
+        r = await client.get(url, params=params, headers=headers, timeout=3.0)
         if r.status_code != 200:
             return []
         jobs = []
@@ -556,28 +558,31 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
             href = item.get("href", "")
             full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
             skills = ", ".join([s.get("title", "") for s in item.get("skills", [])])
-            desc_text = f"Стек: {skills}"
+            title = item.get("title", "")
+            desc_text = f"{title}. Стек: {skills}"
 
             if is_agency(company, desc_text):
                 continue
 
+            overlap = calculate_overlap_score(raw_brief, desc_text)
             jobs.append({
                 "source": "Хабр Карьера",
-                "title": item.get("title", ""),
+                "title": title,
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
-                "desc": desc_text[:300],
-                "overlap": 0.0,
+                "desc": desc_text[:350],
+                "overlap": overlap,
                 "fwd_source": "",
-                "content_hash": generate_content_hash(desc_text)
+                "content_hash": generate_content_hash(desc_text),
+                "is_external": True
             })
         return jobs
     except Exception:
         return []
 
 
-async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str) -> list:
+async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str, raw_brief: str) -> list:
     try:
         url = "https://api.vc.ru/v2.8/vacancies"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -585,17 +590,20 @@ async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str) -> list:
         if r.status_code != 200:
             return []
         jobs = []
-        q_lower = query.lower()
+        q_tokens = [t.lower() for t in query.split() if len(t) > 2]
         items = r.json().get("result", {}).get("items", [])
         for item in items:
             title = item.get("title", "")
             desc = clean_html(item.get("description", ""))
-            if q_lower in title.lower() or q_lower in desc.lower():
+            text_combo = f"{title} {desc}".lower()
+
+            if any(t in text_combo for t in q_tokens):
                 company = item.get("company", {}).get("name", "Компания с VC")
                 sal = item.get("salary", {}).get("title", "не указана")
                 post_url = f"https://vc.ru/job/{item.get('id', '')}"
                 if is_agency(company, desc):
                     continue
+                overlap = calculate_overlap_score(raw_brief, f"{title} {desc}")
                 jobs.append({
                     "source": "VC.ru",
                     "title": title,
@@ -603,16 +611,17 @@ async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str) -> list:
                     "salary": sal,
                     "url": post_url,
                     "desc": desc[:300],
-                    "overlap": 0.0,
+                    "overlap": overlap,
                     "fwd_source": "",
-                    "content_hash": generate_content_hash(desc)
+                    "content_hash": generate_content_hash(desc),
+                    "is_external": True
                 })
         return jobs[:3]
     except Exception:
         return []
 
 
-async def fetch_geeklink_rss(client: httpx.AsyncClient, query: str) -> list:
+async def fetch_geeklink_rss(client: httpx.AsyncClient, query: str, raw_brief: str) -> list:
     try:
         url = "https://geeklink.io/feed/"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -621,16 +630,19 @@ async def fetch_geeklink_rss(client: httpx.AsyncClient, query: str) -> list:
             return []
         root = ET.fromstring(r.content)
         jobs = []
-        q_lower = query.lower()
+        q_tokens = [t.lower() for t in query.split() if len(t) > 2]
         for item in root.findall(".//item"):
             title = item.findtext("title", "")
             link = item.findtext("link", "")
             desc = clean_html(item.findtext("description", ""))
-            if q_lower in title.lower() or q_lower in desc.lower():
+            text_combo = f"{title} {desc}".lower()
+
+            if any(t in text_combo for t in q_tokens):
                 company_match = re.search(r"в\s+([A-Za-zА-Яа-я0-9_\-\s]{2,25})", title)
                 company = company_match.group(1).strip() if company_match else "IT Компания"
                 if is_agency(company, desc):
                     continue
+                overlap = calculate_overlap_score(raw_brief, f"{title} {desc}")
                 jobs.append({
                     "source": "GeekLink",
                     "title": title,
@@ -638,16 +650,17 @@ async def fetch_geeklink_rss(client: httpx.AsyncClient, query: str) -> list:
                     "salary": "в описании",
                     "url": link,
                     "desc": desc[:300],
-                    "overlap": 0.0,
+                    "overlap": overlap,
                     "fwd_source": "",
-                    "content_hash": generate_content_hash(desc)
+                    "content_hash": generate_content_hash(desc),
+                    "is_external": True
                 })
         return jobs[:3]
     except Exception:
         return []
 
 
-async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
+async def fetch_finder_vc(client: httpx.AsyncClient, query: str, raw_brief: str) -> list:
     try:
         url = f"https://finder.vc/api/vacancies?search={quote_plus(query)}"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -656,7 +669,7 @@ async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
             return []
         data = r.json().get("data", [])
         jobs = []
-        for item in data[:3]:
+        for item in data[:4]:
             title = item.get("title", "")
             desc = clean_html(item.get("description", ""))
             company = item.get("company_name", "Удалённый проект")
@@ -665,6 +678,7 @@ async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
             full_url = f"https://finder.vc/vacancies/{slug}" if slug else "https://finder.vc"
             if is_agency(company, desc):
                 continue
+            overlap = calculate_overlap_score(raw_brief, f"{title} {desc}")
             jobs.append({
                 "source": "Finder.vc",
                 "title": title,
@@ -672,16 +686,17 @@ async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
                 "salary": sal,
                 "url": full_url,
                 "desc": desc[:300],
-                "overlap": 0.0,
+                "overlap": overlap,
                 "fwd_source": "",
-                "content_hash": generate_content_hash(desc)
+                "content_hash": generate_content_hash(desc),
+                "is_external": True
             })
         return jobs[:3]
     except Exception:
         return []
 
 
-# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM С ДЕДУПЛИКАЦИЕЙ -----------------
+# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
@@ -697,7 +712,7 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                 continue
 
             try:
-                limit_scan = 40 if target_chat else 20
+                limit_scan = 35 if target_chat else 15
                 async for message in telethon_client.iter_messages(target_chat, search=clean_t, limit=limit_scan):
                     if not message.text or len(message.text) < 40:
                         continue
@@ -746,13 +761,13 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                         "desc": post_text[:400],
                         "overlap": overlap,
                         "fwd_source": fwd_source,
-                        "content_hash": content_hash
+                        "content_hash": content_hash,
+                        "is_external": False
                     })
             except Exception as e:
                 logger.debug(f"Поиск в {target_chat}: {e}")
 
-    found_posts.sort(key=lambda x: x.get("overlap", 0), reverse=True)
-    return found_posts[:12]
+    return found_posts
 
 
 # ----------------- ФОНОВЫЙ СЛУШАТЕЛЬ В SUPABASE -----------------
@@ -788,9 +803,11 @@ def register_telethon_listener():
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф или описание вакансии — бот выполнит поиск по вашим Telegram-папкам, "
-        "базе Supabase, открытым постам Telegram (через OSINT Web Dorks) и IT-платформам, "
-        "деанонимизирует конечного клиента для **каждого** результата и выдаст стратегию выхода.\n\n"
+        "Отправьте бриф или описание вакансии — бот выполнит честный кросс-платформенный поиск:\n"
+        "• Telegram-папки и база Supabase\n"
+        "• Внешние IT-ресурсы (Хабр, VC, GeekLink, Finder, Web Dorks)\n"
+        "• Дедупликация и жесткая квалификация по стеку (Chain-of-Thought)\n"
+        "• Точечная OSINT-деанонимизация конечного заказчика.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
@@ -886,24 +903,27 @@ async def handle_vacancy(message: Message):
         me = await bot.get_me()
         BOT_USER_ID = me.id
 
-    status_msg = await message.answer("⚡️ [1/3] Извлечение ключевых маркеров...")
+    status_msg = await message.answer("⚡️ [1/3] Извлечение ключевого стека...")
 
     search_terms = extract_search_terms(user_text)
-    primary_query = search_terms[0] if search_terms else "разработчик"
+    # Составной поисковый запрос (например: "DevOps Kubernetes" вместо просто "DevOps")
+    composite_query = " ".join(search_terms[:2]) if len(search_terms) >= 2 else (search_terms[0] if search_terms else "разработчик")
     scope_desc = f"{len(ACTIVE_FOLDERS)} папкам" if ACTIVE_FOLDERS else "всем чатам"
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Сканирование TG-папок ({scope_desc}), OSINT Web Dorks, Supabase, VC...")
+    await safe_edit_status(status_msg, f"🔍 [2/3] Опрос источников (TG, Supabase, Хабр, VC, GeekLink, Dorks)...")
 
+    # 1. Поиск в Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
+    # 2. Параллельный сбор по всем остальным платформам
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
-            fetch_telegram_dorks(http_client, primary_query),
-            fetch_habr(http_client, primary_query, 4),
-            fetch_vc_vacancies(http_client, primary_query),
-            fetch_geeklink_rss(http_client, primary_query),
-            fetch_finder_vc(http_client, primary_query),
+            fetch_telegram_dorks(http_client, composite_query, user_text),
+            fetch_habr(http_client, composite_query, user_text, 5),
+            fetch_vc_vacancies(http_client, composite_query, user_text),
+            fetch_geeklink_rss(http_client, composite_query, user_text),
+            fetch_finder_vc(http_client, composite_query, user_text),
         ]
 
         try:
@@ -913,23 +933,34 @@ async def handle_vacancy(message: Message):
             logger.error(f"Ошибка параллельного поиска: {e}")
             valid_results = []
 
-        all_results = db_results + valid_results
+        all_collected = db_results + valid_results
 
+        # Семантическая дедупликация
         seen_hashes = set()
-        unique_vacancies = []
-        for v in all_results:
+        deduped = []
+        for v in all_collected:
             h = v.get("content_hash") or generate_content_hash(v.get("desc", ""))
             if h not in seen_hashes and v.get("url"):
                 seen_hashes.add(h)
-                unique_vacancies.append(v)
+                deduped.append(v)
 
-        if not unique_vacancies:
+        if not deduped:
             await safe_edit_status(status_msg, "❌ Совпадений по источникам не найдено.")
             return
 
-    candidates_pool = unique_vacancies[:8]
+        # БАЛАНСИРОВКА ИСТОЧНИКОВ (Fair Share)
+        internal_pool = [v for v in deduped if not v.get("is_external", False)]
+        external_pool = [v for v in deduped if v.get("is_external", False)]
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] OSINT-расследование заказчика и расчет стратегии...")
+        internal_pool.sort(key=lambda x: x.get("overlap", 0), reverse=True)
+        external_pool.sort(key=lambda x: x.get("overlap", 0), reverse=True)
+
+        # Берем до 5 лучших из TG/Supabase и до 5 лучших с внешних платформ
+        balanced_selection = internal_pool[:5] + external_pool[:5]
+        balanced_selection.sort(key=lambda x: x.get("overlap", 0), reverse=True)
+        candidates_pool = balanced_selection[:8]
+
+    await safe_edit_status(status_msg, f"🧠 [3/3] Глубокий анализ релевантности и OSINT заказчика...")
 
     compact_candidates = [
         {
@@ -937,51 +968,60 @@ async def handle_vacancy(message: Message):
             "company": v['company'],
             "source": v['source'],
             "url": v['url'],
-            "overlap_percent": v.get('overlap', 0),
+            "overlap_calc": v.get('overlap', 0),
             "fwd_origin": v.get('fwd_source', ''),
             "text": v['desc'][:280]
         }
         for idx, v in enumerate(candidates_pool, 1)
     ]
 
-    prompt_matrix = f"""Ты — Senior OSINT-аналитик IT-рынка и специалист по деанонимизации закрытых корпоративных вакансий.
-Твоя задача — сорвать маску кадрового агентства / аутстаффера и определить НАСТОЯЩЕГО конечного заказчика ДЛЯ КАЖДОГО кандидата из списка по тексту задач и метаданным пересылки (fwd_origin).
+    # УСИЛЕННЫЙ CHAIN-OF-THOUGHT ПРОМПТ
+    prompt_matrix = f"""Ты — ведущий технический IT-рекрутер и OSINT-аналитик закрытого рынка вакансий.
+Твоя задача — строго сопоставить найденных кандидатов с брифом, отсеять лишнее и деанонимизировать прямого заказчика.
 
-ОБЯЗАТЕЛЬНОЕ ТРЕБОВАНИЕ:
-Для КАЖДОГО кандидата (с #1 по #5) заполни поля "end_client_name" и "end_client_evidence":
-- "end_client_name": конкретная вероятная компания или экосистема (Сбер, X5 Group, Т-Банк Инфраструктура, Газпромбанк, Альфа-Банк, VK, Ростелеком, Яндекс, Ozon, СИБУР). Без размытых слов вроде «какой-то банк».
-- "end_client_evidence": 1 конкретная улика из текста или fwd_origin (например: «On-premise контур и формулировка TTM для продуктовых команд указывают на банковский PaaS»).
+ВХОДЯЩИЙ БРИФ (ЧТО ТРЕБУЕТСЯ НАЙТИ):
+{user_text[:500]}
 
-ДЛЯ ВСЕХ ПОЗИЦИЙ СФОРМУЛИРУЙ ЛАКОНИЧНО (стиль "Минимализм"):
-- role: точная инженерная роль
-- stack_match: ключевой стек через буллеты (Kubernetes • Helm • Postgres • Linux)
-- strategy_lpr: конкретное лицо (Head of Infrastructure / Lead DevOps)
-- strategy_pain: главная боль бизнеса в 1 строку
-- strategy_value: наш оффер в 1 строку
-- strategy_hook: живое сообщение для Telegram из 2 предложений.
-
-БРИФ:
-{user_text[:450]}
-
-КАНДИДАТЫ:
+СПИСОК НАЙДЕННЫХ ВАКАНСИЙ:
 {json.dumps(compact_candidates, ensure_ascii=False)}
 
-Формат ответа JSON:
+ПРАВИЛА АНАЛИЗА И СКОРИНГА (score):
+1. match_reasoning: в 1 кратком предложении напиши, совпадает ли специальность и ядро стека (например: "Ищут DevOps с K8s, ядро совпало" ИЛИ "Ищут Backend Java, это не подходит").
+2. СКОРИНГ:
+   - 85-100%: Полное совпадение роли и ключевого стека.
+   - 55-84%: Роль совпадает, но стек совпал частично (например, k8s есть, но другие БД).
+   - 0-45%: Другая специальность (Frontend вместо DevOps), стажировки, курсы, резюме человека -> ставить строго меньше 50%!
+3. end_client_name:
+   - Если есть `fwd_origin` — это 100% улика, пиши строго имя источника пересылки.
+   - Если on-premise + PaaS + TTM стримов = Финтех (СберТех, Т-Банк, ВТБ, Альфа).
+   - Если Highload e-com + гибридное облако = X5 Group, Ozon, Wildberries, Яндекс.
+   - Если АСУТП + импортозамещение = Газпром, СИБУР, Ростелеком.
+   - Если явных улик нет — пиши: "Прямой IT-бизнес". НЕ выдумывай корпорации на пустом месте!
+
+ВЫЖИМКА ДЛЯ СЕЙЛЗА (кратко, без воды):
+- stack_match: стек через буллеты (Kubernetes • Helm • Postgres)
+- strategy_lpr: фокусное лицо (Head of Infrastructure / CTO)
+- strategy_pain: главная боль клиента в 1 строку
+- strategy_value: наш оффер в 1 строку
+- strategy_hook: живой питч в Telegram из 2 коротких предложений.
+
+Формат JSON:
 {{
   "results": [
     {{
-      "company": "Название из поста",
-      "score": 90,
-      "role": "Platform / DevOps Engineer",
-      "url": "ссылка",
-      "source": "источник",
-      "stack_match": "Kubernetes • Helm • Postgres • Linux",
-      "end_client_name": "Сбер / FinTech Platform Core",
-      "end_client_evidence": "On-prem контур и сокращение TTM внутренних команд указывают на платформенное ядро СберТеха.",
-      "strategy_lpr": "Head of Infrastructure",
-      "strategy_pain": "Срыв релизов продуктовых команд из-за перегруза рутиной",
-      "strategy_value": "Закрытие операционки и траблшутинга нашими инженерами",
-      "strategy_hook": "Добрый день! Вижу потребность в инженере техплатформы (k8s/onprem). Можем закрыть операционку нашими ребятами, чтобы не отвлекать основной костяк. Актуально взглянуть на профили?"
+      "company": "...",
+      "score": 88,
+      "role": "...",
+      "url": "...",
+      "source": "...",
+      "stack_match": "...",
+      "match_reasoning": "...",
+      "end_client_name": "...",
+      "end_client_evidence": "...",
+      "strategy_lpr": "...",
+      "strategy_pain": "...",
+      "strategy_value": "...",
+      "strategy_hook": "..."
     }}
   ]
 }}"""
@@ -997,44 +1037,51 @@ async def handle_vacancy(message: Message):
 
     if not parsed_candidates:
         for idx, v in enumerate(candidates_pool[:5], 1):
-            score = 90 if v.get("overlap", 0) > 20 else max(40, 85 - idx * 10)
+            calc_score = int(v.get("overlap", 40))
             fwd_info = v.get('fwd_source', '')
-            evidence = f"Выявлен след пересылки ({fwd_info})" if fwd_info else "On-premise контур и специфика стека указывают на закрытый enterprise-контур."
+            evidence = f"След пересылки: {fwd_info}" if fwd_info else "Анализ по технологическому стеку и специфике окружения."
             parsed_candidates.append({
                 "company": v["company"],
-                "score": score,
-                "role": "Platform / DevOps Engineer",
+                "score": max(40, min(95, calc_score + 20)),
+                "role": "IT Специалист",
                 "url": v["url"],
                 "source": v["source"],
-                "stack_match": "Kubernetes • Helm • Postgres • Linux",
-                "end_client_name": "Банковский сектор / FinTech Core",
+                "stack_match": "Стек из описания вакансии",
+                "end_client_name": "Прямой IT-бизнес",
                 "end_client_evidence": evidence,
-                "strategy_lpr": "Head of Infrastructure",
-                "strategy_pain": "Срыв релизов из-за рутинных инцидентов",
-                "strategy_value": "Закрытие операционки внешними инженерами",
-                "strategy_hook": "Добрый день! Вижу потребность в инженере техплатформы (k8s/onprem). Можем закрыть операционку нашими ребятами, чтобы не отвлекать основной костяк. Актуально взглянуть на профили?"
+                "strategy_lpr": "CTO / Team Lead",
+                "strategy_pain": "Потребность в закрытии инженерных задач",
+                "strategy_value": "Предоставление готовых специалистов на проект",
+                "strategy_hook": "Добрый день! Увидели вашу открытую позицию. Готовы обсудить подключение свободных специалистов?"
             })
 
+    # Сортировка по скору от LLM
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
-    final_top = parsed_candidates[:5]
 
-    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** уникальных позиций:")
+    # ЖЕСТКАЯ ФИЛЬТРАЦИЯ: Показываем только релевантные позиции со скором >= 50%
+    qualified_leads = [item for item in parsed_candidates if int(item.get("score", 0)) >= 50][:5]
 
-    for rank, item in enumerate(final_top, 1):
+    if not qualified_leads:
+        # Если жесткий скоринг отбросил всё, берем хотя бы топ-2 лучших, чтобы не отдавать пустоту
+        qualified_leads = parsed_candidates[:2]
+
+    await safe_edit_status(status_msg, f"🏁 Найдено **{len(qualified_leads)}** релевантных позиций (отсеяно всё лишнее):")
+
+    for rank, item in enumerate(qualified_leads, 1):
         company = item.get("company", "Не указана")
         score = int(item.get("score", 50))
-        role = item.get("role", "Platform / DevOps Engineer")
+        role = item.get("role", "IT Специалист")
         url = item.get("url", "#")
-        source = item.get("source", "Telegram")
-        stack = item.get("stack_match", "Kubernetes • Helm • Postgres • Linux")
+        source = item.get("source", "Источник")
+        stack = item.get("stack_match", "Технологии в тексте")
         
-        c_name = item.get("end_client_name", "Enterprise / IT-холдинг")
-        c_evidence = item.get("end_client_evidence", "Определено по специфике задач, закрытому контуру и технологическому стеку.")
+        c_name = item.get("end_client_name", "Прямой IT-бизнес")
+        c_evidence = item.get("end_client_evidence", "Определено по специфике задач и стеку.")
         
-        lpr = item.get("strategy_lpr", "Head of Infrastructure")
-        pain = item.get("strategy_pain", "Срыв релизов из-за рутинных инцидентов")
-        value_prop = item.get("strategy_value", "Закрытие операционки внешними инженерами")
-        hook = item.get("strategy_hook", "Добрый день! Увидели вашу открытую позицию. Готовы обсудить подключение?")
+        lpr = item.get("strategy_lpr", "CTO / Head of Infrastructure")
+        pain = item.get("strategy_pain", "Нехватка рук на ключевые задачи")
+        value_prop = item.get("strategy_value", "Закрытие операционки готовыми инженерами")
+        hook = item.get("strategy_hook", "Добрый день! Обратили внимание на вакансию. Актуально взглянуть на профили?")
 
         client_block = (
             "> 🕵️ **OSINT-расследование заказчика:**\n"
