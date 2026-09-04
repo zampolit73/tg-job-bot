@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 import os
 import re
+import sys
 import threading
 from urllib.parse import quote_plus
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -15,11 +17,18 @@ from groq import AsyncGroq
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# ----------------- КОНФИГУРАЦИЯ ЧЕРЕЗ ENV -----------------
+# ----------------- ЛОГИРОВАНИЕ -----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("OSINT_Bot")
+
+# ----------------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SUPERJOB_KEY = os.getenv("SUPERJOB_KEY")
-
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "10092ea56d2504c84")
 
@@ -28,7 +37,8 @@ TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "")
 
 if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
-    raise ValueError("Критические переменные окружения TELEGRAM_BOT_TOKEN или GROQ_API_KEY не заданы!")
+    logger.critical("Критические переменные окружения TELEGRAM_BOT_TOKEN или GROQ_API_KEY не заданы!")
+    raise ValueError("TELEGRAM_BOT_TOKEN и GROQ_API_KEY обязательны!")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -56,7 +66,7 @@ TARGET_TG_CHANNELS = [
 
 google_quota_exhausted = False
 
-# ----------------- HEALTH SERVER -----------------
+# ----------------- HEALTH SERVER ДЛЯ RENDER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -70,7 +80,9 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health check сервер запущен на порту {port}")
+    server.serve_forever()
 
 
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
@@ -89,7 +101,6 @@ def build_lead_osint_url(company_name: str, target_role: str = "CTO") -> str:
     return f"https://www.google.com/search?q={quote_plus(query)}"
 
 
-# Безопасное обновление текста статуса без зависаний
 async def safe_edit_status(msg: Message, text: str):
     try:
         await msg.edit_text(text)
@@ -125,12 +136,12 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", last_err
 
 
-# ----------------- ИСТОЧНИКИ ДАННЫХ -----------------
+# ----------------- ИСТОЧНИКИ ПОИСКА -----------------
 async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
     global google_quota_exhausted
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or google_quota_exhausted:
         return []
-    
+
     url = "https://www.googleapis.com/customsearch/v1"
     params = {
         "key": GOOGLE_API_KEY,
@@ -140,15 +151,16 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
         "gl": "ru",
         "hl": "ru"
     }
-    
+
     try:
         r = await client.get(url, params=params, timeout=3.0)
         if r.status_code in (429, 403):
+            logger.warning("Квота Google CSE исчерпана (429/403). Переключение на автономный режим.")
             google_quota_exhausted = True
             return []
         if r.status_code != 200:
             return []
-            
+
         items = r.json().get("items", [])
         jobs = []
         for item in items:
@@ -312,12 +324,13 @@ async def search_telegram_native(search_term: str) -> list:
         return []
 
 
-# ----------------- ХЭНДЛЕРЫ -----------------
+# ----------------- ХЭНДЛЕРЫ AIOGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
+    logger.info(f"Команда /start от пользователя {message.from_user.id}")
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф. Бот выполнит каскадный поиск по открытым базам и Google X-Ray.",
+        "Отправьте бриф вакансии. Бот выполнит деанонимизацию прямого заказчика с матричным скорингом.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -326,9 +339,11 @@ async def cmd_start(message: Message):
 async def handle_vacancy(message: Message):
     global google_quota_exhausted
     user_text = message.text
+    logger.info(f"Получен бриф ({len(user_text)} симв.) от {message.from_user.id}")
+
     status_msg = await message.answer("⚡️ [1/3] Извлечение сущностей проекта...")
 
-    # Шаг 1: Извлечение структурированного профиля
+    # Шаг 1: Groq Entity Extraction
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
 Разбери бриф на сущности и верни JSON:
 {{
@@ -353,20 +368,20 @@ async def handle_vacancy(message: Message):
             "infra_type": "Не указан",
             "must_have": [],
             "core_challenge": "Разработка сервисов",
-            "google_query": user_text.split()[:3],
+            "google_query": " ".join(user_text.split()[:3]),
             "ngram_phrase": ""
         }
 
     role_query = brief_profile.get("role", "Разработчик")
-    google_q = brief_profile.get("google_query", "Разработчик")
+    google_q = brief_profile.get("google_query", "Frontend Angular")
     rare_techs = brief_profile.get("must_have", [])
-    rare_term = rare_techs[0] if rare_techs else "Backend"
+    rare_term = rare_techs[0] if rare_techs else "Angular"
     ngram_phrase = brief_profile.get("ngram_phrase", "")
 
     mode_info = "Хабр, SuperJob, Работа России, TG" if google_quota_exhausted else "Google CSE, Хабр, SuperJob, TG"
     await safe_edit_status(status_msg, f"🔍 [2/3] Поиск кандидатов через [{mode_info}]...")
 
-    # Шаг 2: Параллельный опрос с защитой от зависания
+    # Шаг 2: Параллельный опрос источников
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             fetch_habr(http_client, rare_term, 6),
@@ -381,16 +396,16 @@ async def handle_vacancy(message: Message):
                 tasks.append(search_google_custom(http_client, f'"{ngram_phrase}"', count=3))
 
         try:
-            # Жесткий общий таймаут 4 секунды с возвратом частичных результатов
-            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.0)
+            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.5)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
-        except Exception:
+        except Exception as e:
+            logger.error(f"Ошибка при поиске вакансий: {e}")
             valid_results = []
 
     unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
     if not unique_vacancies:
-        await safe_edit_status(status_msg, "❌ Вакансии не найдены в открытых источниках. Попробуйте передать более развернутый бриф.")
+        await safe_edit_status(status_msg, "❌ Вакансии не найдены в открытых базах. Попробуйте передать более развернутый бриф.")
         return
 
     await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:8])} кандидатов в Groq LPU...")
@@ -417,7 +432,7 @@ async def handle_vacancy(message: Message):
 
 ПРАВИЛА:
 1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР <= 35%):
-   - Разные архитектуры (Cloud вместо OnPrem).
+   - Разные архитектуры или фреймворки.
    - Не совпал must_have стек.
 2. ВЕСА:
    - [40%] Архитектурный вызов ('core_challenge').
@@ -440,7 +455,7 @@ async def handle_vacancy(message: Message):
 • **Архитектурный вызов:** [Реальная проектная задача]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Роль ЛПР: CTO, Lead DevOps, Head of Eng]
+• **К кому идти:** [Роль ЛПР: CTO, Lead, Head of Eng]
 • **Болевая точка:** [Главная боль проекта]
 • **Холодный хук:** [1-2 предложения хук для первого контакта]
 ══════════════════════════════"""
@@ -475,14 +490,42 @@ async def handle_vacancy(message: Message):
         await safe_edit_status(status_msg, final_output)
 
 
+# ----------------- БЕЗОПАСНЫЙ ЗАПУСК -----------------
+async def init_telethon():
+    """Подключение Telethon без зависания в консоли при отсутствии сессии"""
+    global telethon_client
+    if not telethon_client:
+        logger.info("Telethon: Ключи не заданы в Environment, клиент пропущен.")
+        return
+    try:
+        await asyncio.wait_for(telethon_client.connect(), timeout=4.0)
+        if not await telethon_client.is_user_authorized():
+            logger.warning("Telethon: Строка сессии не авторизована. Фоновый мониторинг каналов отключен.")
+            telethon_client = None
+        else:
+            logger.info("Telethon: Клиент успешно подключен и авторизован!")
+    except Exception as e:
+        logger.warning(f"Telethon пропущен из-за ошибки подключения: {e}")
+        telethon_client = None
+
+
 async def main():
+    logger.info("Инициализация сервиса...")
+    # 1. Health check сервер для Render
     threading.Thread(target=run_health_server, daemon=True).start()
-    if telethon_client:
-        try:
-            await telethon_client.start()
-        except Exception:
-            pass
-    await bot.delete_webhook(drop_pending_updates=True)
+
+    # 2. Неблокирующий старт Telethon
+    await init_telethon()
+
+    # 3. Безопасный сброс вебхука
+    try:
+        await asyncio.wait_for(bot.delete_webhook(drop_pending_updates=True), timeout=4.0)
+        logger.info("Webhook сброшен, старые апдейты очищены.")
+    except Exception as e:
+        logger.warning(f"Предупреждение при delete_webhook: {e}")
+
+    # 4. Запуск поллинга
+    logger.info(">>> Запуск polling aiogram. Бот слушает сообщения! <<<")
     await dp.start_polling(bot)
 
 
