@@ -117,7 +117,6 @@ def build_lead_osint_url(company_name: str, target_role: str = "CTO") -> str:
 
 
 async def safe_edit_status(msg: Message, text: str):
-    """Безопасное обновление статуса с обработкой лимитов Telegram"""
     try:
         await msg.edit_text(text)
     except TelegramRetryAfter as e:
@@ -130,24 +129,22 @@ async def safe_edit_status(msg: Message, text: str):
         pass
 
 
-# ----------------- АВТООПРЕДЕЛЕНИЕ РАБОЧЕЙ МОДЕЛИ GROQ -----------------
+# ----------------- ВЫБОР МОДЕЛЕЙ GROQ -----------------
 async def find_working_groq_model() -> str:
-    """При запуске тестирует модели микрозапросом и находит 100% рабочую"""
+    """Определяет модель с наибольшим лимитом токенов"""
     global ACTIVE_GROQ_MODEL
+    # Модели с высоким лимитом контекста и токенов
     candidate_models = [
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
-        "qwen/qwen3.6-27b",
         "gemma2-9b-it",
-        "openai/gpt-oss-120b",
-        "openai/gpt-oss-20b",
     ]
 
     try:
         model_list = await groq_client.models.list()
         api_models = [m.id for m in model_list.data if m.active and "whisper" not in m.id and "guard" not in m.id]
         for am in api_models:
-            if am not in candidate_models:
+            if am not in candidate_models and "qwen" not in am:  # Исключаем qwen из-за низких квот
                 candidate_models.append(am)
     except Exception as e:
         logger.warning(f"Не удалось запросить список моделей: {e}")
@@ -172,7 +169,6 @@ async def find_working_groq_model() -> str:
             continue
 
     ACTIVE_GROQ_MODEL = "llama-3.3-70b-versatile"
-    logger.error("Все тесты не прошли, установлена модель по умолчанию.")
     return ACTIVE_GROQ_MODEL
 
 
@@ -181,9 +177,12 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     if not ACTIVE_GROQ_MODEL:
         await find_working_groq_model()
 
+    # Защита от превышения лимитов токенов: обрезаем входной промпт до разумных пределов
+    safe_prompt = prompt if len(prompt) < 7000 else prompt[:7000]
+
     kwargs = {
         "model": ACTIVE_GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [{"role": "user", "content": safe_prompt}],
         "temperature": 0.0,
         "max_tokens": max_tokens,
     }
@@ -193,7 +192,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     try:
         res = await asyncio.wait_for(
             groq_client.chat.completions.create(**kwargs),
-            timeout=10.0
+            timeout=11.0
         )
         content = res.choices[0].message.content
         if content and content.strip():
@@ -201,7 +200,20 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     except Exception as e:
         err_msg = str(e)
         logger.warning(f"Ошибка запроса к Groq ({ACTIVE_GROQ_MODEL}): {err_msg}")
-        # Если была ошибка с JSON-форматом, повторяем один раз без него
+        
+        # Если превышен лимит токенов (413), сжимаем промпт в 2 раза и повторяем
+        if "413" in err_msg or "too large" in err_msg.lower() or "tokens" in err_msg.lower():
+            try:
+                compact_prompt = safe_prompt[:3500]
+                kwargs["messages"] = [{"role": "user", "content": compact_prompt}]
+                res = await asyncio.wait_for(
+                    groq_client.chat.completions.create(**kwargs),
+                    timeout=9.0
+                )
+                return res.choices[0].message.content, ""
+            except Exception as e2:
+                return "", str(e2)
+
         if json_mode and "json" in err_msg.lower():
             try:
                 kwargs.pop("response_format", None)
@@ -212,12 +224,13 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
                 return res.choices[0].message.content, ""
             except Exception as e2:
                 return "", str(e2)
+                
         return "", err_msg
 
     return "", "Empty response"
 
 
-# ----------------- FULL PAGE HYDRATION -----------------
+# ----------------- FULL PAGE HYDRATION (С ОГРАНИЧЕНИЕМ РАЗМЕРА) -----------------
 async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
     url = job.get("url", "")
     if not url or "t.me" in url:
@@ -232,9 +245,10 @@ async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
         r = await client.get(url, headers=headers, timeout=2.0)
         if r.status_code == 200:
             text = clean_html(r.text)
-            clean_snippet = " ".join(text.split()[:300])
-            if len(clean_snippet) > 200:
-                job["desc"] = clean_snippet
+            # Извлекаем не более 450 символов концентрированного описания
+            clean_snippet = " ".join(text.split()[:70])
+            if len(clean_snippet) > 100:
+                job["desc"] = clean_snippet[:450]
                 if is_agency(job["company"], clean_snippet):
                     job["is_agency"] = True
     except Exception:
@@ -243,7 +257,8 @@ async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
 
 
 async def hydrate_all_vacancies(client: httpx.AsyncClient, vacancies: list) -> list:
-    tasks = [hydrate_single_vacancy(client, v) for v in vacancies[:6]]
+    # Ограничиваемся ТОП-4 кандидатами, чтобы гарантированно уложиться в лимиты API
+    tasks = [hydrate_single_vacancy(client, v) for v in vacancies[:4]]
     hydrated = await asyncio.gather(*tasks, return_exceptions=True)
     clean_list = []
     for item in hydrated:
@@ -253,7 +268,7 @@ async def hydrate_all_vacancies(client: httpx.AsyncClient, vacancies: list) -> l
 
 
 # ----------------- ИСТОЧНИКИ ПОИСКА -----------------
-async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
+async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
     global google_quota_exhausted
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or google_quota_exhausted:
         return []
@@ -292,18 +307,18 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
 
             jobs.append({
                 "source": "Google Search",
-                "title": title[:70],
+                "title": title[:60],
                 "company": company,
                 "salary": "в описании",
                 "url": link,
-                "desc": snippet[:350]
+                "desc": snippet[:250]
             })
         return jobs
     except Exception:
         return []
 
 
-async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> list:
+async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
@@ -331,14 +346,14 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
-                "desc": desc_text,
+                "desc": desc_text[:250],
             })
         return jobs
     except Exception:
         return []
 
 
-async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
+async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
     if not SUPERJOB_KEY:
         return []
     words = [w for w in CLEAN_QUERY_RE.sub(" ", query).split() if len(w) > 2][:2]
@@ -369,7 +384,7 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
                 "company": company,
                 "salary": sal_str,
                 "url": item.get("link", ""),
-                "desc": desc[:300]
+                "desc": desc[:250]
             })
         return jobs
     except Exception:
@@ -395,7 +410,7 @@ async def _scan_single_channel(channel: str, search_term: str) -> list:
                     "company": company,
                     "salary": "в посте",
                     "url": post_url,
-                    "desc": post_text[:300]
+                    "desc": post_text[:250]
                 })
     except Exception:
         pass
@@ -448,7 +463,7 @@ async def handle_vacancy(message: Message):
   "dork_ats_search": "главный фреймворк"
 }}
 БРИФ:
-\"\"\"{user_text[:800]}\"\"\""""
+\"\"\"{user_text[:700]}\"\"\""""
 
     extract_raw, err = await call_groq_async(prompt_extract, max_tokens=300, json_mode=True)
     try:
@@ -474,8 +489,8 @@ async def handle_vacancy(message: Message):
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
-            fetch_habr(http_client, primary_tech, 6),
-            fetch_superjob(http_client, primary_tech, 5),
+            fetch_habr(http_client, primary_tech, 5),
+            fetch_superjob(http_client, primary_tech, 4),
             search_telegram_native(primary_tech),
         ]
 
@@ -483,10 +498,10 @@ async def handle_vacancy(message: Message):
             if len(exact_quote.split()) >= 3:
                 tasks.append(search_google_custom(http_client, f'"{exact_quote}"', count=3))
 
-            tasks.append(search_google_custom(http_client, cluster_query, count=5))
+            tasks.append(search_google_custom(http_client, cluster_query, count=4))
 
             ats_query = f"(site:huntflow.io OR site:potok.io) {primary_tech} {brief_profile.get('role', '')}"
-            tasks.append(search_google_custom(http_client, ats_query, count=4))
+            tasks.append(search_google_custom(http_client, ats_query, count=3))
 
         try:
             raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.0)
@@ -501,11 +516,11 @@ async def handle_vacancy(message: Message):
             await safe_edit_status(status_msg, "❌ Совпадений не найдено. Попробуйте передать бриф с более конкретным техническим описанием.")
             return
 
-        await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка полных страниц {len(unique_vacancies[:5])} кандидатов...")
+        await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка данных {len(unique_vacancies[:3])} кандидатов...")
         hydrated_vacancies = await hydrate_all_vacancies(http_client, unique_vacancies)
 
     if not hydrated_vacancies:
-        hydrated_vacancies = unique_vacancies[:5]
+        hydrated_vacancies = unique_vacancies[:3]
 
     await safe_edit_status(status_msg, f"🧠 [4/4] Матричный скоринг через Groq ({ACTIVE_GROQ_MODEL})...")
 
@@ -515,30 +530,26 @@ async def handle_vacancy(message: Message):
         f"Должность: {v['title']}\n"
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
-        f"Полный текст: {v['desc']}\n"
-        for idx, v in enumerate(hydrated_vacancies[:5], 1)
+        f"Описание: {v['desc'][:300]}\n"
+        for idx, v in enumerate(hydrated_vacancies[:3], 1)
     ]
     candidates_payload = "\n".join(compact_candidates)
 
     prompt_matrix = f"""Ты — OSINT-аудитор. Отсей посредников и выяви прямого заказчика.
 
-ЭТАЛОННЫЙ ПРОФИЛЬ ПРОЕКТА:
-{json.dumps(brief_profile, ensure_ascii=False, indent=2)}
+ЭТАЛОН:
+{json.dumps(brief_profile, ensure_ascii=False)}
 
-СПИСОК ВАКАНСИЙ (С ПОЛНЫМ ТЕКСТОМ):
+ВАКАНСИИ:
 {candidates_payload}
 
-ПРАВИЛА ОЦЕНКИ:
+ПРАВИЛА:
 1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР <= 35%):
-   - Аутстафф/рекрутинг-посредник (фразы 'клиент', 'партнер').
+   - Аутстафф/посредник.
    - Не совпал стек или архитектура.
-2. ВЕСА:
-   - [45%] Схожесть реальных проектных задач.
-   - [35%] Покрытие стека.
-   - [20%] Домен бизнеса.
-3. Дословная цитата обязанностей дает 95-99%.
+2. ВЕСА: 45% задачи, 35% стек, 20% домен. Дословная цитата дает 95-99%.
 
-Выведи ТОП-3 кандидатов по шаблону:
+Выведи ТОП кандидатов строго по шаблону:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании или канал]
 🎯 **Матричный скор:** [XX]%
@@ -559,9 +570,9 @@ async def handle_vacancy(message: Message):
 • **Холодный хук:** [1-2 предложения хук для первого контакта]
 ══════════════════════════════"""
 
-    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1500)
+    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1400)
     if not result_text:
-        await safe_edit_status(status_msg, f"⚠️ Не удалось выполнить скоринг через Groq: {err}")
+        await safe_edit_status(status_msg, f"⚠️ Не удалось выполнить скоринг: {err}")
         return
 
     enhanced_lines = []
@@ -611,7 +622,7 @@ async def main():
     logger.info("Инициализация сервиса...")
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    # Быстрый тест и автовыбор рабочей модели Groq
+    # Автоподбор рабочей модели
     await find_working_groq_model()
 
     await init_telethon()
