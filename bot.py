@@ -10,6 +10,7 @@ from urllib.parse import quote_plus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncpg
 import httpx
+import defusedxml.ElementTree as ET
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
@@ -168,7 +169,7 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
             SELECT chat_title, post_text, post_url 
             FROM vacancies 
             WHERE {like_clauses} 
-            ORDER BY id DESC LIMIT 15;
+            ORDER BY id DESC LIMIT 20;
         """
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(query, *params)
@@ -178,8 +179,8 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
                 company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", p_text, re.IGNORECASE)
                 company = company_match.group(1).strip() if company_match else row['chat_title']
                 results.append({
-                    "source": f"Supabase: {row['chat_title'][:25]}",
-                    "title": f"Пост в {row['chat_title'][:25]}",
+                    "source": f"Supabase: {row['chat_title'][:20]}",
+                    "title": f"Пост в {row['chat_title'][:20]}",
                     "company": company,
                     "salary": "в тексте",
                     "url": row['post_url'],
@@ -193,7 +194,6 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
 
 # ----------------- РАБОТА С ПАПКАМИ TELEGRAM -----------------
 def normalize_id(tg_id: int) -> int:
-    """Приводит ID чата к единому числовому виду без префиксов -100."""
     s = str(tg_id)
     if s.startswith("-100"):
         return int(s[4:])
@@ -294,10 +294,10 @@ def extract_search_terms(text: str) -> list:
             terms.append(t_title)
 
     for t in ru_tokens:
-        if t not in terms and len(terms) < 5:
+        if t not in terms and len(terms) < 6:
             terms.append(t)
 
-    return terms[:5] if terms else ["разработчик"]
+    return terms[:6] if terms else ["разработчик"]
 
 
 def calculate_overlap_score(brief_text: str, candidate_text: str) -> float:
@@ -373,12 +373,12 @@ async def find_working_groq_model() -> str:
     return ACTIVE_GROQ_MODEL
 
 
-async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool = False) -> tuple[str, str]:
+async def call_groq_async(prompt: str, max_tokens: int = 1800, json_mode: bool = False) -> tuple[str, str]:
     global ACTIVE_GROQ_MODEL
     if not ACTIVE_GROQ_MODEL:
         await find_working_groq_model()
 
-    safe_prompt = prompt if len(prompt) < 6000 else prompt[:6000]
+    safe_prompt = prompt if len(prompt) < 7000 else prompt[:7000]
     kwargs = {
         "model": ACTIVE_GROQ_MODEL,
         "messages": [{"role": "user", "content": safe_prompt}],
@@ -391,7 +391,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
         kwargs["response_format"] = {"type": "json_object"}
 
     try:
-        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=12.0)
+        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=14.0)
         content = res.choices[0].message.content
         if content and content.strip():
             return content, ""
@@ -399,7 +399,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
         err_msg = str(e)
         if "413" in err_msg or "too large" in err_msg.lower():
             try:
-                kwargs["messages"] = [{"role": "user", "content": safe_prompt[:3000]}]
+                kwargs["messages"] = [{"role": "user", "content": safe_prompt[:3500]}]
                 res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=8.0)
                 return res.choices[0].message.content, ""
             except Exception as e2:
@@ -409,15 +409,148 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- ПРЯМОЙ ОНЛАЙН-ПОИСК В ЧАТАХ -----------------
+# ----------------- ПАРСИНГ ВНЕШНИХ ИСТОЧНИКОВ -----------------
+async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
+    clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
+    url = "https://career.habr.com/api/frontend/vacancies"
+    params = {"q": clean_q, "per_page": count}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = await client.get(url, params=params, headers=headers, timeout=2.5)
+        if r.status_code != 200:
+            return []
+        jobs = []
+        for item in r.json().get("list", []):
+            company = item.get("company", {}).get("title", "Не указана")
+            sal = item.get("salary", {})
+            sal_str = sal.get("formatted") if sal and sal.get("formatted") else "не указана"
+            href = item.get("href", "")
+            full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
+            skills = ", ".join([s.get("title", "") for s in item.get("skills", [])])
+            desc_text = f"Стек: {skills}"
+
+            if is_agency(company, desc_text):
+                continue
+
+            jobs.append({
+                "source": "Хабр Карьера",
+                "title": item.get("title", ""),
+                "company": company,
+                "salary": sal_str,
+                "url": full_url,
+                "desc": desc_text[:300],
+                "overlap": 0.0
+            })
+        return jobs
+    except Exception:
+        return []
+
+
+async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str) -> list:
+    try:
+        url = "https://api.vc.ru/v2.8/vacancies"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = await client.get(url, headers=headers, timeout=2.5)
+        if r.status_code != 200:
+            return []
+        jobs = []
+        q_lower = query.lower()
+        items = r.json().get("result", {}).get("items", [])
+        for item in items:
+            title = item.get("title", "")
+            desc = clean_html(item.get("description", ""))
+            if q_lower in title.lower() or q_lower in desc.lower():
+                company = item.get("company", {}).get("name", "Компания с VC")
+                sal = item.get("salary", {}).get("title", "не указана")
+                post_url = f"https://vc.ru/job/{item.get('id', '')}"
+                if is_agency(company, desc):
+                    continue
+                jobs.append({
+                    "source": "VC.ru Вакансии",
+                    "title": title,
+                    "company": company,
+                    "salary": sal,
+                    "url": post_url,
+                    "desc": desc[:300],
+                    "overlap": 0.0
+                })
+        return jobs[:3]
+    except Exception:
+        return []
+
+
+async def fetch_geeklink_rss(client: httpx.AsyncClient, query: str) -> list:
+    try:
+        url = "https://geeklink.io/feed/"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        r = await client.get(url, headers=headers, timeout=3.0)
+        if r.status_code != 200:
+            return []
+        root = ET.fromstring(r.content)
+        jobs = []
+        q_lower = query.lower()
+        for item in root.findall(".//item"):
+            title = item.findtext("title", "")
+            link = item.findtext("link", "")
+            desc = clean_html(item.findtext("description", ""))
+            if q_lower in title.lower() or q_lower in desc.lower():
+                company_match = re.search(r"в\s+([A-Za-zА-Яа-я0-9_\-\s]{2,25})", title)
+                company = company_match.group(1).strip() if company_match else "IT Компания"
+                if is_agency(company, desc):
+                    continue
+                jobs.append({
+                    "source": "GeekLink",
+                    "title": title,
+                    "company": company,
+                    "salary": "в описании",
+                    "url": link,
+                    "desc": desc[:300],
+                    "overlap": 0.0
+                })
+        return jobs[:3]
+    except Exception:
+        return []
+
+
+async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
+    try:
+        url = f"https://finder.vc/api/vacancies?search={quote_plus(query)}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = await client.get(url, headers=headers, timeout=2.5)
+        if r.status_code != 200:
+            return []
+        data = r.json().get("data", [])
+        jobs = []
+        for item in data[:3]:
+            title = item.get("title", "")
+            desc = clean_html(item.get("description", ""))
+            company = item.get("company_name", "Удалённый проект")
+            sal = item.get("salary_text", "не указана")
+            slug = item.get("slug", "")
+            full_url = f"https://finder.vc/vacancies/{slug}" if slug else "https://finder.vc"
+            if is_agency(company, desc):
+                continue
+            jobs.append({
+                "source": "Finder.vc (Remote)",
+                "title": title,
+                "company": company,
+                "salary": sal,
+                "url": full_url,
+                "desc": desc[:300],
+                "overlap": 0.0
+            })
+        return jobs
+    except Exception:
+        return []
+
+
+# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
 
     found_posts = []
     seen_ids = set()
-
-    # Если выбраны папки, ищем адресно внутри каждого чата папки
     chat_targets = list(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else [None]
 
     for target_chat in chat_targets:
@@ -427,8 +560,7 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                 continue
 
             try:
-                # Если цель конкретный чат — лимит глубже (до 30 сообщений)
-                limit_scan = 30 if target_chat else 15
+                limit_scan = 40 if target_chat else 20
                 async for message in telethon_client.iter_messages(target_chat, search=clean_t, limit=limit_scan):
                     if not message.text or len(message.text) < 40:
                         continue
@@ -467,8 +599,8 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                     company = company_match.group(1).strip() if company_match else chat_title
 
                     found_posts.append({
-                        "source": f"Telegram: {chat_title[:22]}",
-                        "title": f"Пост в {chat_title[:22]}",
+                        "source": f"Telegram: {chat_title[:20]}",
+                        "title": f"Пост в {chat_title[:20]}",
                         "company": company,
                         "salary": "в тексте",
                         "url": msg_url,
@@ -476,47 +608,10 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                         "overlap": overlap
                     })
             except Exception as e:
-                logger.debug(f"Поиск в чате {target_chat} по термину '{clean_t}': {e}")
+                logger.debug(f"Поиск в {target_chat}: {e}")
 
     found_posts.sort(key=lambda x: x.get("overlap", 0), reverse=True)
-    return found_posts[:6]
-
-
-# ----------------- ХАБР КАРЬЕРА -----------------
-async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
-    clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
-    url = "https://career.habr.com/api/frontend/vacancies"
-    params = {"q": clean_q, "per_page": count}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = await client.get(url, params=params, headers=headers, timeout=2.5)
-        if r.status_code != 200:
-            return []
-        jobs = []
-        for item in r.json().get("list", []):
-            company = item.get("company", {}).get("title", "Не указана")
-            sal = item.get("salary", {})
-            sal_str = sal.get("formatted") if sal and sal.get("formatted") else "не указана"
-            href = item.get("href", "")
-            full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
-            skills = ", ".join([s.get("title", "") for s in item.get("skills", [])])
-            desc_text = f"Стек: {skills}"
-
-            if is_agency(company, desc_text):
-                continue
-
-            jobs.append({
-                "source": "Хабр Карьера",
-                "title": item.get("title", ""),
-                "company": company,
-                "salary": sal_str,
-                "url": full_url,
-                "desc": desc_text[:250],
-                "overlap": 0.0
-            })
-        return jobs
-    except Exception:
-        return []
+    return found_posts[:12]
 
 
 # ----------------- ФОНОВЫЙ СЛУШАТЕЛЬ В SUPABASE -----------------
@@ -550,10 +645,12 @@ def register_telethon_listener():
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф или описание вакансии — бот проведёт поиск по выбранным папкам, "
-        "базе Supabase, отсортирует совпадения от 100% вниз и подготовит стратегию первого контакта.\n\n"
-        "• /set_folder — выбрать папки Telegram для сканирования\n"
-        "• /debug_tg — статус базы и выбранных папок",
+        "Отправьте бриф или описание вакансии — бот выполнит поиск по выбранным папкам, "
+        "базе Supabase и внешним источникам, выдаст до 5 вариантов по убыванию соответствия "
+        "и попытается сдеанонить конечного заказчика для лидирующей позиции.\n\n"
+        "Команды:\n"
+        "• /set_folder — выбор папок Telegram для поиска\n"
+        "• /debug_tg — статус базы и папок",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -649,34 +746,42 @@ async def handle_vacancy(message: Message):
     status_msg = await message.answer("⚡️ [1/3] Извлечение ключевых маркеров...")
 
     search_terms = extract_search_terms(user_text)
+    primary_query = search_terms[0] if search_terms else "разработчик"
     scope_desc = f"{len(ACTIVE_FOLDERS)} папкам" if ACTIVE_FOLDERS else "всем чатам"
-    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск по {scope_desc} по тегам: `{', '.join(search_terms)}`...")
+
+    await safe_edit_status(status_msg, f"🔍 [2/3] Глубокий сбор по Telegram ({scope_desc}), Supabase, VC, GeekLink...")
 
     # 1. Поиск по базе Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Поиск в Telegram и на Хабре
+    # 2. Параллельный сбор по всем источникам
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
-            fetch_habr(http_client, search_terms[0], 4),
+            fetch_habr(http_client, primary_query, 4),
+            fetch_vc_vacancies(http_client, primary_query),
+            fetch_geeklink_rss(http_client, primary_query),
+            fetch_finder_vc(http_client, primary_query),
         ]
 
         try:
-            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=15.0)
+            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=16.0)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception as e:
-            logger.error(f"Ошибка поиска: {e}")
+            logger.error(f"Ошибка параллельного поиска: {e}")
             valid_results = []
 
         all_results = db_results + valid_results
         unique_vacancies = list({v["url"]: v for v in all_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений по ключевым маркерным технологиям не найдено.")
+            await safe_edit_status(status_msg, "❌ Совпадений по источникам не найдено.")
             return
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:4])} лидов...")
+    # Берем до 8 сырых кандидатов на вход модели
+    candidates_pool = unique_vacancies[:8]
+
+    await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(candidates_pool)} лидов и OSINT-анализ...")
 
     compact_candidates = [
         {
@@ -685,16 +790,17 @@ async def handle_vacancy(message: Message):
             "source": v['source'],
             "url": v['url'],
             "overlap_percent": v.get('overlap', 0),
-            "text": v['desc'][:220]
+            "text": v['desc'][:260]
         }
-        for idx, v in enumerate(unique_vacancies[:4], 1)
+        for idx, v in enumerate(candidates_pool, 1)
     ]
 
-    prompt_matrix = f"""Ты — Senior IT-Sales и технический рекрутер. Оцени совпадение кандидатов с брифом.
-Верни ТОЛЬКО валидный JSON со списком проверенных кандидатов.
+    prompt_matrix = f"""Ты — Senior IT-Sales и детектив OSINT по закрытым вакансиям. Оцени кандидатов на соответствие брифу.
+Верни ТОЛЬКО валидный JSON со списком проверенных позиций (выдай до 5 позиций).
+ОБЯЗАТЕЛЬНО: для кандидата с самым высоким скором (топ-1) сделай предположение, кто может быть реальным конечным клиентом/заказчиком позиции (укажи сферу или конкретные компании типа Яндекс, Сбер, X5, Ростелеком, промышленный холдинг и т.д. на основе формулировок задач и стека) в поле "end_client_guess".
 
 БРИФ:
-{user_text[:400]}
+{user_text[:450]}
 
 КАНДИДАТЫ:
 {json.dumps(compact_candidates, ensure_ascii=False)}
@@ -703,23 +809,23 @@ async def handle_vacancy(message: Message):
 {{
   "results": [
     {{
-      "company": "Название компании или чата",
+      "company": "Название компании/чата",
       "score": 92,
-      "status": "Оригинал вакансии",
-      "role": "Точная роль",
+      "role": "Точная позиция",
       "salary": "Вилка или Не указана",
       "url": "ссылка",
-      "source": "источник",
+      "source": "Точное название источника",
       "stack_match": "совпадение по технологиям",
       "challenge_match": "основные задачи",
-      "target_lpr": "Роль ЛПР (CTO, Lead DevOps, Head of QA)",
+      "target_lpr": "Роль ЛПР (CTO, Lead DevOps)",
       "pain_point": "ключевая проблема проекта",
-      "hook": "точный хук для первого сообщения"
+      "hook": "точный хук для первого сообщения",
+      "end_client_guess": "Только для топ-1: Название или профиль конечного заказчика + почему"
     }}
   ]
 }}"""
 
-    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=1400, json_mode=True)
+    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=1800, json_mode=True)
     parsed_candidates = []
 
     try:
@@ -729,29 +835,30 @@ async def handle_vacancy(message: Message):
         pass
 
     if not parsed_candidates:
-        for v in unique_vacancies[:4]:
-            score = 90 if v.get("overlap", 0) > 20 else 55
+        for idx, v in enumerate(candidates_pool[:5], 1):
+            score = 90 if v.get("overlap", 0) > 20 else max(40, 85 - idx * 10)
             parsed_candidates.append({
                 "company": v["company"],
                 "score": score,
-                "status": "Точный оригинал" if score > 80 else "Похожий проект",
-                "role": "Специалист по требованиям",
+                "role": "Профильная позиция",
                 "salary": v.get("salary", "Не указана"),
                 "url": v["url"],
                 "source": v["source"],
                 "stack_match": f"Текстовый overlap: {v.get('overlap', 0)}%",
-                "challenge_match": "Решение профильных задач",
+                "challenge_match": "Совпадение по стеку технологий",
                 "target_lpr": "CTO / Head of Engineering",
-                "pain_point": "Закрытие ключевой потребности",
-                "hook": "Добрый день! Увидели вашу потребность в профильном сообществе..."
+                "pain_point": "Закрытие потребности в инженерах",
+                "hook": "Добрый день! Увидели вашу открытую позицию...",
+                "end_client_guess": "Финтех / Крупный enterprise-холдинг со своим on-premise контуром" if idx == 1 else ""
             })
 
-    # СТРОГАЯ СОРТИРОВКА: Лидеры по скорингу (от 100% к меньшим) всегда идут первыми
+    # СТРОГАЯ СОРТИРОВКА: Сверху максимальное совпадение, далее по убыванию
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
+    final_top = parsed_candidates[:5]
 
-    await safe_edit_status(status_msg, f"🏁 Найдено **{len(parsed_candidates)}** релевантных позиций (отсортировано по совпадению):")
+    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** релевантных позиций (отсортировано от лучшего совпадения):")
 
-    for rank, item in enumerate(parsed_candidates, 1):
+    for rank, item in enumerate(final_top, 1):
         company = item.get("company", "Не указана")
         score = int(item.get("score", 50))
         role = item.get("role", "Инженер / Разработчик")
@@ -763,27 +870,33 @@ async def handle_vacancy(message: Message):
         lpr = item.get("target_lpr", "CTO")
         pain = item.get("pain_point", "Высокая нагрузка")
         hook = item.get("hook", "Здравствуйте!")
+        client_guess = item.get("end_client_guess", "").strip()
 
         badge = "🔥" if score >= 85 else "⚡️" if score >= 65 else "🔎"
         status_label = "Точный оригинал" if score >= 85 else "Высокое соответствие" if score >= 65 else "Частичное совпадение"
 
+        guess_part = ""
+        if rank == 1 and client_guess:
+            guess_part = f"🕵️ **Предполагаемый конечный клиент:**\n_{client_guess}_\n\n"
+
         card = (
             f"**#{rank} {badge} {company}** — `{score}% совпадение`\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏛 **Источник:** `{source}`\n"
             f"🎯 **Статус:** {status_label}\n"
             f"📌 **Позиция:** {role}\n"
-            f"💰 **Вилка:** {salary}\n"
-            f"🏛 **Источник:** {source}\n\n"
+            f"💰 **Вилка:** {salary}\n\n"
+            f"{guess_part}"
             f"⚙️ **Аудит стека:**\n"
             f"• **Технологии:** {stack}\n"
-            f"• **Специфика:** {challenge}\n\n"
-            f"💼 **Стратегия для сейлза:**\n"
+            f"• **Задачи:** {challenge}\n\n"
+            f"💼 **Стратегия выхода для сейлза:**\n"
             f"• **К кому идти:** {lpr}\n"
             f"• **Боль заказчика:** {pain}\n"
             f"• **Хук:** _{hook}_\n"
         )
 
-        buttons = [[InlineKeyboardButton(text="🔗 Открыть пост / вакансию", url=url)]]
+        buttons = [[InlineKeyboardButton(text=f"🔗 Открыть в {source[:20]}", url=url)]]
         if company and not company.startswith("@") and "чат" not in company.lower() and "канал" not in company.lower():
             buttons.append([InlineKeyboardButton(text="🕵️ Найти ЛПР в LinkedIn", url=build_lead_osint_url(company))])
 
