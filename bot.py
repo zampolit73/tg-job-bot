@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -98,6 +99,17 @@ def run_health_server():
     server.serve_forever()
 
 
+# ----------------- ФУНКЦИИ ХЕШИРОВАНИЯ И ДЕДУПЛИКАЦИИ -----------------
+def generate_content_hash(text: str) -> str:
+    """Генерирует семантический отпечаток текста для отсечения кросс-постинга."""
+    clean_text = HTML_TAG_RE.sub(" ", text.lower())
+    words = re.findall(r'[a-zа-я0-9\+\#]{3,}', clean_text)
+    meaningful_words = sorted(list({w for w in words if w not in STOP_WORDS}))
+    # Берем срез ключевых слов для вычисления сигнатуры сути поста
+    signature = " ".join(meaningful_words[:30])
+    return hashlib.md5(signature.encode("utf-8")).hexdigest()
+
+
 # ----------------- РАБОТА С SUPABASE -----------------
 async def init_db():
     global db_pool, ACTIVE_FOLDERS
@@ -120,6 +132,12 @@ async def init_db():
         logger.info("Подключение к Supabase PostgreSQL успешно установлено!")
 
         async with db_pool.acquire() as conn:
+            # Создаем колонку content_hash если её еще нет для обратной совместимости
+            await conn.execute("""
+                ALTER TABLE vacancies ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64);
+                CREATE INDEX IF NOT EXISTS idx_vacancies_content_hash ON vacancies (content_hash);
+            """)
+
             rows = await conn.fetch("SELECT folder_id, folder_title FROM active_folders;")
             ACTIVE_FOLDERS = {r["folder_id"]: r["folder_title"] for r in rows}
             logger.info(f"Загружено сохраненных папок из БД: {list(ACTIVE_FOLDERS.values())}")
@@ -148,13 +166,33 @@ async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: s
     if not db_pool:
         return
     try:
+        content_hash = generate_content_hash(text)
         saved_text = f"[FWD: {fwd_source}] {text}" if fwd_source else text
+
         async with db_pool.acquire() as conn:
+            # 1. Проверяем наличие семантического дубля
+            existing = await conn.fetchrow(
+                "SELECT id, chat_title, post_url FROM vacancies WHERE content_hash = $1 LIMIT 1;",
+                content_hash
+            )
+
+            if existing:
+                # Если вакансия уже была выложена в другом канале, дописываем источник
+                old_title = existing['chat_title']
+                if chat_title not in old_title:
+                    new_title = f"{old_title}, {chat_title}"[:80]
+                    await conn.execute(
+                        "UPDATE vacancies SET chat_title = $1 WHERE id = $2;",
+                        new_title, existing['id']
+                    )
+                return
+
+            # 2. Если дубля нет — сохраняем
             await conn.execute("""
-                INSERT INTO vacancies (chat_title, message_id, chat_id, post_text, post_url)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO vacancies (chat_title, message_id, chat_id, post_text, post_url, content_hash)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (chat_id, message_id) DO NOTHING;
-            """, chat_title, msg_id, chat_id, saved_text, url)
+            """, chat_title, msg_id, chat_id, saved_text, url, content_hash)
     except Exception as e:
         logger.debug(f"Ошибка сохранения вакансии в БД: {e}")
 
@@ -163,18 +201,24 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
     if not db_pool or not terms:
         return []
     results = []
+    seen_hashes = set()
     try:
         like_clauses = " OR ".join([f"post_text ILIKE ${i+1}" for i in range(len(terms))])
         params = [f"%{t}%" for t in terms]
         query = f"""
-            SELECT chat_title, post_text, post_url 
+            SELECT chat_title, post_text, post_url, content_hash 
             FROM vacancies 
             WHERE {like_clauses} 
-            ORDER BY id DESC LIMIT 20;
+            ORDER BY id DESC LIMIT 25;
         """
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(query, *params)
             for row in rows:
+                c_hash = row.get('content_hash') or generate_content_hash(row['post_text'])
+                if c_hash in seen_hashes:
+                    continue
+                seen_hashes.add(c_hash)
+
                 p_text = row['post_text']
                 overlap = calculate_overlap_score(raw_brief, p_text)
                 
@@ -185,16 +229,18 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
                     p_text = p_text.replace(fwd_match.group(0), "").strip()
 
                 company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", p_text, re.IGNORECASE)
-                company = company_match.group(1).strip() if company_match else row['chat_title']
+                company = company_match.group(1).strip() if company_match else row['chat_title'].split(",")[0].strip()
+                
                 results.append({
-                    "source": row['chat_title'][:25],
-                    "title": f"Пост в {row['chat_title'][:25]}",
+                    "source": row['chat_title'][:30],
+                    "title": f"Пост в {row['chat_title'][:30]}",
                     "company": company,
                     "salary": "в тексте",
                     "url": row['post_url'],
                     "desc": p_text[:400],
                     "overlap": overlap,
-                    "fwd_source": fwd_info
+                    "fwd_source": fwd_info,
+                    "content_hash": c_hash
                 })
     except Exception as e:
         logger.warning(f"Ошибка поиска в Supabase: {e}")
@@ -471,7 +517,8 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
                 "url": full_url,
                 "desc": desc_text[:300],
                 "overlap": 0.0,
-                "fwd_source": ""
+                "fwd_source": "",
+                "content_hash": generate_content_hash(desc_text)
             })
         return jobs
     except Exception:
@@ -505,7 +552,8 @@ async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str) -> list:
                     "url": post_url,
                     "desc": desc[:300],
                     "overlap": 0.0,
-                    "fwd_source": ""
+                    "fwd_source": "",
+                    "content_hash": generate_content_hash(desc)
                 })
         return jobs[:3]
     except Exception:
@@ -539,7 +587,8 @@ async def fetch_geeklink_rss(client: httpx.AsyncClient, query: str) -> list:
                     "url": link,
                     "desc": desc[:300],
                     "overlap": 0.0,
-                    "fwd_source": ""
+                    "fwd_source": "",
+                    "content_hash": generate_content_hash(desc)
                 })
         return jobs[:3]
     except Exception:
@@ -572,20 +621,21 @@ async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
                 "url": full_url,
                 "desc": desc[:300],
                 "overlap": 0.0,
-                "fwd_source": ""
+                "fwd_source": "",
+                "content_hash": generate_content_hash(desc)
             })
         return jobs[:3]
     except Exception:
         return []
 
 
-# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM -----------------
+# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM С ДЕДУПЛИКАЦИЕЙ -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
 
     found_posts = []
-    seen_ids = set()
+    seen_hashes = set()
     chat_targets = list(ALLOWED_CHAT_IDS) if ALLOWED_CHAT_IDS else [None]
 
     for target_chat in chat_targets:
@@ -614,12 +664,14 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                     if "matcher" in chat_title.lower() or "bot" in chat_title.lower():
                         continue
 
-                    unique_key = f"{normalize_id(message.chat_id)}_{message.id}"
-                    if unique_key in seen_ids:
-                        continue
-                    seen_ids.add(unique_key)
-
                     post_text = clean_html(message.text)
+                    content_hash = generate_content_hash(post_text)
+
+                    # Фильтрация дублей на лету
+                    if content_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(content_hash)
+
                     overlap = calculate_overlap_score(raw_brief, post_text)
                     fwd_source = await extract_forward_metadata(message)
 
@@ -635,14 +687,15 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                     company = company_match.group(1).strip() if company_match else chat_title
 
                     found_posts.append({
-                        "source": chat_title[:25],
-                        "title": f"Пост в {chat_title[:25]}",
+                        "source": chat_title[:30],
+                        "title": f"Пост в {chat_title[:30]}",
                         "company": company,
                         "salary": "в тексте",
                         "url": msg_url,
                         "desc": post_text[:400],
                         "overlap": overlap,
-                        "fwd_source": fwd_source
+                        "fwd_source": fwd_source,
+                        "content_hash": content_hash
                     })
             except Exception as e:
                 logger.debug(f"Поиск в {target_chat}: {e}")
@@ -685,8 +738,8 @@ async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
         "Отправьте бриф или описание вакансии — бот выполнит поиск по Telegram-папкам, "
-        "базе Supabase и внешним платформам, деанонимизирует конечного клиента для **каждого** "
-        "из найденных вариантов и подготовит готовую стратегию выхода.\n\n"
+        "базе Supabase (с автоматической очисткой от дублей) и внешним платформам, "
+        "деанонимизирует конечного клиента для **каждого** результата и выдаст стратегию выхода.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
@@ -749,7 +802,7 @@ async def handle_folder_toggle_callback(call: CallbackQuery):
 
 @dp.message(F.text == "/debug_tg")
 async def cmd_debug(message: Message):
-    db_status = "✅ Подключена" if db_pool else "❌ Не подключена"
+    db_status = "✅ Подключена (Smart Deduplication ON)" if db_pool else "❌ Не подключена"
     if not telethon_client or not telethon_client.is_connected():
         await message.answer(f"🗄 База данных Supabase: {db_status}\nTelethon: ⚠️ Не подключен к Telegram.", parse_mode=None)
         return
@@ -790,7 +843,7 @@ async def handle_vacancy(message: Message):
 
     await safe_edit_status(status_msg, f"🔍 [2/3] Поиск по Telegram ({scope_desc}), Supabase, VC, GeekLink...")
 
-    # 1. Поиск по базе Supabase
+    # 1. Поиск по базе Supabase с дедупликацией
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
     # 2. Параллельный сбор по всем платформам
@@ -811,7 +864,15 @@ async def handle_vacancy(message: Message):
             valid_results = []
 
         all_results = db_results + valid_results
-        unique_vacancies = list({v["url"]: v for v in all_results if v.get("url")}.values())
+
+        # Глобальная семантическая дедупликация перед LLM
+        seen_hashes = set()
+        unique_vacancies = []
+        for v in all_results:
+            h = v.get("content_hash") or generate_content_hash(v.get("desc", ""))
+            if h not in seen_hashes and v.get("url"):
+                seen_hashes.add(h)
+                unique_vacancies.append(v)
 
         if not unique_vacancies:
             await safe_edit_status(status_msg, "❌ Совпадений по источникам не найдено.")
@@ -908,7 +969,7 @@ async def handle_vacancy(message: Message):
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
     final_top = parsed_candidates[:5]
 
-    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** позиций (отсортировано по релевантности):")
+    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** уникальных позиций (дубликаты очищены):")
 
     for rank, item in enumerate(final_top, 1):
         company = item.get("company", "Не указана")
