@@ -144,16 +144,18 @@ async def sync_folder_to_db(folder_id: int, folder_title: str, add: bool):
         logger.error(f"Ошибка синхронизации папки с БД: {e}")
 
 
-async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: str, url: str):
+async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: str, url: str, fwd_source: str = ""):
     if not db_pool:
         return
     try:
+        # Сохраняем fwd_source прямо в начале текста для контекста БД
+        saved_text = f"[FWD: {fwd_source}] {text}" if fwd_source else text
         async with db_pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO vacancies (chat_title, message_id, chat_id, post_text, post_url)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (chat_id, message_id) DO NOTHING;
-            """, chat_title, msg_id, chat_id, text, url)
+            """, chat_title, msg_id, chat_id, saved_text, url)
     except Exception as e:
         logger.debug(f"Ошибка сохранения вакансии в БД: {e}")
 
@@ -176,6 +178,14 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
             for row in rows:
                 p_text = row['post_text']
                 overlap = calculate_overlap_score(raw_brief, p_text)
+                
+                # Извлекаем скрытый fwd_source, если он был записан
+                fwd_info = ""
+                fwd_match = re.search(r"^\[FWD:\s*([^\]]+)\]", p_text)
+                if fwd_match:
+                    fwd_info = fwd_match.group(1).strip()
+                    p_text = p_text.replace(fwd_match.group(0), "").strip()
+
                 company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", p_text, re.IGNORECASE)
                 company = company_match.group(1).strip() if company_match else row['chat_title']
                 results.append({
@@ -185,7 +195,8 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
                     "salary": "в тексте",
                     "url": row['post_url'],
                     "desc": p_text[:400],
-                    "overlap": overlap
+                    "overlap": overlap,
+                    "fwd_source": fwd_info
                 })
     except Exception as e:
         logger.warning(f"Ошибка поиска в Supabase: {e}")
@@ -339,6 +350,35 @@ async def safe_edit_status(msg: Message, text: str):
         pass
 
 
+# ----------------- ИЗВЛЕЧЕНИЕ МЕТАДАННЫХ ПЕРЕСЫЛКИ (FWD OSINT) -----------------
+async def extract_forward_metadata(message) -> str:
+    """Извлекает цифровой след первоисточника из fwd_from."""
+    if not message.fwd_from:
+        return ""
+    try:
+        fwd = message.fwd_from
+        # 1. Если есть имя скрытого автора
+        if getattr(fwd, 'from_name', None):
+            return f"Переслано от: {fwd.from_name}"
+        
+        # 2. Если переслано из канала/чата через from_id
+        if getattr(fwd, 'from_id', None):
+            try:
+                entity = await telethon_client.get_entity(fwd.from_id)
+                title = getattr(entity, 'title', getattr(entity, 'username', getattr(entity, 'first_name', '')))
+                username = f"(@{entity.username})" if getattr(entity, 'username', None) else ""
+                return f"Канал-первоисточник: {title} {username}".strip()
+            except Exception:
+                pass
+        
+        # 3. Канал пересылки post_author
+        if getattr(fwd, 'post_author', None):
+            return f"Автор оригинального поста: {fwd.post_author}"
+    except Exception:
+        pass
+    return ""
+
+
 # ----------------- ВЫБОР МОДЕЛЕЙ GROQ -----------------
 async def find_working_groq_model() -> str:
     global ACTIVE_GROQ_MODEL
@@ -439,7 +479,8 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
                 "salary": sal_str,
                 "url": full_url,
                 "desc": desc_text[:300],
-                "overlap": 0.0
+                "overlap": 0.0,
+                "fwd_source": ""
             })
         return jobs
     except Exception:
@@ -472,7 +513,8 @@ async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str) -> list:
                     "salary": sal,
                     "url": post_url,
                     "desc": desc[:300],
-                    "overlap": 0.0
+                    "overlap": 0.0,
+                    "fwd_source": ""
                 })
         return jobs[:3]
     except Exception:
@@ -505,7 +547,8 @@ async def fetch_geeklink_rss(client: httpx.AsyncClient, query: str) -> list:
                     "salary": "в описании",
                     "url": link,
                     "desc": desc[:300],
-                    "overlap": 0.0
+                    "overlap": 0.0,
+                    "fwd_source": ""
                 })
         return jobs[:3]
     except Exception:
@@ -537,14 +580,15 @@ async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
                 "salary": sal,
                 "url": full_url,
                 "desc": desc[:300],
-                "overlap": 0.0
+                "overlap": 0.0,
+                "fwd_source": ""
             })
         return jobs[:3]
     except Exception:
         return []
 
 
-# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM -----------------
+# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM С АНАЛИЗОМ FWD_FROM -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
@@ -587,13 +631,16 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                     post_text = clean_html(message.text)
                     overlap = calculate_overlap_score(raw_brief, post_text)
 
+                    # СНЯТИЕ МЕТАДАННЫХ ПЕРЕСЫЛКИ
+                    fwd_source = await extract_forward_metadata(message)
+
                     if getattr(chat, 'username', None):
                         msg_url = f"https://t.me/{chat.username}/{message.id}"
                     else:
                         clean_id = str(chat.id).replace("-100", "")
                         msg_url = f"https://t.me/c/{clean_id}/{message.id}"
 
-                    asyncio.create_task(save_vacancy_to_db(chat_title, message.id, message.chat_id, post_text, msg_url))
+                    asyncio.create_task(save_vacancy_to_db(chat_title, message.id, message.chat_id, post_text, msg_url, fwd_source))
 
                     company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
                     company = company_match.group(1).strip() if company_match else chat_title
@@ -605,7 +652,8 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                         "salary": "в тексте",
                         "url": msg_url,
                         "desc": post_text[:400],
-                        "overlap": overlap
+                        "overlap": overlap,
+                        "fwd_source": fwd_source
                     })
             except Exception as e:
                 logger.debug(f"Поиск в {target_chat}: {e}")
@@ -635,7 +683,9 @@ def register_telethon_listener():
                 chat_title = getattr(chat, 'title', 'TG Группа')
                 clean_id = str(chat.id).replace("-100", "")
                 url = f"https://t.me/c/{clean_id}/{event.id}" if not getattr(chat, 'username', None) else f"https://t.me/{chat.username}/{event.id}"
-                await save_vacancy_to_db(chat_title, event.id, chat.id, clean_html(event.text), url)
+                
+                fwd_source = await extract_forward_metadata(event.message)
+                await save_vacancy_to_db(chat_title, event.id, chat.id, clean_html(event.text), url, fwd_source)
         except Exception:
             pass
 
@@ -647,7 +697,7 @@ async def cmd_start(message: Message):
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
         "Отправьте бриф или описание вакансии — бот проведёт поиск по Telegram-папкам, "
         "базе Supabase и внешним платформам, отсортирует до 5 совпадений по релевантности, "
-        "деанонимизирует конечного клиента через OSINT-маркеры и сформирует лаконичную стратегию выхода.\n\n"
+        "проанализирует скрытые метаданные пересылок сообщений (fwd_from) и деанонимизирует заказчика.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
@@ -754,7 +804,7 @@ async def handle_vacancy(message: Message):
     # 1. Поиск по базе Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Параллельный сбор по всем платформам
+    # 2. Параллельный сбор по всем платформам с извлечением метаданных
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
@@ -780,7 +830,7 @@ async def handle_vacancy(message: Message):
 
     candidates_pool = unique_vacancies[:8]
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] Запуск OSINT-деанонимизации и расчет стратегии...")
+    await safe_edit_status(status_msg, f"🧠 [3/3] OSINT-анализ метаданных пересылки и деанонимизация...")
 
     compact_candidates = [
         {
@@ -789,25 +839,27 @@ async def handle_vacancy(message: Message):
             "source": v['source'],
             "url": v['url'],
             "overlap_percent": v.get('overlap', 0),
+            "fwd_origin": v.get('fwd_source', ''),  # Передаем оригинальный цифровой след Telegram
             "text": v['desc'][:280]
         }
         for idx, v in enumerate(candidates_pool, 1)
     ]
 
-    # УСИЛЕННЫЙ ПРОМПТ OSINT-РАССЛЕДОВАНИЯ
     prompt_matrix = f"""Ты — Senior OSINT-аналитик IT-рынка и специалист по деанонимизации закрытых корпоративных вакансий.
-Твоя задача — сорвать маску кадрового агентства / аутстаффера и определить НАСТОЯЩЕГО конечного заказчика по цифровым следам в описании.
+Твоя задача — сорвать маску кадрового агентства / аутстаффера и определить НАСТОЯЩЕГО конечного заказчика по тексту и метаданным пересылки (fwd_origin).
 
-ФРЕЙМВОРК ДЕАНОНИМИЗАЦИИ (анализируй строго по этим 4 признакам):
-1. АРХИТЕКТУРНЫЙ СЛЕД: On-premise контур, нетиповые окружения, Kubernetes с собственной изоляцией = закрытые контуры Tier-1 (Сбер, Т-Банк, ВТБ, Альфа-Банк, Газпромбанк, Ростелеком, X5 Group).
-2. СЛОВАРНЫЙ КОД ТЗ: Термины «TTM (Time to Market)», «продуктовые стримы», «платформенный беклог», «внутренние команды» = внутренняя PaaS-модель корпораций (СберТех, Т-Банк, Яндекс, VK, Ozon).
-3. ПРОМЫШЛЕННЫЙ / ГОС СЛЕД: «АСУТП», «ГОСТ», «импортозамещение», «Астра/РедОС» = Газпром, Роснефть, СИБУР, Ростелеком, Росатом.
-4. МАСШТАБ СТЕКА: Специфические связки инструментов, исключающие стартапы и малый бизнес.
+ВАЖНО ПО FWD_ORIGIN:
+Если в поле fwd_origin указан оригинальный канал или автор (например, "Канал-первоисточник: Alfa Digital"), это 100% доказательство того, кто является заказчиком! Обязательно используй это в первую очередь.
+
+ФРЕЙМВОРК ДЕАНОНИМИЗАЦИИ ПО ТЕКСТУ:
+1. On-premise контур, нетиповые окружения, K8s = закрытые контуры Tier-1 (Сбер, Т-Банк, ВТБ, Альфа-Банк, Газпромбанк, Ростелеком, X5 Group).
+2. «TTM (Time to Market)», «продуктовые стримы», «платформенный беклог» = PaaS-модель крупных корпораций (СберТех, Т-Банк, Яндекс, Ozon).
+3. «АСУТП», «ГОСТ», «импортозамещение», «Астра/РедОС» = Газпром, Роснефть, СИБУР, Ростелеком.
 
 ПРАВИЛО ДЛЯ ТОП-1:
-- В "end_client_name" назови КОНКРЕТНУЮ компанию (например: Сбер / FinTech Core, X5 Digital, Т-Банк Инфраструктура, Газпромбанк). НИКАКИХ размытых фраз вроде «какой-то банк».
-- В "end_client_evidence" укажи КОНКРЕТНУЮ УЛИКУ из текста (например: «On-premise + сокращение TTM внутренних стримов — корпоративный почерк PaaS платформы Сбера/Т-Банка»).
-- В "end_client_alt" укажи 2-го вероятного заказчика на случай субподряда.
+- В "end_client_name" назови КОНКРЕТНУЮ компанию (Сбер, X5 Digital, Т-Банк Инфраструктура, Газпромбанк, Альфа-Банк). Никакой воды.
+- В "end_client_evidence" укажи КОНКРЕТНУЮ УЛИКУ (включая fwd_origin, если он есть).
+- В "end_client_alt" укажи 2-го вероятного заказчика.
 
 ДЛЯ ВСЕХ ПОЗИЦИЙ СФОРМУЛИРУЙ ЛАКОНИЧНО (стиль "Минимализм"):
 - role: точная инженерная роль
@@ -834,7 +886,7 @@ async def handle_vacancy(message: Message):
       "source": "источник",
       "stack_match": "Kubernetes • Helm • Postgres • Linux",
       "end_client_name": "Сбер / FinTech Platform Core",
-      "end_client_evidence": "On-prem контур и формулировка 'сокращение TTM продуктовых команд' выдают модель платформенного ядра СберТеха.",
+      "end_client_evidence": "Сообщение переслано из официального канала Сбера / On-prem контур и формулировка 'сокращение TTM'.",
       "end_client_alt": "Т-Банк / Инфраструктура",
       "strategy_lpr": "Head of Infrastructure",
       "strategy_pain": "Срыв релизов продуктовых команд из-за перегруза рутиной",
@@ -856,6 +908,8 @@ async def handle_vacancy(message: Message):
     if not parsed_candidates:
         for idx, v in enumerate(candidates_pool[:5], 1):
             score = 90 if v.get("overlap", 0) > 20 else max(40, 85 - idx * 10)
+            fwd_info = v.get('fwd_source', '')
+            evidence = f"Выявлен след пересылки ({fwd_info})" if fwd_info else "On-premise контур и сокращение TTM для внутренних стримов указывают на крупный банковский PaaS."
             parsed_candidates.append({
                 "company": v["company"],
                 "score": score,
@@ -864,7 +918,7 @@ async def handle_vacancy(message: Message):
                 "source": v["source"],
                 "stack_match": "Kubernetes • Helm • Postgres • Linux",
                 "end_client_name": "Сбер / FinTech Platform Core" if idx == 1 else "",
-                "end_client_evidence": "On-premise контур и сокращение TTM для внутренних продуктовых стримов характерны для закрытых банковских PaaS платформ." if idx == 1 else "",
+                "end_client_evidence": evidence if idx == 1 else "",
                 "end_client_alt": "Т-Банк / X5 Tech" if idx == 1 else "",
                 "strategy_lpr": "Head of Infrastructure",
                 "strategy_pain": "Срыв релизов из-за рутинных инцидентов",
@@ -872,7 +926,6 @@ async def handle_vacancy(message: Message):
                 "strategy_hook": "Добрый день! Вижу потребность в инженере техплатформы (k8s/onprem). Можем закрыть операционку нашими ребятами, чтобы не отвлекать основной костяк. Актуально взглянуть на профили?"
             })
 
-    # Сортировка: максимальный скор сверху
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
     final_top = parsed_candidates[:5]
 
@@ -894,7 +947,7 @@ async def handle_vacancy(message: Message):
         client_block = ""
         if rank == 1:
             c_name = item.get("end_client_name", "Сбер / FinTech Core")
-            c_evidence = item.get("end_client_evidence", "On-premise контур и внутренняя сервисная модель платформы указывают на закрытый контур крупной экосистемы.")
+            c_evidence = item.get("end_client_evidence", "On-premise контур и внутренняя сервисная модель платформы.")
             c_alt = item.get("end_client_alt", "")
             alt_str = f"\n> **Запасной вариант:** {c_alt}" if c_alt else ""
 
@@ -904,7 +957,6 @@ async def handle_vacancy(message: Message):
                 f"> **Улика:** _{c_evidence}_{alt_str}\n\n"
             )
 
-        # Концепт 1: «Минимализм и теги» (Максимум воздуха)
         card = (
             f"**#{rank}. {company} • {score}%**\n"
             f"{role}\n\n"
