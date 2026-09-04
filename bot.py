@@ -44,6 +44,7 @@ dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
 ACTIVE_GROQ_MODEL = None
+BOT_USER_ID = None
 
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
@@ -178,14 +179,14 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     kwargs = {
         "model": ACTIVE_GROQ_MODEL,
         "messages": [{"role": "user", "content": safe_prompt}],
-        "temperature": 0.0,
+        "temperature": 0.1,  # Небольшая температура убирает зацикливание букв
         "max_tokens": max_tokens,
     }
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
     try:
-        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=10.0)
+        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=11.0)
         content = res.choices[0].message.content
         if content and content.strip():
             return content, ""
@@ -210,9 +211,9 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- БЫСТРЫЙ ГЛОБАЛЬНЫЙ ПОИСК ПО ВСЕМ ЧАТАМ -----------------
-async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list:
-    """Глобальный поиск по всем доступным чатам через MTProto API с очисткой маркеров"""
+# ----------------- БЫСТРЫЙ ПОИСК ПО ВНЕШНИМ ЧАТАМ (БЕЗ САМОГО БОТА) -----------------
+async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
+    """Глобальный поиск с фильтром: игнорируются диалоги с ботом и личка"""
     if not telethon_client or not telethon_client.is_connected():
         logger.warning("Telethon не подключен к Telegram.")
         return []
@@ -221,15 +222,25 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list
     seen_ids = set()
 
     for term in search_terms:
-        # Убираем скобки, точки и мусорные символы
         clean_t = re.sub(r'[^\w\s]', '', term).strip()
         if len(clean_t) < 3:
             continue
 
         try:
             logger.info(f"Глобальный поиск в TG по маркеру: '{clean_t}'...")
-            async for message in telethon_client.iter_messages(None, search=clean_t, limit=12):
-                if not message.text or len(message.text) < 35:
+            async for message in telethon_client.iter_messages(None, search=clean_t, limit=15):
+                if not message.text or len(message.text) < 40:
+                    continue
+
+                # ИСКЛЮЧАЕМ ЛИЧКУ С САМИМ СОБОЙ И С БОТОМ
+                if message.chat_id == bot_id:
+                    continue
+
+                chat = await message.get_chat()
+                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Chat'))
+
+                # Игнорируем если пост найден в чате бота
+                if "matcher" in chat_title.lower() or "bot" in chat_title.lower():
                     continue
 
                 unique_key = f"{message.chat_id}_{message.id}"
@@ -239,9 +250,6 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list
 
                 post_text = clean_html(message.text)
                 overlap = calculate_overlap_score(raw_brief, post_text)
-
-                chat = await message.get_chat()
-                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Chat'))
 
                 if getattr(chat, 'username', None):
                     msg_url = f"https://t.me/{chat.username}/{message.id}"
@@ -258,14 +266,14 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list
                     "company": company,
                     "salary": "в тексте поста",
                     "url": msg_url,
-                    "desc": post_text[:350],
+                    "desc": post_text[:300],
                     "overlap": overlap
                 })
         except Exception as e:
             logger.warning(f"Ошибка при поиске маркера '{clean_t}': {e}")
 
     found_posts.sort(key=lambda x: x.get("overlap", 0), reverse=True)
-    logger.info(f"Глобальный поиск нашел {len(found_posts)} постов в чатах.")
+    logger.info(f"Найдено реальных постов в чатах: {len(found_posts)}")
     return found_posts[:5]
 
 
@@ -311,17 +319,15 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
 async def cmd_start(message: Message):
     await message.answer(
         "💼 Multi-Source OSINT Lead Hunter\n\n"
-        "Отправьте бриф вакансии. Бот выполнит сквозной глобальный поиск по вашим Telegram-чатам "
-        "и открытым базам с детальным сравнением оригинала.",
+        "Отправьте бриф вакансии. Бот найдет оригинальные публикации в ваших Telegram-чатах и внешних базах.",
         parse_mode=None
     )
 
 
 @dp.message(F.text == "/debug_tg")
 async def cmd_debug(message: Message):
-    """Безопасный вывод отладки Telethon без падений Markdown"""
     if not telethon_client:
-        await message.answer("❌ Telethon не инициализирован (проверьте переменные TG_API_ID, TG_SESSION_STRING в Render).", parse_mode=None)
+        await message.answer("❌ Telethon не инициализирован (проверьте переменные в Render).", parse_mode=None)
         return
     if not telethon_client.is_connected():
         await message.answer("⚠️ Telethon не подключен к сети Telegram.", parse_mode=None)
@@ -332,24 +338,27 @@ async def cmd_debug(message: Message):
         chats_lines = [f"- {d.name}" for d in dialogs[:6]]
         chats_list = "\n".join(chats_lines)
         response = (
-            f"✅ Telethon активен и подключен!\n"
+            f"✅ Telethon активен!\n"
             f"Имя аккаунта: {me.first_name} (@{me.username})\n"
-            f"Доступные чаты (первые 6):\n{chats_list}"
+            f"Доступные чаты:\n{chats_list}"
         )
         await message.answer(response, parse_mode=None)
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка при проверке Telethon: {e}", parse_mode=None)
+        await message.answer(f"⚠️ Ошибка Telethon: {e}", parse_mode=None)
 
 
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
-    global google_quota_exhausted
+    global google_quota_exhausted, BOT_USER_ID
     user_text = message.text
     logger.info(f"Получен бриф ({len(user_text)} симв.) от {message.from_user.id}")
 
+    if not BOT_USER_ID:
+        me = await bot.get_me()
+        BOT_USER_ID = me.id
+
     status_msg = await message.answer("⚡️ [1/4] Извлечение ключевых маркеров для поиска...")
 
-    # Извлечение чистых терминов без спецсимволов
     detected_markers = []
     clean_words = re.findall(r'[A-Za-z0-9]{3,}', user_text)
     for word in clean_words:
@@ -367,11 +376,11 @@ async def handle_vacancy(message: Message):
 
     search_terms = detected_markers[:3]
 
-    await safe_edit_status(status_msg, f"🔍 [2/4] Глобальный поиск в ваших Telegram-чатах по {search_terms}...")
+    await safe_edit_status(status_msg, f"🔍 [2/4] Глобальный поиск в группах и чатах по {search_terms}...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
-            search_joined_chats_global(search_terms, user_text),
+            search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
             fetch_habr(http_client, search_terms[0], 4),
         ]
 
@@ -385,10 +394,10 @@ async def handle_vacancy(message: Message):
         unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений в чатах не найдено. Нажмите /debug_tg, чтобы проверить статус подключения.")
+            await safe_edit_status(status_msg, "❌ Совпадений в сторонних чатах не найдено. Проверьте, состоит ли аккаунт в целевой группе.")
             return
 
-    await safe_edit_status(status_msg, f"🧠 [3/4] Сравнение текста с {len(unique_vacancies[:4])} кандидатами...")
+    await safe_edit_status(status_msg, f"🧠 [3/4] Сравнение текста с {len(unique_vacancies[:3])} кандидатами...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -396,24 +405,21 @@ async def handle_vacancy(message: Message):
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
         f"Текстовое совпадение с брифом: {v.get('overlap', 0)}%\n"
-        f"Описание/Пост: {v['desc'][:350]}\n"
-        for idx, v in enumerate(unique_vacancies[:4], 1)
+        f"Текст вакансии: {v['desc'][:250]}\n"
+        for idx, v in enumerate(unique_vacancies[:3], 1)
     ]
-    candidates_payload = "\n".join(compact_candidates)
+    candidates_payload = "\n\n".join(compact_candidates)
 
-    prompt_matrix = f"""Ты — строгий OSINT-аудитор. Сравни найденные посты с оригинальным брифом.
+    prompt_matrix = f"""Ты — OSINT-аудитор. Сравни найденные посты с оригинальным брифом.
+Не повторяй буквы и слова. Пиши строго по шаблону.
 
-ИСХОДНЫЙ БРИФ:
-\"\"\"{user_text[:600]}\"\"\"
+БРИФ:
+{user_text[:400]}
 
-НАЙДЕННЫЕ ВАКАНСИИ:
+ВАКАНСИИ:
 {candidates_payload}
 
-ПРАВИЛА:
-1. Если кандидат из Telegram-чата и совпадение текста > 20% или совпал ключевой стек — ставь скор 85-99% и статус '🟢 Точный оригинал'.
-2. Если кандидат из общей базы без совпадения ключевых задач — скор <= 40%.
-
-Выведи ТОП кандидатов по шаблону:
+Выведи ТОП кандидатов строго по шаблону:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании или чата]
 🎯 **Матричный скор:** [XX]%
@@ -421,7 +427,7 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник/пост](URL)
-🏛 **Источник:** [Telegram Чат / Хабр / Google]
+🏛 **Источник:** [Telegram Чат / Хабр]
 
 ⚖️ **Аудит по матрице:**
 • **Совпадение стека:** [Что совпало по тексту]
@@ -463,7 +469,6 @@ async def handle_vacancy(message: Message):
         else:
             await safe_edit_status(status_msg, final_output)
     except Exception:
-        # Резервный вывод чистым текстом, если Markdown содержит ломающие символы
         await safe_edit_status(status_msg, final_output.replace("*", "").replace("`", ""))
 
 
@@ -478,7 +483,7 @@ async def init_telethon():
             logger.warning("Telethon не авторизован.")
             telethon_client = None
         else:
-            logger.info("Telethon успешно авторизован! Глобальный поиск по чатам активен.")
+            logger.info("Telethon успешно авторизован!")
     except Exception as e:
         logger.warning(f"Telethon пропущен: {e}")
         telethon_client = None
