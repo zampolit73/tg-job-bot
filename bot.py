@@ -12,7 +12,7 @@ import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from groq import AsyncGroq
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -44,8 +44,7 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
-# Динамический список проверенных моделей Groq
-AVAILABLE_GROQ_MODELS = []
+ACTIVE_GROQ_MODEL = None
 
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
@@ -118,86 +117,104 @@ def build_lead_osint_url(company_name: str, target_role: str = "CTO") -> str:
 
 
 async def safe_edit_status(msg: Message, text: str):
+    """Безопасное обновление статуса с обработкой лимитов Telegram"""
     try:
         await msg.edit_text(text)
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 0.5)
+        try:
+            await msg.edit_text(text)
+        except Exception:
+            pass
     except TelegramAPIError:
         pass
 
 
-# ----------------- ДИНАМИЧЕСКИЙ ВЫБОР МОДЕЛЕЙ GROQ -----------------
-async def update_available_groq_models():
-    """Запрашивает у API список моделей, доступных именно вашему аккаунту"""
-    global AVAILABLE_GROQ_MODELS
-    try:
-        models_data = await groq_client.models.list()
-        valid_ids = [m.id for m in models_data.data if m.active]
-        # Приоритет: llama, qwen, gemma, остальные чат-модели
-        sorted_models = sorted(
-            valid_ids,
-            key=lambda x: (
-                0 if "llama" in x.lower() and "70b" in x.lower() else
-                1 if "llama" in x.lower() else
-                2 if "qwen" in x.lower() else
-                3 if "gemma" in x.lower() else 4
-            )
-        )
-        if sorted_models:
-            AVAILABLE_GROQ_MODELS = sorted_models
-            logger.info(f"Доступные модели Groq: {AVAILABLE_GROQ_MODELS[:4]}")
-            return
-    except Exception as e:
-        logger.warning(f"Не удалось получить список моделей через API: {e}")
-
-    # Запасной статический список
-    AVAILABLE_GROQ_MODELS = [
+# ----------------- АВТООПРЕДЕЛЕНИЕ РАБОЧЕЙ МОДЕЛИ GROQ -----------------
+async def find_working_groq_model() -> str:
+    """При запуске тестирует модели микрозапросом и находит 100% рабочую"""
+    global ACTIVE_GROQ_MODEL
+    candidate_models = [
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
-        "gemma2-9b-it"
+        "qwen/qwen3.6-27b",
+        "gemma2-9b-it",
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
     ]
+
+    try:
+        model_list = await groq_client.models.list()
+        api_models = [m.id for m in model_list.data if m.active and "whisper" not in m.id and "guard" not in m.id]
+        for am in api_models:
+            if am not in candidate_models:
+                candidate_models.append(am)
+    except Exception as e:
+        logger.warning(f"Не удалось запросить список моделей: {e}")
+
+    for model in candidate_models:
+        try:
+            logger.info(f"Проверка модели Groq: {model}...")
+            res = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=5,
+                ),
+                timeout=4.0
+            )
+            if res.choices and res.choices[0].message.content:
+                ACTIVE_GROQ_MODEL = model
+                logger.info(f"✅ ВЫБРАНА РАБОЧАЯ МОДЕЛЬ GROQ: {ACTIVE_GROQ_MODEL}")
+                return ACTIVE_GROQ_MODEL
+        except Exception as e:
+            logger.warning(f"Модель {model} не подошла: {e}")
+            continue
+
+    ACTIVE_GROQ_MODEL = "llama-3.3-70b-versatile"
+    logger.error("Все тесты не прошли, установлена модель по умолчанию.")
+    return ACTIVE_GROQ_MODEL
 
 
 async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool = False) -> tuple[str, str]:
-    global AVAILABLE_GROQ_MODELS
-    if not AVAILABLE_GROQ_MODELS:
-        await update_available_groq_models()
+    global ACTIVE_GROQ_MODEL
+    if not ACTIVE_GROQ_MODEL:
+        await find_working_groq_model()
 
-    last_err = ""
-    for model_name in AVAILABLE_GROQ_MODELS[:5]:
-        try:
-            kwargs = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.0,
-                "max_tokens": max_tokens,
-            }
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
+    kwargs = {
+        "model": ACTIVE_GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
 
-            res = await asyncio.wait_for(
-                groq_client.chat.completions.create(**kwargs),
-                timeout=12.0
-            )
-            content = res.choices[0].message.content
-            if content and content.strip():
-                return content, ""
-        except Exception as e:
-            last_err = str(e)
-            logger.warning(f"Модель {model_name} вернула ошибку: {e}. Пробуем следующий вариант...")
-            # Если ошибка вызвана json_mode, пробуем ту же модель без него
-            if json_mode and "json" in str(e).lower():
-                try:
-                    kwargs.pop("response_format", None)
-                    res = await asyncio.wait_for(
-                        groq_client.chat.completions.create(**kwargs),
-                        timeout=12.0
-                    )
-                    content = res.choices[0].message.content
-                    if content and content.strip():
-                        return content, ""
-                except Exception:
-                    pass
-            continue
-    return "", last_err
+    try:
+        res = await asyncio.wait_for(
+            groq_client.chat.completions.create(**kwargs),
+            timeout=10.0
+        )
+        content = res.choices[0].message.content
+        if content and content.strip():
+            return content, ""
+    except Exception as e:
+        err_msg = str(e)
+        logger.warning(f"Ошибка запроса к Groq ({ACTIVE_GROQ_MODEL}): {err_msg}")
+        # Если была ошибка с JSON-форматом, повторяем один раз без него
+        if json_mode and "json" in err_msg.lower():
+            try:
+                kwargs.pop("response_format", None)
+                res = await asyncio.wait_for(
+                    groq_client.chat.completions.create(**kwargs),
+                    timeout=8.0
+                )
+                return res.choices[0].message.content, ""
+            except Exception as e2:
+                return "", str(e2)
+        return "", err_msg
+
+    return "", "Empty response"
 
 
 # ----------------- FULL PAGE HYDRATION -----------------
@@ -212,7 +229,7 @@ async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
     }
 
     try:
-        r = await client.get(url, headers=headers, timeout=2.5)
+        r = await client.get(url, headers=headers, timeout=2.0)
         if r.status_code == 200:
             text = clean_html(r.text)
             clean_snippet = " ".join(text.split()[:300])
@@ -252,9 +269,9 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
     }
 
     try:
-        r = await client.get(url, params=params, timeout=3.0)
+        r = await client.get(url, params=params, timeout=2.5)
         if r.status_code in (429, 403):
-            logger.warning("Квота Google CSE исчерпана (429/403).")
+            logger.warning("Квота Google CSE исчерпана.")
             google_quota_exhausted = True
             return []
         if r.status_code != 200:
@@ -393,7 +410,7 @@ async def search_telegram_native(search_term: str) -> list:
         return []
     try:
         tasks = [_scan_single_channel(ch, clean_term) for ch in TARGET_TG_CHANNELS[:4]]
-        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3.0)
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2.5)
         return [item for sub in results if isinstance(sub, list) for item in sub]
     except Exception:
         return []
@@ -404,8 +421,8 @@ async def search_telegram_native(search_term: str) -> list:
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф вакансии. Бот автоматически подберет активную модель нейросети, "
-        "сформирует каскадные дорки, выкачает страницы и выполнит скоринг.",
+        "Отправьте бриф вакансии. Бот использует проверенную рабочую модель нейросети, "
+        "каскадные поисковые дорки и матричный скоринг прямого заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -419,21 +436,21 @@ async def handle_vacancy(message: Message):
     status_msg = await message.answer("⚡️ [1/4] Извлечение сущностей проекта...")
 
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
-Разбери бриф и верни JSON со строгой структурой:
+Разбери бриф и верни JSON:
 {{
   "role": "название роли",
-  "domain": "домен (Fintech, E-commerce, GameDev или Общий)",
-  "infra_type": "тип среды (OnPrem, Cloud или Не указан)",
-  "must_have": ["список", "только", "редких", "технологий"],
-  "core_challenge": "главная проектная задача (1 предложение)",
+  "domain": "домен проекта",
+  "infra_type": "OnPrem или Cloud или Не указан",
+  "must_have": ["список", "редких", "технологий"],
+  "core_challenge": "главная проектная задача",
   "dork_exact_quote": "дословная фраза из 3-5 слов из обязанностей без кавычек",
-  "dork_tech_cluster": "роль + 2 технологии для поиска",
-  "dork_ats_search": "название ключевого фреймворка"
+  "dork_tech_cluster": "роль + 2 технологии",
+  "dork_ats_search": "главный фреймворк"
 }}
 БРИФ:
-\"\"\"{user_text[:900]}\"\"\""""
+\"\"\"{user_text[:800]}\"\"\""""
 
-    extract_raw, err = await call_groq_async(prompt_extract, max_tokens=350, json_mode=True)
+    extract_raw, err = await call_groq_async(prompt_extract, max_tokens=300, json_mode=True)
     try:
         brief_profile = json.loads(extract_raw)
     except Exception:
@@ -453,7 +470,7 @@ async def handle_vacancy(message: Message):
     exact_quote = brief_profile.get("dork_exact_quote", "")
     cluster_query = brief_profile.get("dork_tech_cluster", primary_tech)
 
-    await safe_edit_status(status_msg, "🔍 [2/4] Запуск поисковых волн (Google X-Ray, Хабр, ATS, SuperJob, TG)...")
+    await safe_edit_status(status_msg, "🔍 [2/4] Запуск поисковых волн (Google, Хабр, ATS, SuperJob, TG)...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
@@ -472,10 +489,10 @@ async def handle_vacancy(message: Message):
             tasks.append(search_google_custom(http_client, ats_query, count=4))
 
         try:
-            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.5)
+            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.0)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception as e:
-            logger.error(f"Ошибка при поиске: {e}")
+            logger.error(f"Ошибка поиска: {e}")
             valid_results = []
 
         unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
@@ -484,13 +501,13 @@ async def handle_vacancy(message: Message):
             await safe_edit_status(status_msg, "❌ Совпадений не найдено. Попробуйте передать бриф с более конкретным техническим описанием.")
             return
 
-        await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка полных страниц {len(unique_vacancies[:6])} кандидатов (Full Body)...")
+        await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка полных страниц {len(unique_vacancies[:5])} кандидатов...")
         hydrated_vacancies = await hydrate_all_vacancies(http_client, unique_vacancies)
 
     if not hydrated_vacancies:
-        hydrated_vacancies = unique_vacancies[:6]
+        hydrated_vacancies = unique_vacancies[:5]
 
-    await safe_edit_status(status_msg, f"🧠 [4/4] Матричный скоринг {len(hydrated_vacancies[:6])} кандидатов через Groq LPU...")
+    await safe_edit_status(status_msg, f"🧠 [4/4] Матричный скоринг через Groq ({ACTIVE_GROQ_MODEL})...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -499,11 +516,11 @@ async def handle_vacancy(message: Message):
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
         f"Полный текст: {v['desc']}\n"
-        for idx, v in enumerate(hydrated_vacancies[:6], 1)
+        for idx, v in enumerate(hydrated_vacancies[:5], 1)
     ]
     candidates_payload = "\n".join(compact_candidates)
 
-    prompt_matrix = f"""Ты — беспощадный OSINT-аудитор. Отсей кадровых посредников и найди истинного прямого заказчика.
+    prompt_matrix = f"""Ты — OSINT-аудитор. Отсей посредников и выяви прямого заказчика.
 
 ЭТАЛОННЫЙ ПРОФИЛЬ ПРОЕКТА:
 {json.dumps(brief_profile, ensure_ascii=False, indent=2)}
@@ -513,17 +530,17 @@ async def handle_vacancy(message: Message):
 
 ПРАВИЛА ОЦЕНКИ:
 1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР <= 35%):
-   - Если кандидат является аутстафф/рекрутинг-посредником (фразы 'наш партнер', 'клиент' и т.д.).
-   - Не совпал стек фреймворков или архитектура.
-2. ВЕСА ДЛЯ НАЧИСЛЕНИЯ БАЛЛОВ:
-   - [45%] Архитектурный вызов ('core_challenge') и схожесть реальных задач.
-   - [35%] Покрытие редкого стека ('must_have').
+   - Аутстафф/рекрутинг-посредник (фразы 'клиент', 'партнер').
+   - Не совпал стек или архитектура.
+2. ВЕСА:
+   - [45%] Схожесть реальных проектных задач.
+   - [35%] Покрытие стека.
    - [20%] Домен бизнеса.
-3. Если совпала дословная цитата обязанностей — вероятность 95-99%.
+3. Дословная цитата обязанностей дает 95-99%.
 
-Выведи ТОП-3 кандидатов строго по шаблону:
+Выведи ТОП-3 кандидатов по шаблону:
 ══════════════════════════════
-🏢 **КОМПАНИЯ:** [Название прямого заказчика или канал]
+🏢 **КОМПАНИЯ:** [Название компании или канал]
 🎯 **Матричный скор:** [XX]%
 🎲 **Статус деанонимизации:** [🟢 Точный оригинал (85-99%) / 🟡 Высокая вероятность (60-84%) / 🟠 Слабое сходство (30-59%)]
 📌 **Позиция:** [Название должности]
@@ -532,7 +549,7 @@ async def handle_vacancy(message: Message):
 🏛 **Источник:** [Google ATS / Google Search / Хабр / SuperJob / Telegram]
 
 ⚖️ **Аудит по матрице:**
-• **Must-have стек:** [Что конкретно совпало, чего нет]
+• **Must-have стек:** [Что совпало, чего нет]
 • **Архитектурный вызов:** [Сравнение задач проекта]
 • **Проверка на аутстафф:** [Прямой заказчик или посредник]
 
@@ -542,7 +559,7 @@ async def handle_vacancy(message: Message):
 • **Холодный хук:** [1-2 предложения хук для первого контакта]
 ══════════════════════════════"""
 
-    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1600)
+    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1500)
     if not result_text:
         await safe_edit_status(status_msg, f"⚠️ Не удалось выполнить скоринг через Groq: {err}")
         return
@@ -594,8 +611,8 @@ async def main():
     logger.info("Инициализация сервиса...")
     threading.Thread(target=run_health_server, daemon=True).start()
 
-    # Получаем список доступных моделей Groq
-    await update_available_groq_models()
+    # Быстрый тест и автовыбор рабочей модели Groq
+    await find_working_groq_model()
 
     await init_telethon()
 
