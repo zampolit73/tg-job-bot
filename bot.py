@@ -52,7 +52,6 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
 CLEAN_QUERY_RE = re.compile(r'[^\w\s\+\#\.\-]')
 
-# Маркеры названий агентств
 KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
     "агентство", "selecty", "ancor", "анкор", "кадры", "outstaff", "аутстафф",
@@ -60,7 +59,6 @@ KNOWN_AGENCIES = (
     "ibs", "icl", "aston", "bell integrator", "neoflex", "epam", "reksoft", "andersen"
 )
 
-# Маркеры скрытого аутстаффа в тексте
 OUTSTAFF_TEXT_MARKERS = (
     "наш клиент", "нашего клиента", "клиент —", "клиент:", "для нашего партнера",
     "проект заказчика", "на стороне заказчика", "аутстафф", "outstaff",
@@ -123,10 +121,10 @@ async def safe_edit_status(msg: Message, text: str):
         pass
 
 
-# ----------------- GROQ CLIENT (СТАБИЛЬНЫЕ МОДЕЛИ) -----------------
+# ----------------- GROQ CLIENT (АКТУАЛЬНЫЕ МОДЕЛИ) -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool = False) -> tuple[str, str]:
-    # Только поддерживаемые и активные модели Groq
-    models = ("llama-3.1-8b-instant", "llama3-70b-8192")
+    # Актуальные стабильные модели Groq
+    models = ("llama-3.3-70b-versatile", "llama-3.1-8b-instant")
     last_err = ""
     for model_name in models:
         try:
@@ -141,14 +139,14 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
 
             res = await asyncio.wait_for(
                 groq_client.chat.completions.create(**kwargs),
-                timeout=10.0
+                timeout=12.0
             )
             content = res.choices[0].message.content
             if content and content.strip():
                 return content, ""
         except Exception as e:
             last_err = str(e)
-            logger.warning(f"Ошибка Groq на модели {model_name}: {e}. Пробуем следующую модель...")
+            logger.warning(f"Ошибка Groq на модели {model_name}: {e}. Переключение на резервную модель...")
             continue
     return "", last_err
 
@@ -371,7 +369,7 @@ async def handle_vacancy(message: Message):
 
     status_msg = await message.answer("⚡️ [1/4] Генерация 3 поисковых гипотез и извлечение сущностей...")
 
-    # Шаг 1: Groq формирует 3 поисковых дорка
+    # Шаг 1: Groq формирует поисковые дорки
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
 Разбери бриф и верни JSON со строгой структурой:
 {{
