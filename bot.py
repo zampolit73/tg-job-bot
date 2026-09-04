@@ -37,7 +37,7 @@ TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "")
 
 if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
-    logger.critical("Критические переменные окружения TELEGRAM_BOT_TOKEN или GROQ_API_KEY не заданы!")
+    logger.critical("TELEGRAM_BOT_TOKEN или GROQ_API_KEY не заданы!")
     raise ValueError("TELEGRAM_BOT_TOKEN и GROQ_API_KEY обязательны!")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -52,11 +52,20 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
 CLEAN_QUERY_RE = re.compile(r'[^\w\s\+\#\.\-]')
 
+# Маркеры названий агентств
 KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
     "агентство", "selecty", "ancor", "анкор", "кадры", "outstaff", "аутстафф",
     "personnel", "talent", "staff", "headhunting", "подбор персонала",
     "ibs", "icl", "aston", "bell integrator", "neoflex", "epam", "reksoft", "andersen"
+)
+
+# Маркеры скрытого аутстаффа/посредничества в теле вакансии
+OUTSTAFF_TEXT_MARKERS = (
+    "наш клиент", "нашего клиента", "клиент —", "клиент:", "для нашего партнера",
+    "проект заказчика", "на стороне заказчика", "аутстафф", "outstaff",
+    "предоставление персонала", "аккредитованная it-компания ищет для",
+    "в интересах компании"
 )
 
 TARGET_TG_CHANNELS = [
@@ -66,7 +75,7 @@ TARGET_TG_CHANNELS = [
 
 google_quota_exhausted = False
 
-# ----------------- HEALTH SERVER ДЛЯ RENDER -----------------
+# ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -90,9 +99,15 @@ def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
 
-def is_agency(company_name: str) -> bool:
+def is_agency(company_name: str, text: str = "") -> bool:
     lower_name = company_name.lower()
-    return any(w in lower_name for w in KNOWN_AGENCIES)
+    if any(w in lower_name for w in KNOWN_AGENCIES):
+        return True
+    if text:
+        lower_text = text.lower()
+        if any(marker in lower_text for marker in OUTSTAFF_TEXT_MARKERS):
+            return True
+    return False
 
 
 def build_lead_osint_url(company_name: str, target_role: str = "CTO") -> str:
@@ -136,8 +151,46 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", last_err
 
 
+# ----------------- FULL PAGE HYDRATION (ВЫКАЧКА СТРАНИЦ) -----------------
+async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
+    url = job.get("url", "")
+    if not url or "t.me" in url:
+        return job
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+
+    try:
+        r = await client.get(url, headers=headers, timeout=2.5)
+        if r.status_code == 200:
+            text = clean_html(r.text)
+            # Извлекаем плотный информационный блок (1 500 символов)
+            clean_snippet = " ".join(text.split()[:300])
+            if len(clean_snippet) > 200:
+                job["desc"] = clean_snippet
+                # Повторная проверка на скрытый аутстафф в полном теле страницы
+                if is_agency(job["company"], clean_snippet):
+                    job["is_agency"] = True
+    except Exception:
+        pass
+    return job
+
+
+async def hydrate_all_vacancies(client: httpx.AsyncClient, vacancies: list) -> list:
+    """Параллельная подгрузка полных страниц для ТОП-6 кандидатов"""
+    tasks = [hydrate_single_vacancy(client, v) for v in vacancies[:6]]
+    hydrated = await asyncio.gather(*tasks, return_exceptions=True)
+    clean_list = []
+    for item in hydrated:
+        if isinstance(item, dict) and not item.get("is_agency", False):
+            clean_list.append(item)
+    return clean_list
+
+
 # ----------------- ИСТОЧНИКИ ПОИСКА -----------------
-async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 6) -> list:
+async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
     global google_quota_exhausted
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or google_quota_exhausted:
         return []
@@ -155,7 +208,7 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
     try:
         r = await client.get(url, params=params, timeout=3.0)
         if r.status_code in (429, 403):
-            logger.warning("Квота Google CSE исчерпана (429/403). Переключение на автономный режим.")
+            logger.warning("Квота Google CSE исчерпана (429/403).")
             google_quota_exhausted = True
             return []
         if r.status_code != 200:
@@ -171,11 +224,11 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
             company_match = re.search(r"(?:в компании|—)\s+([^|\-—\(\)]+)", title, re.IGNORECASE)
             company = company_match.group(1).strip() if company_match else "Прямой работодатель"
 
-            if is_agency(company):
+            if is_agency(company, snippet):
                 continue
 
             jobs.append({
-                "source": "Google X-Ray",
+                "source": "Google Search",
                 "title": title[:70],
                 "company": company,
                 "salary": "в описании",
@@ -199,53 +252,23 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 8) -> l
         jobs = []
         for item in r.json().get("list", []):
             company = item.get("company", {}).get("title", "Не указана")
-            if is_agency(company):
-                continue
             sal = item.get("salary", {})
             sal_str = sal.get("formatted") if sal and sal.get("formatted") else "не указана"
             href = item.get("href", "")
             full_url = f"https://career.habr.com{href}" if href.startswith("/") else href
             skills = ", ".join([s.get("title", "") for s in item.get("skills", [])])
+            desc_text = f"Стек: {skills}"
+
+            if is_agency(company, desc_text):
+                continue
+
             jobs.append({
                 "source": "Хабр Карьера",
                 "title": item.get("title", ""),
                 "company": company,
                 "salary": sal_str,
                 "url": full_url,
-                "desc": f"Стек: {skills}",
-            })
-        return jobs
-    except Exception:
-        return []
-
-
-async def fetch_trudvsem(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
-    clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
-    url = "http://opendata.trudvsem.ru/api/v1/vacancies"
-    params = {"text": clean_q, "limit": count}
-    try:
-        r = await client.get(url, params=params, timeout=2.5)
-        if r.status_code != 200:
-            return []
-        vacancies = r.json().get("results", {}).get("vacancies", [])
-        jobs = []
-        for v in vacancies:
-            vac = v.get("vacancy", {})
-            company = vac.get("company", {}).get("name", "Не указана")
-            if is_agency(company):
-                continue
-            sal_min = vac.get("salary_min", 0)
-            sal_max = vac.get("salary_max", 0)
-            sal_str = f"{sal_min} - {sal_max} руб." if (sal_min or sal_max) else "не указана"
-            duty = clean_html(vac.get("duty", ""))
-            requirement = clean_html(vac.get("requirement", {}).get("qualification", ""))
-            jobs.append({
-                "source": "Работа России",
-                "title": vac.get("job-name", ""),
-                "company": company,
-                "salary": sal_str,
-                "url": vac.get("vac_url", "https://trudvsem.ru"),
-                "desc": f"{requirement} {duty}"[:350]
+                "desc": desc_text,
             })
         return jobs
     except Exception:
@@ -269,12 +292,14 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 5) 
         jobs = []
         for item in r.json().get("objects", []):
             company = item.get("client", {}).get("title", "Не указана")
-            if is_agency(company):
-                continue
             p_from, p_to = item.get("payment_from", 0), item.get("payment_to", 0)
             cur = item.get("currency", "")
             sal_str = f"{p_from if p_from else ''} - {p_to if p_to else ''} {cur}".strip() if (p_from or p_to) else "не указана"
             desc = clean_html(item.get("candidat", "") or item.get("work", ""))
+
+            if is_agency(company, desc):
+                continue
+
             jobs.append({
                 "source": "SuperJob",
                 "title": item.get("profession", ""),
@@ -297,6 +322,10 @@ async def _scan_single_channel(channel: str, search_term: str) -> list:
                 post_url = f"https://t.me/{channel}/{message.id}"
                 company_match = re.search(r"(?:компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
                 company = company_match.group(1).strip() if company_match else f"@{channel}"
+
+                if is_agency(company, post_text):
+                    continue
+
                 results.append({
                     "source": f"Telegram (@{channel})",
                     "title": post_text[:40] + "...",
@@ -324,13 +353,13 @@ async def search_telegram_native(search_term: str) -> list:
         return []
 
 
-# ----------------- ХЭНДЛЕРЫ AIOGRAM -----------------
+# ----------------- ХЭНДЛЕРЫ -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    logger.info(f"Команда /start от пользователя {message.from_user.id}")
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф вакансии. Бот выполнит деанонимизацию прямого заказчика с матричным скорингом.",
+        "💼 **Multi-Source OSINT Lead Hunter (Hydration & Dork Engine)**\n\n"
+        "Отправьте бриф. Бот формирует 3 поисковых дорка, опрашивает джоб-борды и ATS-системы, "
+        "выкачивает полные тексты страниц и проводит жесткий скоринг.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -339,26 +368,27 @@ async def cmd_start(message: Message):
 async def handle_vacancy(message: Message):
     global google_quota_exhausted
     user_text = message.text
-    logger.info(f"Получен бриф ({len(user_text)} симв.) от {message.from_user.id}")
+    logger.info(f"Получен бриф ({len(user_text)} симв.)")
 
-    status_msg = await message.answer("⚡️ [1/3] Извлечение сущностей проекта...")
+    status_msg = await message.answer("⚡️ [1/4] Генерация 3 поисковых гипотез и извлечение сущностей...")
 
-    # Шаг 1: Groq Entity Extraction
+    # Шаг 1: Groq формирует 3 разных дорка для поиска
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
-Разбери бриф на сущности и верни JSON:
+Разбери бриф и верни JSON со строгой структурой:
 {{
-  "role": "название позиции",
-  "domain": "домен (Fintech, E-commerce, Retail или Общий)",
-  "infra_type": "тип среды (OnPrem, Cloud, Bare-metal или Не указан)",
-  "must_have": ["список", "редких", "технологий"],
-  "core_challenge": "главная задача (1 предложение)",
-  "google_query": "3-4 ключевых слова (роль + 2 технологии)",
-  "ngram_phrase": "дословная фраза из 3-4 слов из обязанностей"
+  "role": "название роли",
+  "domain": "домен (Fintech, E-commerce, GameDev или Общий)",
+  "infra_type": "тип среды (OnPrem, Cloud или Не указан)",
+  "must_have": ["список", "только", "редких", "технологий"],
+  "core_challenge": "главная проектная задача (1 предложение)",
+  "dork_exact_quote": "дословная фраза из 3-5 слов из блока обязанностей (без кавычек)",
+  "dork_tech_cluster": "роль + 2 редкие технологии для общего поиска",
+  "dork_ats_search": "название ключевого редкого фреймворка или термина для поиска по ATS"
 }}
 БРИФ:
 \"\"\"{user_text[:900]}\"\"\""""
 
-    extract_raw, _ = await call_groq_async(prompt_extract, max_tokens=300, json_mode=True)
+    extract_raw, _ = await call_groq_async(prompt_extract, max_tokens=350, json_mode=True)
     try:
         brief_profile = json.loads(extract_raw)
     except Exception:
@@ -368,47 +398,60 @@ async def handle_vacancy(message: Message):
             "infra_type": "Не указан",
             "must_have": [],
             "core_challenge": "Разработка сервисов",
-            "google_query": " ".join(user_text.split()[:3]),
-            "ngram_phrase": ""
+            "dork_exact_quote": "",
+            "dork_tech_cluster": " ".join(user_text.split()[:3]),
+            "dork_ats_search": "Frontend"
         }
 
-    role_query = brief_profile.get("role", "Разработчик")
-    google_q = brief_profile.get("google_query", "Frontend Angular")
     rare_techs = brief_profile.get("must_have", [])
-    rare_term = rare_techs[0] if rare_techs else "Angular"
-    ngram_phrase = brief_profile.get("ngram_phrase", "")
+    primary_tech = rare_techs[0] if rare_techs else brief_profile.get("dork_ats_search", "Backend")
+    exact_quote = brief_profile.get("dork_exact_quote", "")
+    cluster_query = brief_profile.get("dork_tech_cluster", primary_tech)
 
-    mode_info = "Хабр, SuperJob, Работа России, TG" if google_quota_exhausted else "Google CSE, Хабр, SuperJob, TG"
-    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск кандидатов через [{mode_info}]...")
+    await safe_edit_status(status_msg, "🔍 [2/4] Запуск 3 поисковых волн (Google X-Ray, Хабр, ATS, SuperJob, TG)...")
 
-    # Шаг 2: Параллельный опрос источников
+    # Шаг 2: Параллельный опрос источников по каскадным доркам
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
-            fetch_habr(http_client, rare_term, 6),
-            fetch_trudvsem(http_client, role_query, 5),
-            fetch_superjob(http_client, rare_term, 5),
-            search_telegram_native(rare_term),
+            fetch_habr(http_client, primary_tech, 6),
+            fetch_superjob(http_client, primary_tech, 5),
+            search_telegram_native(primary_tech),
         ]
 
         if not google_quota_exhausted and GOOGLE_API_KEY:
-            tasks.append(search_google_custom(http_client, google_q, count=6))
-            if len(ngram_phrase.split()) >= 3:
-                tasks.append(search_google_custom(http_client, f'"{ngram_phrase}"', count=3))
+            # Волна 1: Точная N-грамма обязанностей в кавычках
+            if len(exact_quote.split()) >= 3:
+                tasks.append(search_google_custom(http_client, f'"{exact_quote}"', count=3))
+
+            # Волна 2: Технический кластер
+            tasks.append(search_google_custom(http_client, cluster_query, count=5))
+
+            # Волна 3: Поиск прямо по ATS-системам (Huntflow / Potok)
+            ats_query = f"(site:huntflow.io OR site:potok.io) {primary_tech} {brief_profile.get('role', '')}"
+            tasks.append(search_google_custom(http_client, ats_query, count=4))
 
         try:
             raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.5)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception as e:
-            logger.error(f"Ошибка при поиске вакансий: {e}")
+            logger.error(f"Ошибка при поиске: {e}")
             valid_results = []
 
-    unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
+        unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
-    if not unique_vacancies:
-        await safe_edit_status(status_msg, "❌ Вакансии не найдены в открытых базах. Попробуйте передать более развернутый бриф.")
-        return
+        if not unique_vacancies:
+            await safe_edit_status(status_msg, "❌ Совпадений не найдено. Попробуйте передать бриф с более конкретным техническим описанием.")
+            return
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:8])} кандидатов в Groq LPU...")
+        # Шаг 3: Полнотекстовая гидратация страниц (выкачиваем полное тело страниц)
+        await safe_edit_status(status_msg, f"🌐 [3/4] Выкачка полных страниц {len(unique_vacancies[:6])} кандидатов (Full Body Extraction)...")
+        hydrated_vacancies = await hydrate_all_vacancies(http_client, unique_vacancies)
+
+    if not hydrated_vacancies:
+        hydrated_vacancies = unique_vacancies[:6]
+
+    # Шаг 4: Матричный скоринг через Groq
+    await safe_edit_status(status_msg, f"🧠 [4/4] Матричный аудит {len(hydrated_vacancies[:6])} кандидатов через Groq LPU...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -416,51 +459,51 @@ async def handle_vacancy(message: Message):
         f"Должность: {v['title']}\n"
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
-        f"Описание: {v['desc']}\n"
-        for idx, v in enumerate(unique_vacancies[:8], 1)
+        f"Полный текст вакансии: {v['desc']}\n"
+        for idx, v in enumerate(hydrated_vacancies[:6], 1)
     ]
     candidates_payload = "\n".join(compact_candidates)
 
-    # Шаг 3: Матричный скоринг
-    prompt_matrix = f"""Ты — беспощадный OSINT-аудитор. Отсей ложные совпадения и найди оригинального заказчика.
+    prompt_matrix = f"""Ты — беспощадный OSINT-аудитор. Отсей кадровых посредников и найди истинного прямого заказчика.
 
-ЭТАЛОННЫЙ ПРОФИЛЬ:
+ЭТАЛОННЫЙ ПРОФИЛЬ ПРОЕКТА:
 {json.dumps(brief_profile, ensure_ascii=False, indent=2)}
 
-СПИСОК ВАКАНСИЙ:
+СПИСОК ВАКАНСИЙ (С ПОЛНЫМ ТЕКСТОМ):
 {candidates_payload}
 
-ПРАВИЛА:
+ПРАВИЛА ОЦЕНКИ:
 1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР <= 35%):
-   - Разные архитектуры или фреймворки.
-   - Не совпал must_have стек.
-2. ВЕСА:
-   - [40%] Архитектурный вызов ('core_challenge').
-   - [35%] Полнота must_have стека.
-   - [25%] Специфика среды и домен.
-3. Дословная цитата задач в описании дает 95-99%.
+   - Если кандидат является аутстафф/рекрутинг-посредником (фразы 'наш партнер', 'клиент' и т.д.).
+   - Не совпал стек фреймворков или инфраструктура.
+2. ВЕСА ДЛЯ НАЧИСЛЕНИЯ БАЛЛОВ:
+   - [45%] Архитектурный вызов ('core_challenge') и схожесть реальных проектных задач.
+   - [35%] Покрытие редкого стека ('must_have').
+   - [20%] Домен бизнеса.
+3. Если совпала дословная цитата обязанностей — вероятность 95-99%.
 
 Выведи ТОП-3 кандидатов по шаблону:
 ══════════════════════════════
-🏢 **КОМПАНИЯ:** [Название компании или канал]
+🏢 **КОМПАНИЯ:** [Название прямого заказчика или канал]
 🎯 **Матричный скор:** [XX]%
 🎲 **Статус деанонимизации:** [🟢 Точный оригинал (85-99%) / 🟡 Высокая вероятность (60-84%) / 🟠 Слабое сходство (30-59%)]
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник](URL)
-🏛 **Источник:** [Google / Хабр / Работа России / SuperJob / Telegram]
+🏛 **Источник:** [Google ATS / Google X-Ray / Хабр / SuperJob / Telegram]
 
 ⚖️ **Аудит по матрице:**
-• **Must-have стек:** [Что совпало, чего не хватает]
-• **Архитектурный вызов:** [Реальная проектная задача]
+• **Must-have стек:** [Что конкретно совпало, чего нет]
+• **Архитектурный вызов:** [Сравнение реальных задач проекта]
+• **Проверка на аутстафф:** [Прямой заказчик или посредник]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Роль ЛПР: CTO, Lead, Head of Eng]
+• **К кому идти:** [Роль ЛПР: CTO, Lead Frontend, Head of Engineering]
 • **Болевая точка:** [Главная боль проекта]
 • **Холодный хук:** [1-2 предложения хук для первого контакта]
 ══════════════════════════════"""
 
-    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1500)
+    result_text, err = await call_groq_async(prompt_matrix, max_tokens=1600)
     if not result_text:
         await safe_edit_status(status_msg, f"⚠️ Ошибка обработки: {err}")
         return
@@ -478,8 +521,8 @@ async def handle_vacancy(message: Message):
         else:
             enhanced_lines.append(line)
 
-    fallback_badge = "\nℹ️ *Режим работы: Открытые API (квота Google исчерпана)*\n" if google_quota_exhausted else ""
-    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
+    fallback_badge = "\nℹ️ *Режим: Открытые API (квота Google исчерпана)*\n" if google_quota_exhausted else ""
+    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ (FULL BODY HYDRATED)**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
         parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
@@ -490,41 +533,35 @@ async def handle_vacancy(message: Message):
         await safe_edit_status(status_msg, final_output)
 
 
-# ----------------- БЕЗОПАСНЫЙ ЗАПУСК -----------------
+# ----------------- СТАРТ ПРИЛОЖЕНИЯ -----------------
 async def init_telethon():
-    """Подключение Telethon без зависания в консоли при отсутствии сессии"""
     global telethon_client
     if not telethon_client:
-        logger.info("Telethon: Ключи не заданы в Environment, клиент пропущен.")
+        logger.info("Telethon: Ключи не заданы, пропуск.")
         return
     try:
         await asyncio.wait_for(telethon_client.connect(), timeout=4.0)
         if not await telethon_client.is_user_authorized():
-            logger.warning("Telethon: Строка сессии не авторизована. Фоновый мониторинг каналов отключен.")
+            logger.warning("Telethon: Сессия не авторизована, мониторинг отключен.")
             telethon_client = None
         else:
-            logger.info("Telethon: Клиент успешно подключен и авторизован!")
+            logger.info("Telethon успешно авторизован.")
     except Exception as e:
-        logger.warning(f"Telethon пропущен из-за ошибки подключения: {e}")
+        logger.warning(f"Telethon ошибка: {e}")
         telethon_client = None
 
 
 async def main():
     logger.info("Инициализация сервиса...")
-    # 1. Health check сервер для Render
     threading.Thread(target=run_health_server, daemon=True).start()
-
-    # 2. Неблокирующий старт Telethon
     await init_telethon()
 
-    # 3. Безопасный сброс вебхука
     try:
         await asyncio.wait_for(bot.delete_webhook(drop_pending_updates=True), timeout=4.0)
-        logger.info("Webhook сброшен, старые апдейты очищены.")
+        logger.info("Webhook сброшен.")
     except Exception as e:
-        logger.warning(f"Предупреждение при delete_webhook: {e}")
+        logger.warning(f"Предупреждение delete_webhook: {e}")
 
-    # 4. Запуск поллинга
     logger.info(">>> Запуск polling aiogram. Бот слушает сообщения! <<<")
     await dp.start_polling(bot)
 
