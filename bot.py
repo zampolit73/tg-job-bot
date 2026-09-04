@@ -7,13 +7,14 @@ import sys
 import threading
 from urllib.parse import quote_plus
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import asyncpg
 import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from groq import AsyncGroq
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.tl.types import User
 from telethon.sessions import StringSession
 
@@ -28,9 +29,7 @@ logger = logging.getLogger("OSINT_Matcher")
 # ----------------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-SUPERJOB_KEY = os.getenv("SUPERJOB_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "10092ea56d2504c84")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
@@ -46,6 +45,7 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 
 ACTIVE_GROQ_MODEL = None
 BOT_USER_ID = None
+db_pool = None
 
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
@@ -66,8 +66,6 @@ OUTSTAFF_TEXT_MARKERS = (
     "проект заказчика", "на стороне заказчика", "аутстафф", "outstaff"
 )
 
-google_quota_exhausted = False
-
 # ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -85,6 +83,69 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     logger.info(f"Health check сервер запущен на порту {port}")
     server.serve_forever()
+
+
+# ----------------- РАБОТА С SUPABASE (POSTGRESQL) -----------------
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL не задан, работа с БД отключена.")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, timeout=10.0)
+        logger.info("Подключение к Supabase PostgreSQL успешно установлено!")
+    except Exception as e:
+        logger.error(f"Не удалось подключиться к Supabase: {e}")
+        db_pool = None
+
+
+async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: str, url: str):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO vacancies (chat_title, message_id, chat_id, post_text, post_url)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (chat_id, message_id) DO NOTHING;
+            """, chat_title, msg_id, chat_id, text, url)
+    except Exception as e:
+        logger.debug(f"Ошибка сохранения вакансии в БД: {e}")
+
+
+async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
+    if not db_pool or not terms:
+        return []
+    results = []
+    try:
+        # Ищем по ключевым терминам через ILIKE
+        like_clauses = " OR ".join([f"post_text ILIKE ${i+1}" for i in range(len(terms))])
+        params = [f"%{t}%" for t in terms]
+        query = f"""
+            SELECT chat_title, post_text, post_url 
+            FROM vacancies 
+            WHERE {like_clauses} 
+            ORDER BY id DESC LIMIT 10;
+        """
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(query, *params)
+            for row in rows:
+                p_text = row['post_text']
+                overlap = calculate_overlap_score(raw_brief, p_text)
+                company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", p_text, re.IGNORECASE)
+                company = company_match.group(1).strip() if company_match else row['chat_title']
+                results.append({
+                    "source": f"Supabase: {row['chat_title'][:25]}",
+                    "title": f"Пост в {row['chat_title'][:25]}",
+                    "company": company,
+                    "salary": "в тексте",
+                    "url": row['post_url'],
+                    "desc": p_text[:300],
+                    "overlap": overlap
+                })
+    except Exception as e:
+        logger.warning(f"Ошибка поиска в Supabase: {e}")
+    return results
 
 
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
@@ -214,11 +275,9 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- БЫСТРЫЙ ПОИСК ТОЛЬКО ПО ГРУППАМ И КАНАЛАМ -----------------
+# ----------------- БЫСТРЫЙ ОНЛАЙН-ПОИСК ПО TELEGRAM -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
-    """Глобальный поиск: ИГНОРИРУЮТСЯ ЛИЧНЫЕ СООБЩЕНИЯ 1 НА 1"""
     if not telethon_client or not telethon_client.is_connected():
-        logger.warning("Telethon не подключен к Telegram.")
         return []
 
     found_posts = []
@@ -230,22 +289,21 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
             continue
 
         try:
-            logger.info(f"Поиск в рабочих группах/каналах по маркеру: '{clean_t}'...")
-            async for message in telethon_client.iter_messages(None, search=clean_t, limit=15):
+            logger.info(f"Поиск в группах/каналах по маркеру: '{clean_t}'...")
+            async for message in telethon_client.iter_messages(None, search=clean_t, limit=12):
                 if not message.text or len(message.text) < 40:
                     continue
 
-                # Исключаем диалог с самим ботом
                 if message.chat_id == bot_id:
                     continue
 
                 chat = await message.get_chat()
 
-                # СТРОГАЯ ЗАЩИТА ПРИВАТНОСТИ: ИГНОРИРУЕМ ЛИЧНЫЕ ДИАЛОГИ (1 НА 1)
+                # Игнорируем ЛИЧНЫЕ ДИАЛОГИ (1 на 1)
                 if isinstance(chat, User) or getattr(chat, 'is_user', False):
                     continue
 
-                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Channel/Group'))
+                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Channel'))
 
                 if "matcher" in chat_title.lower() or "bot" in chat_title.lower():
                     continue
@@ -263,6 +321,9 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                 else:
                     clean_id = str(chat.id).replace("-100", "")
                     msg_url = f"https://t.me/c/{clean_id}/{message.id}"
+
+                # Автоматически сохраняем найденный пост в Supabase
+                asyncio.create_task(save_vacancy_to_db(chat_title, message.id, message.chat_id, post_text, msg_url))
 
                 company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
                 company = company_match.group(1).strip() if company_match else chat_title
@@ -283,7 +344,7 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
     return found_posts[:4]
 
 
-# ----------------- ВНЕШНИЕ ИСТОЧНИКИ -----------------
+# ----------------- ХАБР КАРЬЕРА -----------------
 async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
@@ -320,40 +381,61 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
         return []
 
 
+# ----------------- ФОНОВЫЙ LISTENER ТЕЛЕГРАМА В SUPABASE -----------------
+def register_telethon_listener():
+    if not telethon_client:
+        return
+
+    @telethon_client.on(events.NewMessage)
+    async def handler_new_message(event):
+        try:
+            # Игнорируем приватные диалоги 1 на 1
+            if event.is_private or not event.text or len(event.text) < 40:
+                return
+
+            text_lower = event.text.lower()
+            # Фильтр ключевых слов вакансий
+            if any(k in text_lower for k in ("вакансия", "ищем", "senior", "middle", "lead", "remote", "developer", "инженер")):
+                chat = await event.get_chat()
+                chat_title = getattr(chat, 'title', 'TG Группа')
+                clean_id = str(chat.id).replace("-100", "")
+                url = f"https://t.me/c/{clean_id}/{event.id}" if not getattr(chat, 'username', None) else f"https://t.me/{chat.username}/{event.id}"
+                await save_vacancy_to_db(chat_title, event.id, chat.id, clean_html(event.text), url)
+        except Exception:
+            pass
+
+
 # ----------------- ХЭНДЛЕРЫ AIOGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 Multi-Source OSINT Lead Hunter\n\n"
-        "Отправьте бриф вакансии. Бот выполнит сквозной поиск по рабочим Telegram-группам/каналам "
-        "и карьерным площадкам (личные переписки исключены).",
+        "💼 Multi-Source OSINT Lead Hunter (с базой Supabase)\n\n"
+        "Отправьте бриф вакансии. Бот выполнит моментальный поиск по облачной базе вакансий, "
+        "вашим группам в Telegram и внешним источникам.",
         parse_mode=None
     )
 
 
 @dp.message(F.text == "/debug_tg")
 async def cmd_debug(message: Message):
-    if not telethon_client:
-        await message.answer("❌ Telethon не инициализирован.", parse_mode=None)
-        return
-    if not telethon_client.is_connected():
-        await message.answer("⚠️ Telethon не подключен к сети Telegram.", parse_mode=None)
+    db_status = "✅ Подключена" if db_pool else "❌ Не подключена"
+    if not telethon_client or not telethon_client.is_connected():
+        await message.answer(f"База данных: {db_status}\nTelethon: ⚠️ Не подключен к Telegram.", parse_mode=None)
         return
     try:
         me = await telethon_client.get_me()
         dialogs = await telethon_client.get_dialogs(limit=12)
-        # Показываем только группы и каналы
         group_lines = [f"- {d.name}" for d in dialogs if (d.is_group or d.is_channel)][:6]
         chats_list = "\n".join(group_lines) if group_lines else "Группы не найдены"
         response = (
-            f"✅ Telethon активен!\n"
-            f"Аккаунт: {me.first_name} (@{me.username})\n"
-            f"Доступные группы и каналы:\n{chats_list}\n\n"
-            f"🔒 Защита приватности: Личные сообщения (DM) исключены из поиска."
+            f"🗄 База данных Supabase: {db_status}\n"
+            f"👤 Telethon аккаунт: {me.first_name} (@{me.username})\n"
+            f"📂 Доступные группы и каналы:\n{chats_list}\n\n"
+            f"🔒 Защита приватности: Личные переписки (1 на 1) исключены."
         )
         await message.answer(response, parse_mode=None)
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка Telethon: {e}", parse_mode=None)
+        await message.answer(f"⚠️ Ошибка: {e}", parse_mode=None)
 
 
 @dp.message(F.text)
@@ -385,8 +467,12 @@ async def handle_vacancy(message: Message):
 
     search_terms = detected_markers[:3]
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск в рабочих Telegram-группах по {search_terms}...")
+    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск в Supabase и рабочих группах по {search_terms}...")
 
+    # 1. Сначала мгновенный поиск по локальной базе Supabase
+    db_results = await search_vacancies_in_db(search_terms, user_text)
+
+    # 2. Параллельный поиск по внешним источникам и активным чатам Telegram
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
@@ -400,10 +486,11 @@ async def handle_vacancy(message: Message):
             logger.error(f"Ошибка поиска: {e}")
             valid_results = []
 
-        unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
+        all_results = db_results + valid_results
+        unique_vacancies = list({v["url"]: v for v in all_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений в рабочих группах и каналах не найдено.")
+            await safe_edit_status(status_msg, "❌ Совпадений в базе и рабочих группах не найдено.")
             return
 
     await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:3])} кандидатов...")
@@ -421,7 +508,7 @@ async def handle_vacancy(message: Message):
     ]
 
     prompt_matrix = f"""Ты — senior технический рекрутер. Сравни кандидатов с брифом.
-Верни ТОЛЬКО валидный JSON со списком проверенных кандидатов. Никакого лишнего текста, без дефисов и черточек.
+Верни ТОЛЬКО валидный JSON со списком проверенных кандидатов. Никакого лишнего текста.
 
 БРИФ:
 {user_text[:350]}
@@ -541,12 +628,13 @@ async def init_telethon():
     if not telethon_client:
         return
     try:
-        await asyncio.wait_for(telethon_client.connect(), timeout=3.5)
+        await asyncio.wait_for(telethon_client.connect(), timeout=4.0)
         if not await telethon_client.is_user_authorized():
             logger.warning("Telethon не авторизован.")
             telethon_client = None
         else:
-            logger.info("Telethon успешно авторизован! Поиск по группам активен.")
+            logger.info("Telethon успешно авторизован! Регистрация фонового слушателя...")
+            register_telethon_listener()
     except Exception as e:
         logger.warning(f"Telethon пропущен: {e}")
         telethon_client = None
@@ -555,6 +643,7 @@ async def init_telethon():
 async def main():
     logger.info("Инициализация сервиса...")
     threading.Thread(target=run_health_server, daemon=True).start()
+    await init_db()
     await find_working_groq_model()
     await init_telethon()
 
