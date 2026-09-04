@@ -373,25 +373,25 @@ async def find_working_groq_model() -> str:
     return ACTIVE_GROQ_MODEL
 
 
-async def call_groq_async(prompt: str, max_tokens: int = 1800, json_mode: bool = False) -> tuple[str, str]:
+async def call_groq_async(prompt: str, max_tokens: int = 2200, json_mode: bool = False) -> tuple[str, str]:
     global ACTIVE_GROQ_MODEL
     if not ACTIVE_GROQ_MODEL:
         await find_working_groq_model()
 
-    safe_prompt = prompt if len(prompt) < 7000 else prompt[:7000]
+    safe_prompt = prompt if len(prompt) < 8000 else prompt[:8000]
     kwargs = {
         "model": ACTIVE_GROQ_MODEL,
         "messages": [{"role": "user", "content": safe_prompt}],
         "temperature": 0.2,
-        "presence_penalty": 0.3,
-        "frequency_penalty": 0.3,
+        "presence_penalty": 0.2,
+        "frequency_penalty": 0.2,
         "max_tokens": max_tokens,
     }
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
     try:
-        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=14.0)
+        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=15.0)
         content = res.choices[0].message.content
         if content and content.strip():
             return content, ""
@@ -399,7 +399,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1800, json_mode: bool =
         err_msg = str(e)
         if "413" in err_msg or "too large" in err_msg.lower():
             try:
-                kwargs["messages"] = [{"role": "user", "content": safe_prompt[:3500]}]
+                kwargs["messages"] = [{"role": "user", "content": safe_prompt[:4000]}]
                 res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=8.0)
                 return res.choices[0].message.content, ""
             except Exception as e2:
@@ -645,12 +645,12 @@ def register_telethon_listener():
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф или описание вакансии — бот выполнит поиск по выбранным папкам, "
-        "базе Supabase и внешним источникам, выдаст до 5 вариантов по убыванию соответствия "
-        "и попытается сдеанонить конечного заказчика для лидирующей позиции.\n\n"
+        "Отправьте бриф или описание вакансии — бот проведет поиск по Telegram-папкам, "
+        "базе Supabase и внешним IT-платформам, отсортирует до 5 совпадений по релевантности, "
+        "деанонимизирует конечного клиента для лидера и подготовит полноценную стратегию выхода.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
-        "• /debug_tg — статус базы и папок",
+        "• /debug_tg — статус базы и выбранных папок",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -754,7 +754,7 @@ async def handle_vacancy(message: Message):
     # 1. Поиск по базе Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Параллельный сбор по всем источникам
+    # 2. Параллельный сбор по всем платформам
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
@@ -778,10 +778,9 @@ async def handle_vacancy(message: Message):
             await safe_edit_status(status_msg, "❌ Совпадений по источникам не найдено.")
             return
 
-    # Берем до 8 сырых кандидатов на вход модели
     candidates_pool = unique_vacancies[:8]
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(candidates_pool)} лидов и OSINT-анализ...")
+    await safe_edit_status(status_msg, f"🧠 [3/3] Анализ стека, деанонимизация клиента и расчет стратегии...")
 
     compact_candidates = [
         {
@@ -795,9 +794,17 @@ async def handle_vacancy(message: Message):
         for idx, v in enumerate(candidates_pool, 1)
     ]
 
-    prompt_matrix = f"""Ты — Senior IT-Sales и детектив OSINT по закрытым вакансиям. Оцени кандидатов на соответствие брифу.
-Верни ТОЛЬКО валидный JSON со списком проверенных позиций (выдай до 5 позиций).
-ОБЯЗАТЕЛЬНО: для кандидата с самым высоким скором (топ-1) сделай предположение, кто может быть реальным конечным клиентом/заказчиком позиции (укажи сферу или конкретные компании типа Яндекс, Сбер, X5, Ростелеком, промышленный холдинг и т.д. на основе формулировок задач и стека) в поле "end_client_guess".
+    prompt_matrix = f"""Ты — Senior IT-Sales и детектив OSINT по закрытым IT-вакансиям.
+Сравни кандидатов с брифом и верни валидный JSON со списком до 5 позиций.
+
+ДЛЯ КАНДИДАТА С САМЫМ ВЫСОКИМ СКОРОМ (#1):
+1. В поле "end_client_name" укажи конкретную вероятную компанию (Сбер, Яндекс, Ростелеком, X5, Лукойл, СИБУР, Т-Банк, крупный FinTech/Enterprise холдинг).
+2. В поле "end_client_reason" дай четкое обоснование из 2-3 предложений, ПОЧЕМУ это они (на основе стека, закрытого on-premise контура, формулировок задач и масштаба).
+3. В полях стратегии ("strategy_lpr", "strategy_pain", "strategy_value", "strategy_hook") распиши ПОЛНУЮ стратегию продажи:
+   - strategy_lpr: конкретная должность ЛПР и второй контакт для обхода секретарей.
+   - strategy_pain: детальная бизнес-боль (нехватка рук, срыв TTM, дороговизна инхаус найма).
+   - strategy_value: точный оффер нашего агентства/аутстаффа (готовая команда, быстрый старт за 3 дня, проверенный стек).
+   - strategy_hook: готовое холодное сообщение для отправки в Telegram/LinkedIn от лица сейлза (вежливое, бьющее в боль, без воды).
 
 БРИФ:
 {user_text[:450]}
@@ -805,7 +812,7 @@ async def handle_vacancy(message: Message):
 КАНДИДАТЫ:
 {json.dumps(compact_candidates, ensure_ascii=False)}
 
-Формат ответа:
+Формат JSON ответа:
 {{
   "results": [
     {{
@@ -814,18 +821,20 @@ async def handle_vacancy(message: Message):
       "role": "Точная позиция",
       "salary": "Вилка или Не указана",
       "url": "ссылка",
-      "source": "Точное название источника",
+      "source": "Точный источник",
       "stack_match": "совпадение по технологиям",
-      "challenge_match": "основные задачи",
-      "target_lpr": "Роль ЛПР (CTO, Lead DevOps)",
-      "pain_point": "ключевая проблема проекта",
-      "hook": "точный хук для первого сообщения",
-      "end_client_guess": "Только для топ-1: Название или профиль конечного заказчика + почему"
+      "challenge_match": "ключевые задачи",
+      "end_client_name": "Только для топ-1: Название или тип заказчика",
+      "end_client_reason": "Только для топ-1: Обоснование почему это они",
+      "strategy_lpr": "Роль ЛПР и дублера",
+      "strategy_pain": "Подробная боль заказчика",
+      "strategy_value": "Ценностное предложение",
+      "strategy_hook": "Готовый холодный питч"
     }}
   ]
 }}"""
 
-    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=1800, json_mode=True)
+    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=2200, json_mode=True)
     parsed_candidates = []
 
     try:
@@ -836,7 +845,7 @@ async def handle_vacancy(message: Message):
 
     if not parsed_candidates:
         for idx, v in enumerate(candidates_pool[:5], 1):
-            score = 90 if v.get("overlap", 0) > 20 else max(40, 85 - idx * 10)
+            score = 92 if v.get("overlap", 0) > 20 else max(40, 85 - idx * 10)
             parsed_candidates.append({
                 "company": v["company"],
                 "score": score,
@@ -846,17 +855,19 @@ async def handle_vacancy(message: Message):
                 "source": v["source"],
                 "stack_match": f"Текстовый overlap: {v.get('overlap', 0)}%",
                 "challenge_match": "Совпадение по стеку технологий",
-                "target_lpr": "CTO / Head of Engineering",
-                "pain_point": "Закрытие потребности в инженерах",
-                "hook": "Добрый день! Увидели вашу открытую позицию...",
-                "end_client_guess": "Финтех / Крупный enterprise-холдинг со своим on-premise контуром" if idx == 1 else ""
+                "end_client_name": "Крупный Enterprise / FinTech холдинг со своим on-premise контуром" if idx == 1 else "",
+                "end_client_reason": "На это указывает требование к поддержке изолированных контуров onprem, строгие нормативы регламентов и платформенная автоматизация для внутренних команд." if idx == 1 else "",
+                "strategy_lpr": "CTO / Head of Infrastructure, альтернатива — Team Lead платформенной команды",
+                "strategy_pain": "Высокая загрузка инженеров рутинными обращениями и задержка time-to-market новых продуктовых фичей.",
+                "strategy_value": "Предоставление готовых инженеров уровня Middle+/Senior с релевантным бэкграундом без длительного цикла онбординга.",
+                "strategy_hook": "Добрый день! Видим, что у вас открыта потребность в усилении инфраструктурного блока. У нас есть свободные инженеры именно под ваш стек, готовы подключиться за пару дней. Удобно обсудить?"
             })
 
-    # СТРОГАЯ СОРТИРОВКА: Сверху максимальное совпадение, далее по убыванию
+    # Сортировка по релевантности от 100% вниз
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
     final_top = parsed_candidates[:5]
 
-    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** релевантных позиций (отсортировано от лучшего совпадения):")
+    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** позиций (отсортировано по релевантности):")
 
     for rank, item in enumerate(final_top, 1):
         company = item.get("company", "Не указана")
@@ -867,17 +878,26 @@ async def handle_vacancy(message: Message):
         source = item.get("source", "Telegram")
         stack = item.get("stack_match", "Частичное совпадение")
         challenge = item.get("challenge_match", "Общий стек")
-        lpr = item.get("target_lpr", "CTO")
-        pain = item.get("pain_point", "Высокая нагрузка")
-        hook = item.get("hook", "Здравствуйте!")
-        client_guess = item.get("end_client_guess", "").strip()
+        
+        lpr = item.get("strategy_lpr", "CTO")
+        pain = item.get("strategy_pain", "Нехватка рук в команде")
+        value_prop = item.get("strategy_value", "Усиление команды проверенными специалистами")
+        hook = item.get("strategy_hook", "Здравствуйте! Увидели вашу открытую вакансию...")
 
         badge = "🔥" if score >= 85 else "⚡️" if score >= 65 else "🔎"
         status_label = "Точный оригинал" if score >= 85 else "Высокое соответствие" if score >= 65 else "Частичное совпадение"
 
-        guess_part = ""
-        if rank == 1 and client_guess:
-            guess_part = f"🕵️ **Предполагаемый конечный клиент:**\n_{client_guess}_\n\n"
+        # Блок анализа клиента сразу после шапки топ-1
+        client_block = ""
+        if rank == 1:
+            c_name = item.get("end_client_name", "Крупный отраслевой холдинг")
+            c_reason = item.get("end_client_reason", "Определено по специфике стека, изолированному контуру и структуре задач.")
+            client_block = (
+                f"🕵️ **ПРЕДПОЛАГАЕМЫЙ КОНЕЧНЫЙ ЗАКАЗЧИК:**\n"
+                f"🏢 **Кто это:** `{c_name}`\n"
+                f"💡 **Почему:** _{c_reason}_\n"
+                f"──────────────────────────────\n"
+            )
 
         card = (
             f"**#{rank} {badge} {company}** — `{score}% совпадение`\n"
@@ -886,14 +906,16 @@ async def handle_vacancy(message: Message):
             f"🎯 **Статус:** {status_label}\n"
             f"📌 **Позиция:** {role}\n"
             f"💰 **Вилка:** {salary}\n\n"
-            f"{guess_part}"
-            f"⚙️ **Аудит стека:**\n"
+            f"{client_block}"
+            f"⚙️ **Аудит стека и задач:**\n"
             f"• **Технологии:** {stack}\n"
-            f"• **Задачи:** {challenge}\n\n"
-            f"💼 **Стратегия выхода для сейлза:**\n"
-            f"• **К кому идти:** {lpr}\n"
-            f"• **Боль заказчика:** {pain}\n"
-            f"• **Хук:** _{hook}_\n"
+            f"• **Специфика:** {challenge}\n\n"
+            f"💼 **ПОЛНАЯ СТРАТЕГИЯ ВЫХОДА ДЛЯ СЕЙЛЗА:**\n"
+            f"• 👤 **К кому идти (ЛПР):** {lpr}\n"
+            f"• 🚨 **Ключевая боль:** {pain}\n"
+            f"• 💎 **Наше ценностное предложение:** {value_prop}\n\n"
+            f"• ✉️ **Готовый холодный питч:**\n"
+            f"_{hook}_\n"
         )
 
         buttons = [[InlineKeyboardButton(text=f"🔗 Открыть в {source[:20]}", url=url)]]
