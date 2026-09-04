@@ -1,4 +1,4 @@
-вimport asyncio
+import asyncio
 import hashlib
 import json
 import logging
@@ -427,7 +427,6 @@ async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
         if r.status_code != 200:
             return []
 
-        # Парсим сниппеты DuckDuckGo
         raw_results = re.findall(
             r'<a class="result__url" href="[^"]*uddg=([^"&]+)[^"]*">.*?</a>.*?<a class="result__snippet[^>]*>(.*?)</a>',
             r.text, re.DOTALL
@@ -436,7 +435,6 @@ async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
         jobs = []
         for enc_url, snippet in raw_results[:4]:
             decoded_url = unquote(enc_url)
-            # Ищем ссылки формата t.me/s/channel/id или t.me/channel/id
             match = re.search(r"t\.me/(?:s/)?([a-zA-Z0-9_]+)/(\d+)", decoded_url)
             if not match:
                 continue
@@ -896,14 +894,12 @@ async def handle_vacancy(message: Message):
 
     await safe_edit_status(status_msg, f"🔍 [2/3] Сканирование TG-папок ({scope_desc}), OSINT Web Dorks, Supabase, VC...")
 
-    # 1. Поиск по базе Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Параллельный сбор по всем источникам (включая Telegram Dorks)
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
-            fetch_telegram_dorks(http_client, primary_query),  # Новый OSINT-источник открытых постов TG
+            fetch_telegram_dorks(http_client, primary_query),
             fetch_habr(http_client, primary_query, 4),
             fetch_vc_vacancies(http_client, primary_query),
             fetch_geeklink_rss(http_client, primary_query),
@@ -919,7 +915,6 @@ async def handle_vacancy(message: Message):
 
         all_results = db_results + valid_results
 
-        # Семантическая дедупликация
         seen_hashes = set()
         unique_vacancies = []
         for v in all_results:
