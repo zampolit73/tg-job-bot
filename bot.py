@@ -1,4 +1,4 @@
-import asyncio
+вimport asyncio
 import hashlib
 import json
 import logging
@@ -7,7 +7,7 @@ import re
 import ssl
 import sys
 import threading
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncpg
 import httpx
@@ -101,11 +101,9 @@ def run_health_server():
 
 # ----------------- ФУНКЦИИ ХЕШИРОВАНИЯ И ДЕДУПЛИКАЦИИ -----------------
 def generate_content_hash(text: str) -> str:
-    """Генерирует семантический отпечаток текста для отсечения кросс-постинга."""
     clean_text = HTML_TAG_RE.sub(" ", text.lower())
     words = re.findall(r'[a-zа-я0-9\+\#]{3,}', clean_text)
     meaningful_words = sorted(list({w for w in words if w not in STOP_WORDS}))
-    # Берем срез ключевых слов для вычисления сигнатуры сути поста
     signature = " ".join(meaningful_words[:30])
     return hashlib.md5(signature.encode("utf-8")).hexdigest()
 
@@ -132,7 +130,6 @@ async def init_db():
         logger.info("Подключение к Supabase PostgreSQL успешно установлено!")
 
         async with db_pool.acquire() as conn:
-            # Создаем колонку content_hash если её еще нет для обратной совместимости
             await conn.execute("""
                 ALTER TABLE vacancies ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64);
                 CREATE INDEX IF NOT EXISTS idx_vacancies_content_hash ON vacancies (content_hash);
@@ -170,14 +167,12 @@ async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: s
         saved_text = f"[FWD: {fwd_source}] {text}" if fwd_source else text
 
         async with db_pool.acquire() as conn:
-            # 1. Проверяем наличие семантического дубля
             existing = await conn.fetchrow(
-                "SELECT id, chat_title, post_url FROM vacancies WHERE content_hash = $1 LIMIT 1;",
+                "SELECT id, chat_title FROM vacancies WHERE content_hash = $1 LIMIT 1;",
                 content_hash
             )
 
             if existing:
-                # Если вакансия уже была выложена в другом канале, дописываем источник
                 old_title = existing['chat_title']
                 if chat_title not in old_title:
                     new_title = f"{old_title}, {chat_title}"[:80]
@@ -187,7 +182,6 @@ async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: s
                     )
                 return
 
-            # 2. Если дубля нет — сохраняем
             await conn.execute("""
                 INSERT INTO vacancies (chat_title, message_id, chat_id, post_text, post_url, content_hash)
                 VALUES ($1, $2, $3, $4, $5, $6)
@@ -414,6 +408,66 @@ async def extract_forward_metadata(message) -> str:
     except Exception:
         pass
     return ""
+
+
+# ----------------- ИНТЕГРАЦИЯ TELEGRAM DORKS (OSINT) -----------------
+async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str) -> list:
+    """Бесплатный OSINT-поиск открытых постов в Telegram через зеркало t.me/s/."""
+    try:
+        clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
+        search_query = f'site:t.me/s/ "{clean_q}" "вакансия"'
+        url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"
+        }
+        data = {"q": search_query, "b": ""}
+
+        r = await client.post(url, data=data, headers=headers, timeout=3.5)
+        if r.status_code != 200:
+            return []
+
+        # Парсим сниппеты DuckDuckGo
+        raw_results = re.findall(
+            r'<a class="result__url" href="[^"]*uddg=([^"&]+)[^"]*">.*?</a>.*?<a class="result__snippet[^>]*>(.*?)</a>',
+            r.text, re.DOTALL
+        )
+
+        jobs = []
+        for enc_url, snippet in raw_results[:4]:
+            decoded_url = unquote(enc_url)
+            # Ищем ссылки формата t.me/s/channel/id или t.me/channel/id
+            match = re.search(r"t\.me/(?:s/)?([a-zA-Z0-9_]+)/(\d+)", decoded_url)
+            if not match:
+                continue
+
+            channel_username = match.group(1)
+            msg_id = match.group(2)
+            post_url = f"https://t.me/{channel_username}/{msg_id}"
+            desc = clean_html(snippet)
+
+            if len(desc) < 30 or is_agency(channel_username, desc):
+                continue
+
+            company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", desc, re.IGNORECASE)
+            company = company_match.group(1).strip() if company_match else f"@{channel_username}"
+
+            jobs.append({
+                "source": f"TG Web: @{channel_username}",
+                "title": f"Пост в @{channel_username}",
+                "company": company,
+                "salary": "в тексте",
+                "url": post_url,
+                "desc": desc[:350],
+                "overlap": 0.0,
+                "fwd_source": "",
+                "content_hash": generate_content_hash(desc)
+            })
+
+        return jobs
+    except Exception as e:
+        logger.debug(f"Ошибка поиска через Telegram Dorks: {e}")
+        return []
 
 
 # ----------------- ВЫБОР МОДЕЛЕЙ GROQ -----------------
@@ -667,7 +721,6 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                     post_text = clean_html(message.text)
                     content_hash = generate_content_hash(post_text)
 
-                    # Фильтрация дублей на лету
                     if content_hash in seen_hashes:
                         continue
                     seen_hashes.add(content_hash)
@@ -737,8 +790,8 @@ def register_telethon_listener():
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф или описание вакансии — бот выполнит поиск по Telegram-папкам, "
-        "базе Supabase (с автоматической очисткой от дублей) и внешним платформам, "
+        "Отправьте бриф или описание вакансии — бот выполнит поиск по вашим Telegram-папкам, "
+        "базе Supabase, открытым постам Telegram (через OSINT Web Dorks) и IT-платформам, "
         "деанонимизирует конечного клиента для **каждого** результата и выдаст стратегию выхода.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
@@ -841,15 +894,16 @@ async def handle_vacancy(message: Message):
     primary_query = search_terms[0] if search_terms else "разработчик"
     scope_desc = f"{len(ACTIVE_FOLDERS)} папкам" if ACTIVE_FOLDERS else "всем чатам"
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск по Telegram ({scope_desc}), Supabase, VC, GeekLink...")
+    await safe_edit_status(status_msg, f"🔍 [2/3] Сканирование TG-папок ({scope_desc}), OSINT Web Dorks, Supabase, VC...")
 
-    # 1. Поиск по базе Supabase с дедупликацией
+    # 1. Поиск по базе Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Параллельный сбор по всем платформам
+    # 2. Параллельный сбор по всем источникам (включая Telegram Dorks)
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
+            fetch_telegram_dorks(http_client, primary_query),  # Новый OSINT-источник открытых постов TG
             fetch_habr(http_client, primary_query, 4),
             fetch_vc_vacancies(http_client, primary_query),
             fetch_geeklink_rss(http_client, primary_query),
@@ -865,7 +919,7 @@ async def handle_vacancy(message: Message):
 
         all_results = db_results + valid_results
 
-        # Глобальная семантическая дедупликация перед LLM
+        # Семантическая дедупликация
         seen_hashes = set()
         unique_vacancies = []
         for v in all_results:
@@ -880,7 +934,7 @@ async def handle_vacancy(message: Message):
 
     candidates_pool = unique_vacancies[:8]
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] Запуск OSINT-деанонимизации для всех кандидатов...")
+    await safe_edit_status(status_msg, f"🧠 [3/3] OSINT-расследование заказчика и расчет стратегии...")
 
     compact_candidates = [
         {
@@ -969,7 +1023,7 @@ async def handle_vacancy(message: Message):
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
     final_top = parsed_candidates[:5]
 
-    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** уникальных позиций (дубликаты очищены):")
+    await safe_edit_status(status_msg, f"🏁 Найдено **{len(final_top)}** уникальных позиций:")
 
     for rank, item in enumerate(final_top, 1):
         company = item.get("company", "Не указана")
