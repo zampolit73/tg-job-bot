@@ -91,7 +91,7 @@ def clean_html(raw_html: str) -> str:
 
 
 def extract_key_tokens(text: str) -> set:
-    words = re.findall(r'[A-Za-zА-Яа-я0-9\+\#\.\/\-]{3,}', text.lower())
+    words = re.findall(r'[A-Za-zА-Яа-я0-9\+\#]{3,}', text.lower())
     stop_words = {"для", "или", "как", "все", "при", "опыт", "работа", "года", "знание", "умение", "будет"}
     return {w for w in words if w not in stop_words}
 
@@ -212,7 +212,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
 
 # ----------------- БЫСТРЫЙ ГЛОБАЛЬНЫЙ ПОИСК ПО ВСЕМ ЧАТАМ -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list:
-    """Глобальный поиск сразу по всей базе всех ваших чатов через MTProto API"""
+    """Глобальный поиск по всем доступным чатам через MTProto API с очисткой маркеров"""
     if not telethon_client or not telethon_client.is_connected():
         logger.warning("Telethon не подключен к Telegram.")
         return []
@@ -220,17 +220,16 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list
     found_posts = []
     seen_ids = set()
 
-    # Ищем по каждому ключевому маркеру
     for term in search_terms:
-        clean_t = term.strip()
+        # Убираем скобки, точки и мусорные символы
+        clean_t = re.sub(r'[^\w\s]', '', term).strip()
         if len(clean_t) < 3:
             continue
 
         try:
             logger.info(f"Глобальный поиск в TG по маркеру: '{clean_t}'...")
-            # entity=None — поиск по всем доступным чатам аккаунта в один запрос!
-            async for message in telethon_client.iter_messages(None, search=clean_t, limit=10):
-                if not message.text or len(message.text) < 40:
+            async for message in telethon_client.iter_messages(None, search=clean_t, limit=12):
+                if not message.text or len(message.text) < 35:
                     continue
 
                 unique_key = f"{message.chat_id}_{message.id}"
@@ -244,7 +243,6 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list
                 chat = await message.get_chat()
                 chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Chat'))
 
-                # Формирование правильной ссылки на пост
                 if getattr(chat, 'username', None):
                     msg_url = f"https://t.me/{chat.username}/{message.id}"
                 else:
@@ -266,7 +264,6 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list
         except Exception as e:
             logger.warning(f"Ошибка при поиске маркера '{clean_t}': {e}")
 
-    # Сортируем: сначала с наибольшим процентом совпадения текста
     found_posts.sort(key=lambda x: x.get("overlap", 0), reverse=True)
     logger.info(f"Глобальный поиск нашел {len(found_posts)} постов в чатах.")
     return found_posts[:5]
@@ -313,34 +310,35 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "💼 Multi-Source OSINT Lead Hunter\n\n"
         "Отправьте бриф вакансии. Бот выполнит сквозной глобальный поиск по вашим Telegram-чатам "
         "и открытым базам с детальным сравнением оригинала.",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=None
     )
 
 
 @dp.message(F.text == "/debug_tg")
 async def cmd_debug(message: Message):
-    """Команда проверки состояния Telethon"""
+    """Безопасный вывод отладки Telethon без падений Markdown"""
     if not telethon_client:
-        await message.answer("❌ Telethon не инициализирован (проверьте переменные TG_API_ID, TG_SESSION_STRING в Render).")
+        await message.answer("❌ Telethon не инициализирован (проверьте переменные TG_API_ID, TG_SESSION_STRING в Render).", parse_mode=None)
         return
     if not telethon_client.is_connected():
-        await message.answer("⚠️ Telethon не подключен к сети Telegram.")
+        await message.answer("⚠️ Telethon не подключен к сети Telegram.", parse_mode=None)
         return
     try:
         me = await telethon_client.get_me()
         dialogs = await telethon_client.get_dialogs(limit=10)
-        chats_list = "\n".join([f"• {d.name}" for d in dialogs[:5]])
-        await message.answer(
-            f"✅ **Telethon активен!**\n"
-            f"👤 Аккаунт: **{me.first_name}** (@{me.username})\n"
-            f"📂 Первые чаты в списке:\n{chats_list}",
-            parse_mode=ParseMode.MARKDOWN
+        chats_lines = [f"- {d.name}" for d in dialogs[:6]]
+        chats_list = "\n".join(chats_lines)
+        response = (
+            f"✅ Telethon активен и подключен!\n"
+            f"Имя аккаунта: {me.first_name} (@{me.username})\n"
+            f"Доступные чаты (первые 6):\n{chats_list}"
         )
+        await message.answer(response, parse_mode=None)
     except Exception as e:
-        await message.answer(f"⚠️ Ошибка при проверке Telethon: {e}")
+        await message.answer(f"⚠️ Ошибка при проверке Telethon: {e}", parse_mode=None)
 
 
 @dp.message(F.text)
@@ -351,16 +349,14 @@ async def handle_vacancy(message: Message):
 
     status_msg = await message.answer("⚡️ [1/4] Извлечение ключевых маркеров для поиска...")
 
-    # Автоматическое извлечение редких терминов (английские и русские корни)
+    # Извлечение чистых терминов без спецсимволов
     detected_markers = []
-    # Находим все слова на латинице от 3 символов
-    latin_words = re.findall(r'\b[A-Za-z0-9\.\/\+\#\-]{3,}\b', user_text)
-    for word in latin_words:
+    clean_words = re.findall(r'[A-Za-z0-9]{3,}', user_text)
+    for word in clean_words:
         w_lower = word.lower()
         if w_lower not in {"the", "and", "for", "with", "from"} and word not in detected_markers:
             detected_markers.append(word)
 
-    # Добавляем специфичные русские корни
     if "микрофронт" in user_text.lower():
         detected_markers.append("микрофронт")
     if "телефон" in user_text.lower() or "voip" in user_text.lower():
@@ -369,7 +365,6 @@ async def handle_vacancy(message: Message):
     if not detected_markers:
         detected_markers = ["Angular", "JavaScript"]
 
-    # Берем ТОП-3 самых характерных маркера
     search_terms = detected_markers[:3]
 
     await safe_edit_status(status_msg, f"🔍 [2/4] Глобальный поиск в ваших Telegram-чатах по {search_terms}...")
@@ -381,7 +376,6 @@ async def handle_vacancy(message: Message):
         ]
 
         try:
-            # Увеличен таймаут, чтобы Telegram успел отдать сообщения
             raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10.0)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception as e:
@@ -416,7 +410,7 @@ async def handle_vacancy(message: Message):
 {candidates_payload}
 
 ПРАВИЛА:
-1. Если кандидат из Telegram-чата и совпадение текста > 25% или совпал ключевой стек — ставь скор 85-99% и статус '🟢 Точный оригинал'.
+1. Если кандидат из Telegram-чата и совпадение текста > 20% или совпал ключевой стек — ставь скор 85-99% и статус '🟢 Точный оригинал'.
 2. Если кандидат из общей базы без совпадения ключевых задач — скор <= 40%.
 
 Выведи ТОП кандидатов по шаблону:
@@ -460,13 +454,17 @@ async def handle_vacancy(message: Message):
 
     final_output = f"🎯 **ОТЧЁТ МАТРИЧНОГО СРАВНЕНИЯ**\n\n" + "\n".join(enhanced_lines)
 
-    if len(final_output) > 4000:
-        parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
-        await safe_edit_status(status_msg, parts[0])
-        for p in parts[1:]:
-            await message.answer(p, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
-    else:
-        await safe_edit_status(status_msg, final_output)
+    try:
+        if len(final_output) > 4000:
+            parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
+            await safe_edit_status(status_msg, parts[0])
+            for p in parts[1:]:
+                await message.answer(p, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        else:
+            await safe_edit_status(status_msg, final_output)
+    except Exception:
+        # Резервный вывод чистым текстом, если Markdown содержит ломающие символы
+        await safe_edit_status(status_msg, final_output.replace("*", "").replace("`", ""))
 
 
 # ----------------- БЕЗОПАСНЫЙ СТАРТ -----------------
