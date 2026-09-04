@@ -179,7 +179,7 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
                 company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", p_text, re.IGNORECASE)
                 company = company_match.group(1).strip() if company_match else row['chat_title']
                 results.append({
-                    "source": f"Supabase: {row['chat_title'][:20]}",
+                    "source": f"Supabase ({row['chat_title'][:20]})",
                     "title": f"Пост в {row['chat_title'][:20]}",
                     "company": company,
                     "salary": "в тексте",
@@ -466,7 +466,7 @@ async def fetch_vc_vacancies(client: httpx.AsyncClient, query: str) -> list:
                 if is_agency(company, desc):
                     continue
                 jobs.append({
-                    "source": "VC.ru Вакансии",
+                    "source": "VC.ru",
                     "title": title,
                     "company": company,
                     "salary": sal,
@@ -531,7 +531,7 @@ async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
             if is_agency(company, desc):
                 continue
             jobs.append({
-                "source": "Finder.vc (Remote)",
+                "source": "Finder.vc",
                 "title": title,
                 "company": company,
                 "salary": sal,
@@ -599,7 +599,7 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                     company = company_match.group(1).strip() if company_match else chat_title
 
                     found_posts.append({
-                        "source": f"Telegram: {chat_title[:20]}",
+                        "source": f"Telegram ({chat_title[:20]})",
                         "title": f"Пост в {chat_title[:20]}",
                         "company": company,
                         "salary": "в тексте",
@@ -646,7 +646,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
         "Отправьте бриф или описание вакансии — бот проведёт поиск по Telegram-папкам, "
-        "базе Supabase и внешним IT-платформам, отсортирует до 5 совпадений по релевантности, "
+        "базе Supabase и внешним платформам, отсортирует до 5 совпадений по релевантности, "
         "деанонимизирует конечного клиента для лидера и подготовит полноценную стратегию выхода.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
@@ -798,13 +798,13 @@ async def handle_vacancy(message: Message):
 Сравни кандидатов с брифом и верни валидный JSON со списком до 5 позиций.
 
 ДЛЯ КАНДИДАТА С САМЫМ ВЫСОКИМ СКОРОМ (#1):
-1. В поле "end_client_name" укажи конкретную вероятную сферу или компанию (Сбер, Т-Банк, Яндекс, X5, Финтех / Tier-1 Банковский контур и т.д.).
-2. В поле "end_client_reason" дай аргументацию из 2 предложений, ПОЧЕМУ это они (на основе стека, закрытого onprem-контура, масштаба задач).
-3. В полях стратегии ("strategy_lpr", "strategy_pain", "strategy_value", "strategy_hook") распиши ПОЛНУЮ стратегию продажи:
-   - strategy_lpr: конкретная должность ЛПР (CTO, Head of Platform).
-   - strategy_pain: детальная бизнес-боль (перегруз ядра техплатформы саппортом, срыв TTM).
-   - strategy_value: оффер аутстаффа (выделение 2 инженеров Middle+/Senior, быстрый старт).
-   - strategy_hook: готовое холодное сообщение для отправки в Telegram/LinkedIn (вежливое, бьющее в боль, без воды).
+1. В поле "end_client_name" укажи конкретную вероятную сферу или компанию (Банковский сектор / E-commerce Core / Сбер / Т-Банк и т.д.).
+2. В поле "end_client_reason" дай аргументацию из 1-2 предложений, ПОЧЕМУ это они (на основе стека, закрытого onprem-контура, масштаба задач).
+3. В полях стратегии ("strategy_lpr", "strategy_pain", "strategy_value", "strategy_hook") распиши стратегию продажи:
+   - strategy_lpr: должность ЛПР (Head of Infrastructure / Lead DevOps).
+   - strategy_pain: проблема клиента (срыв релизных окон из-за текучки инцидентов).
+   - strategy_value: ценность (оперативное закрытие операционки силами внешних инженеров).
+   - strategy_hook: готовое холодное сообщение для отправки (вежливое, бьющее в боль, без воды).
 
 БРИФ:
 {user_text[:450]}
@@ -822,14 +822,14 @@ async def handle_vacancy(message: Message):
       "salary": "Вилка или По договоренности",
       "url": "ссылка",
       "source": "Точный источник",
-      "stack_match": "k8s • helm • postgres • linux",
+      "stack_match": "Kubernetes, Helm, Postgres, Linux, Observability",
       "challenge_match": "основные задачи",
-      "end_client_name": "Только для топ-1: Название или тип заказчика",
-      "end_client_reason": "Только для топ-1: Обоснование почему это они",
-      "strategy_lpr": "CTO / Head of Platform",
-      "strategy_pain": "Перегруз ядра техплатформы саппортом вместо задач беклога",
-      "strategy_value": "Выделение 2 инженеров Middle+ со свободными слотами",
-      "strategy_hook": "Здравствуйте! Обратил внимание на поиск инженера техплатформы. Чтобы не тормозить TTM продуктовых стримов, можем выделить готовых специалистов под k8s/onprem и саппорт. Открыть резюме ребят?"
+      "end_client_name": "Только для топ-1: Банковский сектор / E-commerce Core",
+      "end_client_reason": "Только для топ-1: нетиповые on-prem окружения и внутренняя сервисная модель платформы характерны для закрытых контуров enterprise-уровня.",
+      "strategy_lpr": "Head of Infrastructure / Lead DevOps",
+      "strategy_pain": "срыв релизных окон из-за текучки инцидентов",
+      "strategy_value": "оперативное закрытие операционки силами внешних инженеров",
+      "strategy_hook": "Добрый день! Обратил внимание на вакансию инженера техплатформы под k8s/onprem. Можем подставить свободных специалистов на саппорт, чтобы ядро команды не отвлекалось от ключевого беклога. Актуально взглянуть на профили?"
     }}
   ]
 }}"""
@@ -853,14 +853,14 @@ async def handle_vacancy(message: Message):
                 "salary": v.get("salary", "По договоренности"),
                 "url": v["url"],
                 "source": v["source"],
-                "stack_match": "k8s • helm • postgres • linux",
+                "stack_match": "Kubernetes, Helm, Postgres, Linux, Observability",
                 "challenge_match": "Совпадение по стеку технологий",
-                "end_client_name": "Финтех / Tier-1 Банковский контур" if idx == 1 else "",
-                "end_client_reason": "Поддержка нетиповых onprem-окружений и фокус на сокращение TTM внутренних стримов исключают малый бизнес — это закрытый контур крупной экосистемы." if idx == 1 else "",
-                "strategy_lpr": "CTO / Head of Platform",
-                "strategy_pain": "Перегруз ядра техплатформы саппортом вместо задач беклога",
-                "strategy_value": "Выделение 2 инженеров Middle+ со свободными слотами",
-                "strategy_hook": "Здравствуйте! Обратил внимание на поиск инженера техплатформы. Чтобы не тормозить TTM продуктовых стримов, можем выделить готовых специалистов под k8s/onprem и саппорт. Открыть резюме ребят?"
+                "end_client_name": "Банковский сектор / E-commerce Core" if idx == 1 else "",
+                "end_client_reason": "нетиповые on-prem окружения и внутренняя сервисная модель платформы характерны для закрытых контуров enterprise-уровня." if idx == 1 else "",
+                "strategy_lpr": "Head of Infrastructure / Lead DevOps",
+                "strategy_pain": "срыв релизных окон из-за текучки инцидентов",
+                "strategy_value": "оперативное закрытие операционки силами внешних инженеров",
+                "strategy_hook": "Добрый день! Обратил внимание на вакансию инженера техплатформы под k8s/onprem. Можем подставить свободных специалистов на саппорт, чтобы ядро команды не отвлекалось от ключевого беклога. Актуально взглянуть на профили?"
             })
 
     # Сортировка по релевантности: лидеры первыми
@@ -875,57 +875,44 @@ async def handle_vacancy(message: Message):
         role = item.get("role", "Platform / DevOps Engineer")
         url = item.get("url", "#")
         source = item.get("source", "Telegram")
-        stack = item.get("stack_match", "k8s • helm • postgres • linux")
+        stack = item.get("stack_match", "Kubernetes, Helm, Postgres, Linux, Observability")
         
-        lpr = item.get("strategy_lpr", "CTO / Head of Platform")
-        pain = item.get("strategy_pain", "Перегруз ядра техплатформы саппортом")
-        value_prop = item.get("strategy_value", "Выделение готовых инженеров под спринты")
-        hook = item.get("strategy_hook", "Здравствуйте! Увидели вашу открытую позицию...")
-
-        # Выравнивание шапки по ширине
-        org_line = f"║ ОРГАНИЗАЦИЯ: {company} [ {score}% ]"
-        role_line = f"║ РОЛЬ:        {role}"
-        source_line = f"║ ИСТОЧНИК:    {source}"
-        stack_line = f"║ СТЕК:        {stack}"
-
-        header_box = (
-            "╔══ INTELLIGENCE REPORT #" + str(rank) + " ══════════════\n"
-            + org_line + "\n"
-            + role_line + "\n"
-            + source_line + "\n"
-            + stack_line + "\n"
-            + "╚════════════════════════════════════════"
-        )
+        lpr = item.get("strategy_lpr", "Head of Infrastructure / Lead DevOps")
+        pain = item.get("strategy_pain", "срыв релизных окон из-за текучки инцидентов")
+        value_prop = item.get("strategy_value", "оперативное закрытие операционки силами внешних инженеров")
+        hook = item.get("strategy_hook", "Добрый день! Увидели вашу открытую позицию...")
 
         client_block = ""
         if rank == 1:
-            c_name = item.get("end_client_name", "Финтех / Tier-1 Банковский контур")
-            c_reason = item.get("end_client_reason", "Поддержка нетиповых onprem-окружений и фокус на сокращение TTM внутренних стримов указывают на закрытый контур крупной экосистемы.")
+            c_name = item.get("end_client_name", "Банковский сектор / E-commerce Core")
+            c_reason = item.get("end_client_reason", "нетиповые on-prem окружения и внутренняя сервисная модель платформы характерны для закрытых контуров enterprise-уровня.")
             client_block = (
-                "> 🕵️ OSINT-АНАЛИЗ КОНЕЧНОГО ЗАКАЗЧИКА\n"
-                f"> • Профиль: {c_name}\n"
-                f"> • Обоснование: {c_reason}\n\n"
+                "> 🔎 **OSINT-декомпозиция клиента:**\n"
+                f"> **Профиль:** {c_name}\n"
+                f"> **Обоснование:** {c_reason}\n\n"
             )
 
-        sales_block = (
-            "> 💼 СТРАТЕГИЯ И ПИТЧ ДЛЯ СЕЙЛЗА\n"
-            f"> • ЛПР: {lpr}\n"
-            f"> • Боль: {pain}\n"
-            f"> • Ценность: {value_prop}\n"
-            ">\n"
-            "> ✉️ Готовое сообщение (кликните для копирования):\n"
-            f"> `{hook}`"
-        )
-
         card = (
-            f"```text\n{header_box}\n```\n\n"
+            f"**#{rank}. {company} — {score}% МАТЧ**\n"
+            f"───────────────────────────\n"
+            f"**Позиция:** {role}\n"
+            f"**Где найден:** {source}\n"
+            f"**Технологии:** {stack}\n\n"
             f"{client_block}"
-            f"{sales_block}"
+            f"🎯 **Точки входа для сейлза:**\n"
+            f"• **ЛПР:** {lpr}\n"
+            f"• **Ключевая проблема:** {pain}\n"
+            f"• **Ценность:** {value_prop}\n\n"
+            f"💬 **Сообщение для отправки:**\n"
+            f"`{hook}`"
         )
 
-        buttons = [[InlineKeyboardButton(text="🔗 Открыть публикацию", url=url)]]
-        if company and not company.startswith("@") and "чат" not in company.lower() and "канал" not in company.lower():
-            buttons.append([InlineKeyboardButton(text="👤 Найти CTO в LinkedIn", url=build_lead_osint_url(company))])
+        buttons = [
+            [
+                InlineKeyboardButton(text="↗ Перейти к вакансии", url=url),
+                InlineKeyboardButton(text="🕵️ Найти ЛПР", url=build_lead_osint_url(company))
+            ]
+        ]
 
         reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer(card, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
