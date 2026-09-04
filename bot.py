@@ -14,6 +14,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from groq import AsyncGroq
 from telethon import TelegramClient
+from telethon.tl.types import User
 from telethon.sessions import StringSession
 
 # ----------------- ЛОГИРОВАНИЕ -----------------
@@ -213,8 +214,9 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- БЫСТРЫЙ ПОИСК ПО ЧАТАМ -----------------
+# ----------------- БЫСТРЫЙ ПОИСК ТОЛЬКО ПО ГРУППАМ И КАНАЛАМ -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
+    """Глобальный поиск: ИГНОРИРУЮТСЯ ЛИЧНЫЕ СООБЩЕНИЯ 1 НА 1"""
     if not telethon_client or not telethon_client.is_connected():
         logger.warning("Telethon не подключен к Telegram.")
         return []
@@ -228,16 +230,22 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
             continue
 
         try:
-            logger.info(f"Глобальный поиск в TG по маркеру: '{clean_t}'...")
+            logger.info(f"Поиск в рабочих группах/каналах по маркеру: '{clean_t}'...")
             async for message in telethon_client.iter_messages(None, search=clean_t, limit=15):
                 if not message.text or len(message.text) < 40:
                     continue
 
+                # Исключаем диалог с самим ботом
                 if message.chat_id == bot_id:
                     continue
 
                 chat = await message.get_chat()
-                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Chat'))
+
+                # СТРОГАЯ ЗАЩИТА ПРИВАТНОСТИ: ИГНОРИРУЕМ ЛИЧНЫЕ ДИАЛОГИ (1 НА 1)
+                if isinstance(chat, User) or getattr(chat, 'is_user', False):
+                    continue
+
+                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Channel/Group'))
 
                 if "matcher" in chat_title.lower() or "bot" in chat_title.lower():
                     continue
@@ -260,7 +268,7 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                 company = company_match.group(1).strip() if company_match else chat_title
 
                 found_posts.append({
-                    "source": f"TG Чат: {chat_title[:25]}",
+                    "source": f"TG Группа: {chat_title[:25]}",
                     "title": f"Пост в {chat_title[:25]}",
                     "company": company,
                     "salary": "в тексте",
@@ -317,7 +325,8 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
 async def cmd_start(message: Message):
     await message.answer(
         "💼 Multi-Source OSINT Lead Hunter\n\n"
-        "Отправьте бриф вакансии. Бот выполнит сквозной поиск по вашим Telegram-чатам и карьерным площадкам.",
+        "Отправьте бриф вакансии. Бот выполнит сквозной поиск по рабочим Telegram-группам/каналам "
+        "и карьерным площадкам (личные переписки исключены).",
         parse_mode=None
     )
 
@@ -332,13 +341,15 @@ async def cmd_debug(message: Message):
         return
     try:
         me = await telethon_client.get_me()
-        dialogs = await telethon_client.get_dialogs(limit=10)
-        chats_lines = [f"- {d.name}" for d in dialogs[:6]]
-        chats_list = "\n".join(chats_lines)
+        dialogs = await telethon_client.get_dialogs(limit=12)
+        # Показываем только группы и каналы
+        group_lines = [f"- {d.name}" for d in dialogs if (d.is_group or d.is_channel)][:6]
+        chats_list = "\n".join(group_lines) if group_lines else "Группы не найдены"
         response = (
             f"✅ Telethon активен!\n"
             f"Аккаунт: {me.first_name} (@{me.username})\n"
-            f"Доступные чаты:\n{chats_list}"
+            f"Доступные группы и каналы:\n{chats_list}\n\n"
+            f"🔒 Защита приватности: Личные сообщения (DM) исключены из поиска."
         )
         await message.answer(response, parse_mode=None)
     except Exception as e:
@@ -374,7 +385,7 @@ async def handle_vacancy(message: Message):
 
     search_terms = detected_markers[:3]
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск в Telegram-чатах по {search_terms}...")
+    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск в рабочих Telegram-группах по {search_terms}...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
@@ -392,7 +403,7 @@ async def handle_vacancy(message: Message):
         unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений в сторонних чатах не найдено.")
+            await safe_edit_status(status_msg, "❌ Совпадений в рабочих группах и каналах не найдено.")
             return
 
     await safe_edit_status(status_msg, f"🧠 [3/3] Матричный скоринг {len(unique_vacancies[:3])} кандидатов...")
@@ -449,7 +460,6 @@ async def handle_vacancy(message: Message):
     except Exception:
         pass
 
-    # Если JSON распарсить не удалось, формируем отчет напрямую из кандидатов
     if not parsed_candidates:
         for v in unique_vacancies[:3]:
             score = 90 if v.get("overlap", 0) > 20 else 45
@@ -466,7 +476,7 @@ async def handle_vacancy(message: Message):
                 "challenge_match": "Совпадение по ключевым маркерам",
                 "target_lpr": "CTO / Head of Engineering",
                 "pain_point": "Поиск профильных инженеров",
-                "hook": "Добрый день! Увидели вашу открытую потребность в профильном канале..."
+                "hook": "Добрый день! Увидели вашу открытую потребность в профильном сообществе..."
             })
 
     for item in parsed_candidates:
@@ -487,7 +497,7 @@ async def handle_vacancy(message: Message):
         hook = item.get("hook", "Здравствуйте!")
 
         osint_part = ""
-        if company and not company.startswith("@") and "чат" not in company.lower():
+        if company and not company.startswith("@") and "группа" not in company.lower() and "чат" not in company.lower():
             osint_url = build_lead_osint_url(company)
             osint_part = f"• **Поиск контактов ЛПР:** [Найти профили в LinkedIn/Google]({osint_url})\n"
 
@@ -536,7 +546,7 @@ async def init_telethon():
             logger.warning("Telethon не авторизован.")
             telethon_client = None
         else:
-            logger.info("Telethon успешно авторизован!")
+            logger.info("Telethon успешно авторизован! Поиск по группам активен.")
     except Exception as e:
         logger.warning(f"Telethon пропущен: {e}")
         telethon_client = None
