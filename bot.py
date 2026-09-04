@@ -148,7 +148,6 @@ async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: s
     if not db_pool:
         return
     try:
-        # Сохраняем fwd_source прямо в начале текста для контекста БД
         saved_text = f"[FWD: {fwd_source}] {text}" if fwd_source else text
         async with db_pool.acquire() as conn:
             await conn.execute("""
@@ -179,7 +178,6 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
                 p_text = row['post_text']
                 overlap = calculate_overlap_score(raw_brief, p_text)
                 
-                # Извлекаем скрытый fwd_source, если он был записан
                 fwd_info = ""
                 fwd_match = re.search(r"^\[FWD:\s*([^\]]+)\]", p_text)
                 if fwd_match:
@@ -350,18 +348,13 @@ async def safe_edit_status(msg: Message, text: str):
         pass
 
 
-# ----------------- ИЗВЛЕЧЕНИЕ МЕТАДАННЫХ ПЕРЕСЫЛКИ (FWD OSINT) -----------------
 async def extract_forward_metadata(message) -> str:
-    """Извлекает цифровой след первоисточника из fwd_from."""
     if not message.fwd_from:
         return ""
     try:
         fwd = message.fwd_from
-        # 1. Если есть имя скрытого автора
         if getattr(fwd, 'from_name', None):
             return f"Переслано от: {fwd.from_name}"
-        
-        # 2. Если переслано из канала/чата через from_id
         if getattr(fwd, 'from_id', None):
             try:
                 entity = await telethon_client.get_entity(fwd.from_id)
@@ -370,8 +363,6 @@ async def extract_forward_metadata(message) -> str:
                 return f"Канал-первоисточник: {title} {username}".strip()
             except Exception:
                 pass
-        
-        # 3. Канал пересылки post_author
         if getattr(fwd, 'post_author', None):
             return f"Автор оригинального поста: {fwd.post_author}"
     except Exception:
@@ -413,7 +404,7 @@ async def find_working_groq_model() -> str:
     return ACTIVE_GROQ_MODEL
 
 
-async def call_groq_async(prompt: str, max_tokens: int = 2400, json_mode: bool = False) -> tuple[str, str]:
+async def call_groq_async(prompt: str, max_tokens: int = 2500, json_mode: bool = False) -> tuple[str, str]:
     global ACTIVE_GROQ_MODEL
     if not ACTIVE_GROQ_MODEL:
         await find_working_groq_model()
@@ -588,7 +579,7 @@ async def fetch_finder_vc(client: httpx.AsyncClient, query: str) -> list:
         return []
 
 
-# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM С АНАЛИЗОМ FWD_FROM -----------------
+# ----------------- ОНЛАЙН-ПОИСК В TELEGRAM -----------------
 async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id: int) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
@@ -630,8 +621,6 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
 
                     post_text = clean_html(message.text)
                     overlap = calculate_overlap_score(raw_brief, post_text)
-
-                    # СНЯТИЕ МЕТАДАННЫХ ПЕРЕСЫЛКИ
                     fwd_source = await extract_forward_metadata(message)
 
                     if getattr(chat, 'username', None):
@@ -695,9 +684,9 @@ def register_telethon_listener():
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф или описание вакансии — бот проведёт поиск по Telegram-папкам, "
-        "базе Supabase и внешним платформам, отсортирует до 5 совпадений по релевантности, "
-        "проанализирует скрытые метаданные пересылок сообщений (fwd_from) и деанонимизирует заказчика.\n\n"
+        "Отправьте бриф или описание вакансии — бот выполнит поиск по Telegram-папкам, "
+        "базе Supabase и внешним платформам, деанонимизирует конечного клиента для **каждого** "
+        "из найденных вариантов и подготовит готовую стратегию выхода.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
@@ -804,7 +793,7 @@ async def handle_vacancy(message: Message):
     # 1. Поиск по базе Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Параллельный сбор по всем платформам с извлечением метаданных
+    # 2. Параллельный сбор по всем платформам
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
@@ -830,7 +819,7 @@ async def handle_vacancy(message: Message):
 
     candidates_pool = unique_vacancies[:8]
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] OSINT-анализ метаданных пересылки и деанонимизация...")
+    await safe_edit_status(status_msg, f"🧠 [3/3] Запуск OSINT-деанонимизации для всех кандидатов...")
 
     compact_candidates = [
         {
@@ -839,32 +828,24 @@ async def handle_vacancy(message: Message):
             "source": v['source'],
             "url": v['url'],
             "overlap_percent": v.get('overlap', 0),
-            "fwd_origin": v.get('fwd_source', ''),  # Передаем оригинальный цифровой след Telegram
+            "fwd_origin": v.get('fwd_source', ''),
             "text": v['desc'][:280]
         }
         for idx, v in enumerate(candidates_pool, 1)
     ]
 
     prompt_matrix = f"""Ты — Senior OSINT-аналитик IT-рынка и специалист по деанонимизации закрытых корпоративных вакансий.
-Твоя задача — сорвать маску кадрового агентства / аутстаффера и определить НАСТОЯЩЕГО конечного заказчика по тексту и метаданным пересылки (fwd_origin).
+Твоя задача — сорвать маску кадрового агентства / аутстаффера и определить НАСТОЯЩЕГО конечного заказчика ДЛЯ КАЖДОГО кандидата из списка по тексту задач и метаданным пересылки (fwd_origin).
 
-ВАЖНО ПО FWD_ORIGIN:
-Если в поле fwd_origin указан оригинальный канал или автор (например, "Канал-первоисточник: Alfa Digital"), это 100% доказательство того, кто является заказчиком! Обязательно используй это в первую очередь.
-
-ФРЕЙМВОРК ДЕАНОНИМИЗАЦИИ ПО ТЕКСТУ:
-1. On-premise контур, нетиповые окружения, K8s = закрытые контуры Tier-1 (Сбер, Т-Банк, ВТБ, Альфа-Банк, Газпромбанк, Ростелеком, X5 Group).
-2. «TTM (Time to Market)», «продуктовые стримы», «платформенный беклог» = PaaS-модель крупных корпораций (СберТех, Т-Банк, Яндекс, Ozon).
-3. «АСУТП», «ГОСТ», «импортозамещение», «Астра/РедОС» = Газпром, Роснефть, СИБУР, Ростелеком.
-
-ПРАВИЛО ДЛЯ ТОП-1:
-- В "end_client_name" назови КОНКРЕТНУЮ компанию (Сбер, X5 Digital, Т-Банк Инфраструктура, Газпромбанк, Альфа-Банк). Никакой воды.
-- В "end_client_evidence" укажи КОНКРЕТНУЮ УЛИКУ (включая fwd_origin, если он есть).
-- В "end_client_alt" укажи 2-го вероятного заказчика.
+ОБЯЗАТЕЛЬНОЕ ТРЕБОВАНИЕ:
+Для КАЖДОГО кандидата (с #1 по #5) заполни поля "end_client_name" и "end_client_evidence":
+- "end_client_name": конкретная вероятная компания или экосистема (Сбер, X5 Group, Т-Банк Инфраструктура, Газпромбанк, Альфа-Банк, VK, Ростелеком, Яндекс, Ozon, СИБУР). Без размытых слов вроде «какой-то банк».
+- "end_client_evidence": 1 конкретная улика из текста или fwd_origin (например: «On-premise контур и формулировка TTM для продуктовых команд указывают на банковский PaaS»).
 
 ДЛЯ ВСЕХ ПОЗИЦИЙ СФОРМУЛИРУЙ ЛАКОНИЧНО (стиль "Минимализм"):
 - role: точная инженерная роль
 - stack_match: ключевой стек через буллеты (Kubernetes • Helm • Postgres • Linux)
-- strategy_lpr: конкретное лицо (Head of Infrastructure / CTO)
+- strategy_lpr: конкретное лицо (Head of Infrastructure / Lead DevOps)
 - strategy_pain: главная боль бизнеса в 1 строку
 - strategy_value: наш оффер в 1 строку
 - strategy_hook: живое сообщение для Telegram из 2 предложений.
@@ -886,8 +867,7 @@ async def handle_vacancy(message: Message):
       "source": "источник",
       "stack_match": "Kubernetes • Helm • Postgres • Linux",
       "end_client_name": "Сбер / FinTech Platform Core",
-      "end_client_evidence": "Сообщение переслано из официального канала Сбера / On-prem контур и формулировка 'сокращение TTM'.",
-      "end_client_alt": "Т-Банк / Инфраструктура",
+      "end_client_evidence": "On-prem контур и сокращение TTM внутренних команд указывают на платформенное ядро СберТеха.",
       "strategy_lpr": "Head of Infrastructure",
       "strategy_pain": "Срыв релизов продуктовых команд из-за перегруза рутиной",
       "strategy_value": "Закрытие операционки и траблшутинга нашими инженерами",
@@ -896,7 +876,7 @@ async def handle_vacancy(message: Message):
   ]
 }}"""
 
-    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=2400, json_mode=True)
+    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=2500, json_mode=True)
     parsed_candidates = []
 
     try:
@@ -909,7 +889,7 @@ async def handle_vacancy(message: Message):
         for idx, v in enumerate(candidates_pool[:5], 1):
             score = 90 if v.get("overlap", 0) > 20 else max(40, 85 - idx * 10)
             fwd_info = v.get('fwd_source', '')
-            evidence = f"Выявлен след пересылки ({fwd_info})" if fwd_info else "On-premise контур и сокращение TTM для внутренних стримов указывают на крупный банковский PaaS."
+            evidence = f"Выявлен след пересылки ({fwd_info})" if fwd_info else "On-premise контур и специфика стека указывают на закрытый enterprise-контур."
             parsed_candidates.append({
                 "company": v["company"],
                 "score": score,
@@ -917,9 +897,8 @@ async def handle_vacancy(message: Message):
                 "url": v["url"],
                 "source": v["source"],
                 "stack_match": "Kubernetes • Helm • Postgres • Linux",
-                "end_client_name": "Сбер / FinTech Platform Core" if idx == 1 else "",
-                "end_client_evidence": evidence if idx == 1 else "",
-                "end_client_alt": "Т-Банк / X5 Tech" if idx == 1 else "",
+                "end_client_name": "Банковский сектор / FinTech Core",
+                "end_client_evidence": evidence,
                 "strategy_lpr": "Head of Infrastructure",
                 "strategy_pain": "Срыв релизов из-за рутинных инцидентов",
                 "strategy_value": "Закрытие операционки внешними инженерами",
@@ -939,23 +918,19 @@ async def handle_vacancy(message: Message):
         source = item.get("source", "Telegram")
         stack = item.get("stack_match", "Kubernetes • Helm • Postgres • Linux")
         
+        c_name = item.get("end_client_name", "Enterprise / IT-холдинг")
+        c_evidence = item.get("end_client_evidence", "Определено по специфике задач, закрытому контуру и технологическому стеку.")
+        
         lpr = item.get("strategy_lpr", "Head of Infrastructure")
         pain = item.get("strategy_pain", "Срыв релизов из-за рутинных инцидентов")
         value_prop = item.get("strategy_value", "Закрытие операционки внешними инженерами")
         hook = item.get("strategy_hook", "Добрый день! Увидели вашу открытую позицию. Готовы обсудить подключение?")
 
-        client_block = ""
-        if rank == 1:
-            c_name = item.get("end_client_name", "Сбер / FinTech Core")
-            c_evidence = item.get("end_client_evidence", "On-premise контур и внутренняя сервисная модель платформы.")
-            c_alt = item.get("end_client_alt", "")
-            alt_str = f"\n> **Запасной вариант:** {c_alt}" if c_alt else ""
-
-            client_block = (
-                "> 🕵️ **OSINT-расследование заказчика:**\n"
-                f"> **Вероятный бенефициар:** `{c_name}`\n"
-                f"> **Улика:** _{c_evidence}_{alt_str}\n\n"
-            )
+        client_block = (
+            "> 🕵️ **OSINT-расследование заказчика:**\n"
+            f"> **Вероятный бенефициар:** `{c_name}`\n"
+            f"> **Улика:** _{c_evidence}_\n\n"
+        )
 
         card = (
             f"**#{rank}. {company} • {score}%**\n"
