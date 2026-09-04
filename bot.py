@@ -60,7 +60,7 @@ KNOWN_AGENCIES = (
     "ibs", "icl", "aston", "bell integrator", "neoflex", "epam", "reksoft", "andersen"
 )
 
-# Маркеры скрытого аутстаффа/посредничества в теле вакансии
+# Маркеры скрытого аутстаффа в тексте
 OUTSTAFF_TEXT_MARKERS = (
     "наш клиент", "нашего клиента", "клиент —", "клиент:", "для нашего партнера",
     "проект заказчика", "на стороне заказчика", "аутстафф", "outstaff",
@@ -123,10 +123,10 @@ async def safe_edit_status(msg: Message, text: str):
         pass
 
 
-# ----------------- GROQ CLIENT (ИСПРАВЛЕННЫЙ СПИСОК МОДЕЛЕЙ) -----------------
+# ----------------- GROQ CLIENT (СТАБИЛЬНЫЕ МОДЕЛИ) -----------------
 async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool = False) -> tuple[str, str]:
-    # Актуальные модели с поддержкой JSON и высокой скоростью инференса
-    models = ("llama-3.1-8b-instant", "llama3-70b-8192", "mixtral-8x7b-32768")
+    # Только поддерживаемые и активные модели Groq
+    models = ("llama-3.1-8b-instant", "llama3-70b-8192")
     last_err = ""
     for model_name in models:
         try:
@@ -141,18 +141,19 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
 
             res = await asyncio.wait_for(
                 groq_client.chat.completions.create(**kwargs),
-                timeout=9.0
+                timeout=10.0
             )
             content = res.choices[0].message.content
             if content and content.strip():
                 return content, ""
         except Exception as e:
             last_err = str(e)
+            logger.warning(f"Ошибка Groq на модели {model_name}: {e}. Пробуем следующую модель...")
             continue
     return "", last_err
 
 
-# ----------------- FULL PAGE HYDRATION (ВЫКАЧКА СТРАНИЦ) -----------------
+# ----------------- FULL PAGE HYDRATION -----------------
 async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
     url = job.get("url", "")
     if not url or "t.me" in url:
@@ -351,13 +352,13 @@ async def search_telegram_native(search_term: str) -> list:
         return []
 
 
-# ----------------- ХЭНДЛЕРЫ -----------------
+# ----------------- ХЭНДЛЕРЫ AIOGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter (Hydration & Dork Engine)**\n\n"
-        "Отправьте бриф. Бот формирует 3 поисковых дорка, опрашивает джоб-борды и ATS-системы, "
-        "выкачивает полные тексты страниц и проводит жесткий скоринг.",
+        "Отправьте бриф. Бот формирует каскадные дорки, опрашивает открытые базы и Google X-Ray, "
+        "выкачивает страницы вакансий целиком и проводит матричный скоринг.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -370,7 +371,7 @@ async def handle_vacancy(message: Message):
 
     status_msg = await message.answer("⚡️ [1/4] Генерация 3 поисковых гипотез и извлечение сущностей...")
 
-    # Шаг 1: Формирование поисковых дорков через Groq
+    # Шаг 1: Groq формирует 3 поисковых дорка
     prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
 Разбери бриф и верни JSON со строгой структурой:
 {{
@@ -386,7 +387,7 @@ async def handle_vacancy(message: Message):
 БРИФ:
 \"\"\"{user_text[:900]}\"\"\""""
 
-    extract_raw, _ = await call_groq_async(prompt_extract, max_tokens=350, json_mode=True)
+    extract_raw, err = await call_groq_async(prompt_extract, max_tokens=350, json_mode=True)
     try:
         brief_profile = json.loads(extract_raw)
     except Exception:
@@ -408,7 +409,7 @@ async def handle_vacancy(message: Message):
 
     await safe_edit_status(status_msg, "🔍 [2/4] Запуск 3 поисковых волн (Google X-Ray, Хабр, ATS, SuperJob, TG)...")
 
-    # Шаг 2: Каскадный параллельный опрос
+    # Шаг 2: Каскадный поиск
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             fetch_habr(http_client, primary_tech, 6),
@@ -424,7 +425,7 @@ async def handle_vacancy(message: Message):
             # Волна 2: Технический кластер
             tasks.append(search_google_custom(http_client, cluster_query, count=5))
 
-            # Волна 3: Поиск прямо по ATS-системам
+            # Волна 3: Прямой поиск по ATS-системам
             ats_query = f"(site:huntflow.io OR site:potok.io) {primary_tech} {brief_profile.get('role', '')}"
             tasks.append(search_google_custom(http_client, ats_query, count=4))
 
@@ -503,7 +504,7 @@ async def handle_vacancy(message: Message):
 
     result_text, err = await call_groq_async(prompt_matrix, max_tokens=1600)
     if not result_text:
-        await safe_edit_status(status_msg, f"⚠️ Ошибка обработки: {err}")
+        await safe_edit_status(status_msg, f"⚠️ Не удалось выполнить скоринг через Groq: {err}")
         return
 
     enhanced_lines = []
