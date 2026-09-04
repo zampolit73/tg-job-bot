@@ -11,7 +11,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncpg
 import httpx
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from groq import AsyncGroq
@@ -47,6 +47,9 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 ACTIVE_GROQ_MODEL = None
 BOT_USER_ID = None
 db_pool = None
+
+# Локальный кэш исключенных ID для мгновенной проверки
+IGNORED_CHATS_CACHE = set()
 
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
@@ -86,9 +89,9 @@ def run_health_server():
     server.serve_forever()
 
 
-# ----------------- РАБОТА С SUPABASE (POSTGRESQL) -----------------
+# ----------------- РАБОТА С SUPABASE -----------------
 async def init_db():
-    global db_pool
+    global db_pool, IGNORED_CHATS_CACHE
     if not DATABASE_URL:
         logger.warning("DATABASE_URL не задан, работа с БД отключена.")
         return
@@ -106,9 +109,44 @@ async def init_db():
             timeout=10.0
         )
         logger.info("Подключение к Supabase PostgreSQL успешно установлено!")
+
+        # Загружаем сохраненный черный список из БД
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT chat_id FROM ignored_chats;")
+            IGNORED_CHATS_CACHE = {r["chat_id"] for r in rows}
+            logger.info(f"Загружено исключенных чатов из БД: {len(IGNORED_CHATS_CACHE)}")
     except Exception as e:
         logger.error(f"Не удалось подключиться к Supabase: {e}")
         db_pool = None
+
+
+async def toggle_ignore_chat(chat_id: int, chat_title: str) -> bool:
+    """Переключает статус чата: игнорировать / сканировать. Возвращает True, если чат теперь игнорируется."""
+    global IGNORED_CHATS_CACHE
+    if not db_pool:
+        if chat_id in IGNORED_CHATS_CACHE:
+            IGNORED_CHATS_CACHE.remove(chat_id)
+            return False
+        else:
+            IGNORED_CHATS_CACHE.add(chat_id)
+            return True
+
+    try:
+        async with db_pool.acquire() as conn:
+            if chat_id in IGNORED_CHATS_CACHE:
+                await conn.execute("DELETE FROM ignored_chats WHERE chat_id = $1;", chat_id)
+                IGNORED_CHATS_CACHE.remove(chat_id)
+                return False
+            else:
+                await conn.execute(
+                    "INSERT INTO ignored_chats (chat_id, chat_title) VALUES ($1, $2) ON CONFLICT DO NOTHING;",
+                    chat_id, chat_title
+                )
+                IGNORED_CHATS_CACHE.add(chat_id)
+                return True
+    except Exception as e:
+        logger.error(f"Ошибка изменения статуса игнорирования чата: {e}")
+        return chat_id in IGNORED_CHATS_CACHE
 
 
 async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: str, url: str):
@@ -305,17 +343,16 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                 if not message.text or len(message.text) < 40:
                     continue
 
-                if message.chat_id == bot_id:
+                if message.chat_id == bot_id or message.chat_id in IGNORED_CHATS_CACHE:
                     continue
 
                 chat = await message.get_chat()
 
-                # Игнорируем ЛИЧНЫЕ ДИАЛОГИ (1 на 1)
+                # Игнорируем личные диалоги 1 на 1
                 if isinstance(chat, User) or getattr(chat, 'is_user', False):
                     continue
 
                 chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Channel'))
-
                 if "matcher" in chat_title.lower() or "bot" in chat_title.lower():
                     continue
 
@@ -402,6 +439,9 @@ def register_telethon_listener():
             if event.is_private or not event.text or len(event.text) < 40:
                 return
 
+            if event.chat_id in IGNORED_CHATS_CACHE:
+                return
+
             text_lower = event.text.lower()
             if any(k in text_lower for k in ("вакансия", "ищем", "senior", "middle", "lead", "remote", "developer", "инженер")):
                 chat = await event.get_chat()
@@ -413,15 +453,78 @@ def register_telethon_listener():
             pass
 
 
+# ----------------- ИНТЕРФЕЙС УПРАВЛЕНИЯ ЧАТАМИ -----------------
+async def build_chats_keyboard() -> tuple[str, InlineKeyboardMarkup]:
+    dialogs = await telethon_client.get_dialogs(limit=35)
+    keyboard = []
+    text_lines = [
+        "⚙️ **Управление источниками поиска**\n",
+        "Нажмите на чат, чтобы включить или исключить его из поиска:\n",
+        "• ✅ — чат сканируется",
+        "• ⛔️ — чат исключен (игнорируется)\n"
+    ]
+
+    for d in dialogs:
+        if d.is_group or d.is_channel:
+            c_id = d.id
+            name = d.name[:25]
+            is_ignored = c_id in IGNORED_CHATS_CACHE
+            icon = "⛔️" if is_ignored else "✅"
+            button_text = f"{icon} {name}"
+            cb_data = f"tg_ign:{c_id}"
+            keyboard.append([InlineKeyboardButton(text=button_text, callback_data=cb_data)])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return "\n".join(text_lines), markup
+
+
 # ----------------- ХЭНДЛЕРЫ AIOGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 Multi-Source OSINT Lead Hunter (с базой Supabase)\n\n"
-        "Отправьте бриф вакансии. Бот выполнит поиск по облачной базе вакансий, "
-        "рабочим группам в Telegram и внешним источникам.",
+        "💼 Multi-Source OSINT Lead Hunter\n\n"
+        "Команды:\n"
+        "• /manage_chats — интерактивное меню с кнопками для исключения ненужных чатов\n"
+        "• /debug_tg — статус базы и подключение к Telegram\n\n"
+        "Отправьте бриф вакансии в чат для поиска лидов.",
         parse_mode=None
     )
+
+
+@dp.message(F.text == "/manage_chats")
+async def cmd_manage_chats(message: Message):
+    if not telethon_client or not telethon_client.is_connected():
+        await message.answer("⚠️ Telethon не подключен к Telegram.", parse_mode=None)
+        return
+
+    status = await message.answer("🔄 Загружаю список каналов...")
+    try:
+        text, markup = await build_chats_keyboard()
+        await status.edit_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await status.edit_text(f"⚠️ Ошибка формирования клавиатуры: {e}", parse_mode=None)
+
+
+@dp.callback_query(F.data.startswith("tg_ign:"))
+async def handle_toggle_chat(call: CallbackQuery):
+    chat_id = int(call.data.split(":")[1])
+    try:
+        chat = await telethon_client.get_entity(chat_id)
+        chat_title = getattr(chat, 'title', str(chat_id))
+    except Exception:
+        chat_title = str(chat_id)
+
+    # Переключаем статус в базе данных и кэше
+    is_now_ignored = await toggle_ignore_chat(chat_id, chat_title)
+    status_label = "исключен из поиска ⛔️" if is_now_ignored else "снова активен ✅"
+    await call.answer(f"Чат {status_label}", show_alert=False)
+
+    # Обновляем кнопки на экране
+    try:
+        text, markup = await build_chats_keyboard()
+        await call.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        pass
 
 
 @dp.message(F.text == "/debug_tg")
@@ -432,13 +535,18 @@ async def cmd_debug(message: Message):
         return
     try:
         me = await telethon_client.get_me()
-        dialogs = await telethon_client.get_dialogs(limit=12)
-        group_lines = [f"- {d.name}" for d in dialogs if (d.is_group or d.is_channel)][:6]
-        chats_list = "\n".join(group_lines) if group_lines else "Группы не найдены"
+        dialogs = await telethon_client.get_dialogs(limit=15)
+        active_lines = []
+        for d in dialogs:
+            if (d.is_group or d.is_channel) and d.id not in IGNORED_CHATS_CACHE:
+                active_lines.append(f"- {d.name}")
+
+        chats_list = "\n".join(active_lines[:6]) if active_lines else "Нет активных групп"
         response = (
             f"🗄 База данных Supabase: {db_status}\n"
             f"👤 Telethon аккаунт: {me.first_name} (@{me.username})\n"
-            f"📂 Доступные группы и каналы:\n{chats_list}\n\n"
+            f"🚫 Исключено чатов: {len(IGNORED_CHATS_CACHE)}\n"
+            f"📂 Активные рабочие группы:\n{chats_list}\n\n"
             f"🔒 Защита приватности: Личные переписки (1 на 1) исключены."
         )
         await message.answer(response, parse_mode=None)
@@ -480,7 +588,7 @@ async def handle_vacancy(message: Message):
     # 1. Поиск в Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Поиск в открытых чатах и на Хабре
+    # 2. Поиск в Telegram и на Хабре
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
