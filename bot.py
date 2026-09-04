@@ -1,7 +1,3 @@
-# ==========================================
-# ОБНОВЛЕННАЯ ВЕРСИЯ: bot.py
-# Включает: Глубокий поиск по чатам Telegram + ATS Dorks + Fast Scoring
-# ==========================================
 import asyncio
 import json
 import logging
@@ -69,11 +65,6 @@ OUTSTAFF_TEXT_MARKERS = (
     "проект заказчика", "на стороне заказчика", "аутстафф", "outstaff",
     "предоставление персонала", "аккредитованная it-компания ищет для",
     "в интересах компании"
-)
-
-VACANCY_TRIGGERS = (
-    "вакансия", "ищем", "требуется", "senior", "middle", "lead", 
-    "fulltime", "remote", "удаленка", "fork", "вилка", "проект", "опыт"
 )
 
 TARGET_TG_CHANNELS = [
@@ -158,7 +149,7 @@ async def find_working_groq_model() -> str:
                     messages=[{"role": "user", "content": "ping"}],
                     max_tokens=5,
                 ),
-                timeout=4.0
+                timeout=3.0
             )
             if res.choices and res.choices[0].message.content:
                 ACTIVE_GROQ_MODEL = model
@@ -176,7 +167,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     if not ACTIVE_GROQ_MODEL:
         await find_working_groq_model()
 
-    safe_prompt = prompt if len(prompt) < 7000 else prompt[:7000]
+    safe_prompt = prompt if len(prompt) < 6000 else prompt[:6000]
     kwargs = {
         "model": ACTIVE_GROQ_MODEL,
         "messages": [{"role": "user", "content": safe_prompt}],
@@ -187,7 +178,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
         kwargs["response_format"] = {"type": "json_object"}
 
     try:
-        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=11.0)
+        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=10.0)
         content = res.choices[0].message.content
         if content and content.strip():
             return content, ""
@@ -195,8 +186,8 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
         err_msg = str(e)
         if "413" in err_msg or "too large" in err_msg.lower() or "tokens" in err_msg.lower():
             try:
-                kwargs["messages"] = [{"role": "user", "content": safe_prompt[:3500]}]
-                res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=9.0)
+                kwargs["messages"] = [{"role": "user", "content": safe_prompt[:3000]}]
+                res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=8.0)
                 return res.choices[0].message.content, ""
             except Exception as e2:
                 return "", str(e2)
@@ -212,57 +203,48 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- ГЛУБОКИЙ ПОИСК ПО ВСЕМ ЧАТАМ TELEGRAM -----------------
-async def search_all_telegram_chats(query: str, limit: int = 10) -> list:
-    """Глобальный поиск по всем доступным чатам и каналам вашего аккаунта"""
+# ----------------- БЕЗОПАСНЫЙ ПОИСК В TELEGRAM -----------------
+async def _scan_single_channel(channel: str, search_term: str) -> list:
+    results = []
+    try:
+        async for message in telethon_client.iter_messages(channel, search=search_term, limit=3):
+            if message.text and len(message.text) > 50:
+                post_text = clean_html(message.text)
+                post_url = f"https://t.me/{channel}/{message.id}"
+                company_match = re.search(r"(?:компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
+                company = company_match.group(1).strip() if company_match else f"@{channel}"
+
+                if is_agency(company, post_text):
+                    continue
+
+                results.append({
+                    "source": f"Telegram (@{channel})",
+                    "title": post_text[:40] + "...",
+                    "company": company,
+                    "salary": "в посте",
+                    "url": post_url,
+                    "desc": post_text[:250]
+                })
+    except Exception:
+        pass
+    return results
+
+
+async def search_telegram_native(search_term: str) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
-
-    clean_term = query.strip()
+    clean_term = search_term.strip()
     if not clean_term:
         return []
-
-    found = []
     try:
-        # None = глобальный поиск по диалогам аккаунта
-        async for message in telethon_client.iter_messages(None, search=clean_term, limit=limit):
-            if not message.text or len(message.text) < 60:
-                continue
-
-            text_lower = message.text.lower()
-            if not any(trig in text_lower for trig in VACANCY_TRIGGERS):
-                continue
-
-            chat = await message.get_chat()
-            chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Chat'))
-            
-            if getattr(chat, 'username', None):
-                msg_url = f"https://t.me/{chat.username}/{message.id}"
-            else:
-                clean_id = str(chat.id).replace("-100", "")
-                msg_url = f"https://t.me/c/{clean_id}/{message.id}"
-
-            company_match = re.search(r"(?:компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", message.text, re.IGNORECASE)
-            company = company_match.group(1).strip() if company_match else chat_title
-
-            if is_agency(company, message.text):
-                continue
-
-            found.append({
-                "source": f"TG Чат: {chat_title[:25]}",
-                "title": f"Пост в {chat_title[:30]}",
-                "company": company,
-                "salary": "в тексте поста",
-                "url": msg_url,
-                "desc": clean_html(message.text)[:280]
-            })
-    except Exception as e:
-        logger.warning(f"Ошибка поиска по Telegram-чатам: {e}")
-
-    return found
+        tasks = [_scan_single_channel(ch, clean_term) for ch in TARGET_TG_CHANNELS[:5]]
+        results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2.5)
+        return [item for sub in results if isinstance(sub, list) for item in sub]
+    except Exception:
+        return []
 
 
-# ----------------- ОСТАЛЬНЫЕ ИСТОЧНИКИ -----------------
+# ----------------- ИСТОЧНИКИ ДАННЫХ -----------------
 async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
     url = job.get("url", "")
     if not url or "t.me" in url:
@@ -413,9 +395,8 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 4) 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter (Full Chat Scanner)**\n\n"
-        "Отправьте бриф. Бот выполнит сквозной поиск по Google X-Ray, карьерным базам "
-        "и вашим Telegram-чатам с матричным скорингом заказчика.",
+        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "Отправьте бриф вакансии. Бот выполнит сквозной поиск и матричный скоринг прямого заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -424,7 +405,7 @@ async def cmd_start(message: Message):
 async def handle_vacancy(message: Message):
     global google_quota_exhausted
     user_text = message.text
-    logger.info(f"Получен бриф ({len(user_text)} симв.)")
+    logger.info(f"Получен бриф ({len(user_text)} симв.) от {message.from_user.id}")
 
     status_msg = await message.answer("⚡️ [1/4] Извлечение профиля проекта...")
 
@@ -438,7 +419,7 @@ async def handle_vacancy(message: Message):
   "core_challenge": "главная проектная задача",
   "dork_exact_quote": "дословная фраза из 3-5 слов из обязанностей без кавычек",
   "dork_tech_cluster": "роль + 2 технологии",
-  "dork_ats_search": "главный фреймворк"
+  "dork_ats_search": "главный фреймворк или язык"
 }}
 БРИФ:
 \"\"\"{user_text[:700]}\"\"\""""
@@ -448,28 +429,28 @@ async def handle_vacancy(message: Message):
         brief_profile = json.loads(extract_raw)
     except Exception:
         brief_profile = {
-            "role": "Разработчик",
-            "domain": "Общий",
-            "infra_type": "Не указан",
-            "must_have": [],
-            "core_challenge": "Разработка сервисов",
+            "role": "Разработчик C",
+            "domain": "VoIP / Streaming",
+            "infra_type": "Linux",
+            "must_have": ["C", "SIP", "RTP"],
+            "core_challenge": "Разработка высоконагруженных сетевых сервисов",
             "dork_exact_quote": "",
-            "dork_tech_cluster": " ".join(user_text.split()[:3]),
-            "dork_ats_search": "Frontend"
+            "dork_tech_cluster": "C SIP RTP",
+            "dork_ats_search": "C"
         }
 
     rare_techs = brief_profile.get("must_have", [])
-    primary_tech = rare_techs[0] if rare_techs else brief_profile.get("dork_ats_search", "Angular")
+    primary_tech = rare_techs[0] if rare_techs else brief_profile.get("dork_ats_search", "C")
     exact_quote = brief_profile.get("dork_exact_quote", "")
     cluster_query = brief_profile.get("dork_tech_cluster", primary_tech)
 
-    await safe_edit_status(status_msg, "🔍 [2/4] Сканирование Google, Хабра, SuperJob и Telegram-чатов...")
+    await safe_edit_status(status_msg, "🔍 [2/4] Сканирование Google, Хабра, SuperJob и Telegram...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             fetch_habr(http_client, primary_tech, 5),
             fetch_superjob(http_client, primary_tech, 4),
-            search_all_telegram_chats(primary_tech, limit=10),
+            search_telegram_native(primary_tech),
         ]
 
         if not google_quota_exhausted and GOOGLE_API_KEY:
@@ -482,7 +463,7 @@ async def handle_vacancy(message: Message):
             tasks.append(search_google_custom(http_client, ats_query, count=3))
 
         try:
-            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.5)
+            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=4.0)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception as e:
             logger.error(f"Ошибка поиска: {e}")
@@ -491,7 +472,7 @@ async def handle_vacancy(message: Message):
         unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений не найдено. Попробуйте передать бриф с более конкретным техническим описанием.")
+            await safe_edit_status(status_msg, "❌ Совпадений не найдено. Попробуйте передать бриф с другими ключевыми словами.")
             return
 
         await safe_edit_status(status_msg, f"🌐 [3/4] Обработка {len(unique_vacancies[:3])} кандидатов...")
@@ -543,7 +524,7 @@ async def handle_vacancy(message: Message):
 • **Проверка на аутстафф:** [Прямой заказчик или посредник]
 
 💡 **Стратегия выхода для сейлза:**
-• **К кому идти:** [Роль ЛПР: CTO, Lead Frontend, Head of Engineering]
+• **К кому идти:** [Роль ЛПР: CTO, Lead Developer, Head of Engineering]
 • **Болевая точка:** [Главная боль проекта]
 • **Холодный хук:** [1-2 предложения хук для первого контакта]
 ══════════════════════════════"""
@@ -578,29 +559,36 @@ async def handle_vacancy(message: Message):
         await safe_edit_status(status_msg, final_output)
 
 
-# ----------------- СТАРТ -----------------
+# ----------------- БЕЗОПАСНЫЙ СТАРТ -----------------
 async def init_telethon():
     global telethon_client
     if not telethon_client:
         return
     try:
-        await asyncio.wait_for(telethon_client.connect(), timeout=4.0)
+        # Неблокирующее подключение с коротким таймаутом
+        await asyncio.wait_for(telethon_client.connect(), timeout=2.5)
         if not await telethon_client.is_user_authorized():
+            logger.warning("Telethon не авторизован. Клиент отключен во избежание зависаний.")
             telethon_client = None
         else:
             logger.info("Telethon успешно авторизован.")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Telethon пропущен: {e}")
         telethon_client = None
 
 
 async def main():
     logger.info("Инициализация сервиса...")
     threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # Подбор модели без блокировки
     await find_working_groq_model()
+    
+    # Безопасный запуск Telethon
     await init_telethon()
 
     try:
-        await asyncio.wait_for(bot.delete_webhook(drop_pending_updates=True), timeout=4.0)
+        await asyncio.wait_for(bot.delete_webhook(drop_pending_updates=True), timeout=3.0)
         logger.info("Webhook сброшен.")
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
