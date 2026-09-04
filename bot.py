@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import sys
 import threading
 from urllib.parse import quote_plus
@@ -92,7 +93,18 @@ async def init_db():
         logger.warning("DATABASE_URL не задан, работа с БД отключена.")
         return
     try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, timeout=10.0)
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        clean_url = DATABASE_URL.strip().replace("?sslmode=require", "")
+        db_pool = await asyncpg.create_pool(
+            clean_url,
+            ssl=ssl_ctx,
+            min_size=1,
+            max_size=4,
+            timeout=10.0
+        )
         logger.info("Подключение к Supabase PostgreSQL успешно установлено!")
     except Exception as e:
         logger.error(f"Не удалось подключиться к Supabase: {e}")
@@ -118,7 +130,6 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
         return []
     results = []
     try:
-        # Ищем по ключевым терминам через ILIKE
         like_clauses = " OR ".join([f"post_text ILIKE ${i+1}" for i in range(len(terms))])
         params = [f"%{t}%" for t in terms]
         query = f"""
@@ -322,7 +333,6 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
                     clean_id = str(chat.id).replace("-100", "")
                     msg_url = f"https://t.me/c/{clean_id}/{message.id}"
 
-                # Автоматически сохраняем найденный пост в Supabase
                 asyncio.create_task(save_vacancy_to_db(chat_title, message.id, message.chat_id, post_text, msg_url))
 
                 company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
@@ -381,7 +391,7 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
         return []
 
 
-# ----------------- ФОНОВЫЙ LISTENER ТЕЛЕГРАМА В SUPABASE -----------------
+# ----------------- ФОНОВЫЙ СЛУШАТЕЛЬ В SUPABASE -----------------
 def register_telethon_listener():
     if not telethon_client:
         return
@@ -389,12 +399,10 @@ def register_telethon_listener():
     @telethon_client.on(events.NewMessage)
     async def handler_new_message(event):
         try:
-            # Игнорируем приватные диалоги 1 на 1
             if event.is_private or not event.text or len(event.text) < 40:
                 return
 
             text_lower = event.text.lower()
-            # Фильтр ключевых слов вакансий
             if any(k in text_lower for k in ("вакансия", "ищем", "senior", "middle", "lead", "remote", "developer", "инженер")):
                 chat = await event.get_chat()
                 chat_title = getattr(chat, 'title', 'TG Группа')
@@ -410,8 +418,8 @@ def register_telethon_listener():
 async def cmd_start(message: Message):
     await message.answer(
         "💼 Multi-Source OSINT Lead Hunter (с базой Supabase)\n\n"
-        "Отправьте бриф вакансии. Бот выполнит моментальный поиск по облачной базе вакансий, "
-        "вашим группам в Telegram и внешним источникам.",
+        "Отправьте бриф вакансии. Бот выполнит поиск по облачной базе вакансий, "
+        "рабочим группам в Telegram и внешним источникам.",
         parse_mode=None
     )
 
@@ -420,7 +428,7 @@ async def cmd_start(message: Message):
 async def cmd_debug(message: Message):
     db_status = "✅ Подключена" if db_pool else "❌ Не подключена"
     if not telethon_client or not telethon_client.is_connected():
-        await message.answer(f"База данных: {db_status}\nTelethon: ⚠️ Не подключен к Telegram.", parse_mode=None)
+        await message.answer(f"🗄 База данных Supabase: {db_status}\nTelethon: ⚠️ Не подключен к Telegram.", parse_mode=None)
         return
     try:
         me = await telethon_client.get_me()
@@ -469,10 +477,10 @@ async def handle_vacancy(message: Message):
 
     await safe_edit_status(status_msg, f"🔍 [2/3] Поиск в Supabase и рабочих группах по {search_terms}...")
 
-    # 1. Сначала мгновенный поиск по локальной базе Supabase
+    # 1. Поиск в Supabase
     db_results = await search_vacancies_in_db(search_terms, user_text)
 
-    # 2. Параллельный поиск по внешним источникам и активным чатам Telegram
+    # 2. Поиск в открытых чатах и на Хабре
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
             search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
