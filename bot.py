@@ -85,20 +85,18 @@ def run_health_server():
     server.serve_forever()
 
 
-# ----------------- СРАВНЕНИЕ ТЕКСТОВ НА СХОДСТВО -----------------
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
 
 def extract_key_tokens(text: str) -> set:
-    """Извлекает значимые технические слова, игнорируя предлоги"""
     words = re.findall(r'[A-Za-zА-Яа-я0-9\+\#\.\/\-]{3,}', text.lower())
-    stop_words = {"для", "или", "как", "все", "при", "опыт", "работа", "года", "знание", "умение"}
+    stop_words = {"для", "или", "как", "все", "при", "опыт", "работа", "года", "знание", "умение", "будет"}
     return {w for w in words if w not in stop_words}
 
 
 def calculate_overlap_score(brief_text: str, candidate_text: str) -> float:
-    """Вычисляет прямое процентное сходство между присланной вакансией и найденным постом"""
     brief_tokens = extract_key_tokens(brief_text)
     cand_tokens = extract_key_tokens(candidate_text)
     if not brief_tokens or not cand_tokens:
@@ -148,7 +146,7 @@ async def find_working_groq_model() -> str:
             if am not in candidate_models and "qwen" not in am:
                 candidate_models.append(am)
     except Exception as e:
-        logger.warning(f"Ошибка проверки списка моделей: {e}")
+        logger.warning(f"Ошибка проверки моделей: {e}")
 
     for model in candidate_models:
         try:
@@ -212,121 +210,69 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- ТОЧНЫЙ ПОИСК ПО ВАШИМ ЧАТАМ TELEGRAM -----------------
-async def search_joined_chats_by_terms(search_terms: list, raw_brief: str) -> list:
-    """Ищет по нескольким ключевым маркерам и сравнивает текст с оригинальным брифом"""
+# ----------------- БЫСТРЫЙ ГЛОБАЛЬНЫЙ ПОИСК ПО ВСЕМ ЧАТАМ -----------------
+async def search_joined_chats_global(search_terms: list, raw_brief: str) -> list:
+    """Глобальный поиск сразу по всей базе всех ваших чатов через MTProto API"""
     if not telethon_client or not telethon_client.is_connected():
-        logger.warning("Telethon не подключен.")
+        logger.warning("Telethon не подключен к Telegram.")
         return []
 
     found_posts = []
     seen_ids = set()
 
+    # Ищем по каждому ключевому маркеру
     for term in search_terms:
         clean_t = term.strip()
         if len(clean_t) < 3:
             continue
 
         try:
-            logger.info(f"Поиск в диалогах Telegram по маркеру: '{clean_t}'...")
-            async for dialog in telethon_client.iter_dialogs(limit=40):
-                if not (dialog.is_group or dialog.is_channel):
+            logger.info(f"Глобальный поиск в TG по маркеру: '{clean_t}'...")
+            # entity=None — поиск по всем доступным чатам аккаунта в один запрос!
+            async for message in telethon_client.iter_messages(None, search=clean_t, limit=10):
+                if not message.text or len(message.text) < 40:
                     continue
 
-                try:
-                    async for message in telethon_client.iter_messages(dialog.entity, search=clean_t, limit=4):
-                        if not message.text or len(message.text) < 50:
-                            continue
-
-                        unique_key = f"{dialog.id}_{message.id}"
-                        if unique_key in seen_ids:
-                            continue
-                        seen_ids.add(unique_key)
-
-                        post_text = clean_html(message.text)
-                        
-                        # Расчет точного текстового сходства с присланным брифом
-                        overlap = calculate_overlap_score(raw_brief, post_text)
-
-                        # Если совпадение больше 25%, это явный кандидат
-                        if overlap > 25.0 or clean_t.lower() in post_text.lower():
-                            if getattr(dialog.entity, 'username', None):
-                                msg_url = f"https://t.me/{dialog.entity.username}/{message.id}"
-                            else:
-                                clean_id = str(dialog.entity.id).replace("-100", "")
-                                msg_url = f"https://t.me/c/{clean_id}/{message.id}"
-
-                            company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
-                            company = company_match.group(1).strip() if company_match else dialog.name
-
-                            found_posts.append({
-                                "source": f"Ваш чат: {dialog.name[:25]}",
-                                "title": f"Пост в {dialog.name[:25]} (Сходство текста: {overlap}%)",
-                                "company": company,
-                                "salary": "в тексте поста",
-                                "url": msg_url,
-                                "desc": post_text[:350],
-                                "overlap": overlap
-                            })
-                except Exception:
+                unique_key = f"{message.chat_id}_{message.id}"
+                if unique_key in seen_ids:
                     continue
+                seen_ids.add(unique_key)
+
+                post_text = clean_html(message.text)
+                overlap = calculate_overlap_score(raw_brief, post_text)
+
+                chat = await message.get_chat()
+                chat_title = getattr(chat, 'title', getattr(chat, 'username', 'Telegram Chat'))
+
+                # Формирование правильной ссылки на пост
+                if getattr(chat, 'username', None):
+                    msg_url = f"https://t.me/{chat.username}/{message.id}"
+                else:
+                    clean_id = str(chat.id).replace("-100", "")
+                    msg_url = f"https://t.me/c/{clean_id}/{message.id}"
+
+                company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
+                company = company_match.group(1).strip() if company_match else chat_title
+
+                found_posts.append({
+                    "source": f"TG Чат: {chat_title[:25]}",
+                    "title": f"Пост в {chat_title[:25]} (Сходство: {overlap}%)",
+                    "company": company,
+                    "salary": "в тексте поста",
+                    "url": msg_url,
+                    "desc": post_text[:350],
+                    "overlap": overlap
+                })
         except Exception as e:
-            logger.warning(f"Ошибка при поиске маркера {clean_t}: {e}")
+            logger.warning(f"Ошибка при поиске маркера '{clean_t}': {e}")
 
-    # Сортируем: посты с наибольшим совпадением текста идут первыми
+    # Сортируем: сначала с наибольшим процентом совпадения текста
     found_posts.sort(key=lambda x: x.get("overlap", 0), reverse=True)
+    logger.info(f"Глобальный поиск нашел {len(found_posts)} постов в чатах.")
     return found_posts[:5]
 
 
 # ----------------- ВНЕШНИЕ ИСТОЧНИКИ ДАННЫХ -----------------
-async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
-    global google_quota_exhausted
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or google_quota_exhausted:
-        return []
-
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query,
-        "num": min(count, 10),
-        "gl": "ru",
-        "hl": "ru"
-    }
-
-    try:
-        r = await client.get(url, params=params, timeout=2.5)
-        if r.status_code in (429, 403):
-            google_quota_exhausted = True
-            return []
-        if r.status_code != 200:
-            return []
-
-        jobs = []
-        for item in r.json().get("items", []):
-            title = item.get("title", "")
-            link = item.get("link", "")
-            snippet = clean_html(item.get("snippet", ""))
-            company_match = re.search(r"(?:в компании|—)\s+([^|\-—\(\)]+)", title, re.IGNORECASE)
-            company = company_match.group(1).strip() if company_match else "Прямой работодатель"
-
-            if is_agency(company, snippet):
-                continue
-
-            jobs.append({
-                "source": "Google Search",
-                "title": title[:60],
-                "company": company,
-                "salary": "в описании",
-                "url": link,
-                "desc": snippet[:250],
-                "overlap": 0.0
-            })
-        return jobs
-    except Exception:
-        return []
-
-
 async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
@@ -368,10 +314,33 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> l
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф. Бот выполнит поиск по вашим Telegram-чатам, проверит дословные "
-        "совпадения и выдаст матричный скоринг прямого заказчика.",
+        "Отправьте бриф вакансии. Бот выполнит сквозной глобальный поиск по вашим Telegram-чатам "
+        "и открытым базам с детальным сравнением оригинала.",
         parse_mode=ParseMode.MARKDOWN
     )
+
+
+@dp.message(F.text == "/debug_tg")
+async def cmd_debug(message: Message):
+    """Команда проверки состояния Telethon"""
+    if not telethon_client:
+        await message.answer("❌ Telethon не инициализирован (проверьте переменные TG_API_ID, TG_SESSION_STRING в Render).")
+        return
+    if not telethon_client.is_connected():
+        await message.answer("⚠️ Telethon не подключен к сети Telegram.")
+        return
+    try:
+        me = await telethon_client.get_me()
+        dialogs = await telethon_client.get_dialogs(limit=10)
+        chats_list = "\n".join([f"• {d.name}" for d in dialogs[:5]])
+        await message.answer(
+            f"✅ **Telethon активен!**\n"
+            f"👤 Аккаунт: **{me.first_name}** (@{me.username})\n"
+            f"📂 Первые чаты в списке:\n{chats_list}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка при проверке Telethon: {e}")
 
 
 @dp.message(F.text)
@@ -382,72 +351,50 @@ async def handle_vacancy(message: Message):
 
     status_msg = await message.answer("⚡️ [1/4] Извлечение ключевых маркеров для поиска...")
 
-    # Автоматическое извлечение самых редких технических маркеров прямо из текста
+    # Автоматическое извлечение редких терминов (английские и русские корни)
     detected_markers = []
-    candidates_raw = re.findall(r'\b[A-Za-z0-9\.\/\-]{3,}\b', user_text)
-    known_tech = {"sip", "rtp", "rtcp", "voip", "g.711", "g.729", "h.264", "webrtc", "netfilter", "iptables", "valgrind", "cmake", "nginx", "angular"}
-    for word in candidates_raw:
-        if word.lower() in known_tech and word not in detected_markers:
+    # Находим все слова на латинице от 3 символов
+    latin_words = re.findall(r'\b[A-Za-z0-9\.\/\+\#\-]{3,}\b', user_text)
+    for word in latin_words:
+        w_lower = word.lower()
+        if w_lower not in {"the", "and", "for", "with", "from"} and word not in detected_markers:
             detected_markers.append(word)
 
+    # Добавляем специфичные русские корни
+    if "микрофронт" in user_text.lower():
+        detected_markers.append("микрофронт")
+    if "телефон" in user_text.lower() or "voip" in user_text.lower():
+        detected_markers.append("VoIP")
+
     if not detected_markers:
-        detected_markers = ["VoIP", "SIP", "Linux"]
+        detected_markers = ["Angular", "JavaScript"]
 
-    prompt_extract = f"""Ты — technical recruiter. Разбери бриф и верни JSON:
-{{
-  "role": "название роли",
-  "domain": "домен проекта",
-  "must_have": ["список", "редких", "технологий"],
-  "core_challenge": "главная проектная задача (1 предложение)",
-  "dork_exact_quote": "дословная строгая фраза из 3-4 слов из обязанностей"
-}}
-БРИФ:
-\"\"\"{user_text[:700]}\"\"\""""
+    # Берем ТОП-3 самых характерных маркера
+    search_terms = detected_markers[:3]
 
-    extract_raw, err = await call_groq_async(prompt_extract, max_tokens=300, json_mode=True)
-    try:
-        brief_profile = json.loads(extract_raw)
-    except Exception:
-        brief_profile = {
-            "role": "Разработчик C",
-            "domain": "VoIP / Streaming",
-            "must_have": detected_markers,
-            "core_challenge": "Разработка сетевых сервисов",
-            "dork_exact_quote": ""
-        }
-
-    search_terms = list(set(detected_markers + brief_profile.get("must_have", [])))[:4]
-    primary_term = search_terms[0] if search_terms else "VoIP"
-    exact_quote = brief_profile.get("dork_exact_quote", "")
-
-    await safe_edit_status(status_msg, f"🔍 [2/4] Сканирование чатов Telegram по маркерам {search_terms}...")
+    await safe_edit_status(status_msg, f"🔍 [2/4] Глобальный поиск в ваших Telegram-чатах по {search_terms}...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
-            search_joined_chats_by_terms(search_terms, user_text),
-            fetch_habr(http_client, primary_term, 4),
+            search_joined_chats_global(search_terms, user_text),
+            fetch_habr(http_client, search_terms[0], 4),
         ]
 
-        if not google_quota_exhausted and GOOGLE_API_KEY:
-            if len(exact_quote.split()) >= 3:
-                tasks.append(search_google_custom(http_client, f'"{exact_quote}"', count=3))
-            tasks.append(search_google_custom(http_client, f"{primary_term} вакансия", count=3))
-
         try:
-            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.5)
+            # Увеличен таймаут, чтобы Telegram успел отдать сообщения
+            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10.0)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception as e:
             logger.error(f"Ошибка поиска: {e}")
             valid_results = []
 
-        # Удаляем дубли по URL
         unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений в чатах не найдено. Проверьте, есть ли этот аккаунт в нужном чате.")
+            await safe_edit_status(status_msg, "❌ Совпадений в чатах не найдено. Нажмите /debug_tg, чтобы проверить статус подключения.")
             return
 
-    await safe_edit_status(status_msg, f"🧠 [3/4] Сравнение вакансии с {len(unique_vacancies[:4])} кандидатами...")
+    await safe_edit_status(status_msg, f"🧠 [3/4] Сравнение текста с {len(unique_vacancies[:4])} кандидатами...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
@@ -455,7 +402,7 @@ async def handle_vacancy(message: Message):
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
         f"Текстовое совпадение с брифом: {v.get('overlap', 0)}%\n"
-        f"Описание/Пост: {v['desc'][:300]}\n"
+        f"Описание/Пост: {v['desc'][:350]}\n"
         for idx, v in enumerate(unique_vacancies[:4], 1)
     ]
     candidates_payload = "\n".join(compact_candidates)
@@ -469,8 +416,8 @@ async def handle_vacancy(message: Message):
 {candidates_payload}
 
 ПРАВИЛА:
-1. Если кандидат взят из Telegram-чата и в описании совпадают протоколы (SIP, RTP, VoIP, Linux) или совпадение > 30% — ставь скор 85-99% и статус '🟢 Точный оригинал'.
-2. Если это общая вакансия без специфики VoIP/RTP — ставь скор <= 40%.
+1. Если кандидат из Telegram-чата и совпадение текста > 25% или совпал ключевой стек — ставь скор 85-99% и статус '🟢 Точный оригинал'.
+2. Если кандидат из общей базы без совпадения ключевых задач — скор <= 40%.
 
 Выведи ТОП кандидатов по шаблону:
 ══════════════════════════════
@@ -480,7 +427,7 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник/пост](URL)
-🏛 **Источник:** [Telegram Чат / Google / Хабр]
+🏛 **Источник:** [Telegram Чат / Хабр / Google]
 
 ⚖️ **Аудит по матрице:**
 • **Совпадение стека:** [Что совпало по тексту]
@@ -511,8 +458,7 @@ async def handle_vacancy(message: Message):
         else:
             enhanced_lines.append(line)
 
-    fallback_badge = "\nℹ️ *Режим: Сквозное сравнение Telegram-чатов*\n"
-    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОГО СРАВНЕНИЯ**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
+    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОГО СРАВНЕНИЯ**\n\n" + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
         parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
@@ -529,12 +475,12 @@ async def init_telethon():
     if not telethon_client:
         return
     try:
-        await asyncio.wait_for(telethon_client.connect(), timeout=3.0)
+        await asyncio.wait_for(telethon_client.connect(), timeout=3.5)
         if not await telethon_client.is_user_authorized():
             logger.warning("Telethon не авторизован.")
             telethon_client = None
         else:
-            logger.info("Telethon успешно авторизован! Поиск по чатам активен.")
+            logger.info("Telethon успешно авторизован! Глобальный поиск по чатам активен.")
     except Exception as e:
         logger.warning(f"Telethon пропущен: {e}")
         telethon_client = None
