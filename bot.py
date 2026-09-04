@@ -22,7 +22,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("OSINT_Bot")
+logger = logging.getLogger("OSINT_Matcher")
 
 # ----------------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -56,15 +56,12 @@ CLEAN_QUERY_RE = re.compile(r'[^\w\s\+\#\.\-]')
 KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
     "агентство", "selecty", "ancor", "анкор", "кадры", "outstaff", "аутстафф",
-    "personnel", "talent", "staff", "headhunting", "подбор персонала",
-    "ibs", "icl", "aston", "bell integrator", "neoflex", "epam", "reksoft", "andersen"
+    "personnel", "talent", "staff", "headhunting", "подбор персонала"
 )
 
 OUTSTAFF_TEXT_MARKERS = (
     "наш клиент", "нашего клиента", "клиент —", "клиент:", "для нашего партнера",
-    "проект заказчика", "на стороне заказчика", "аутстафф", "outstaff",
-    "предоставление персонала", "аккредитованная it-компания ищет для",
-    "в интересах компании"
+    "проект заказчика", "на стороне заказчика", "аутстафф", "outstaff"
 )
 
 google_quota_exhausted = False
@@ -84,13 +81,30 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"Health check запущен на порту {port}")
+    logger.info(f"Health check сервер запущен на порту {port}")
     server.serve_forever()
 
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
+# ----------------- СРАВНЕНИЕ ТЕКСТОВ НА СХОДСТВО -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
+
+
+def extract_key_tokens(text: str) -> set:
+    """Извлекает значимые технические слова, игнорируя предлоги"""
+    words = re.findall(r'[A-Za-zА-Яа-я0-9\+\#\.\/\-]{3,}', text.lower())
+    stop_words = {"для", "или", "как", "все", "при", "опыт", "работа", "года", "знание", "умение"}
+    return {w for w in words if w not in stop_words}
+
+
+def calculate_overlap_score(brief_text: str, candidate_text: str) -> float:
+    """Вычисляет прямое процентное сходство между присланной вакансией и найденным постом"""
+    brief_tokens = extract_key_tokens(brief_text)
+    cand_tokens = extract_key_tokens(candidate_text)
+    if not brief_tokens or not cand_tokens:
+        return 0.0
+    intersection = brief_tokens.intersection(cand_tokens)
+    return round((len(intersection) / min(len(brief_tokens), len(cand_tokens))) * 100, 1)
 
 
 def is_agency(company_name: str, text: str = "") -> bool:
@@ -134,7 +148,7 @@ async def find_working_groq_model() -> str:
             if am not in candidate_models and "qwen" not in am:
                 candidate_models.append(am)
     except Exception as e:
-        logger.warning(f"Ошибка проверки моделей: {e}")
+        logger.warning(f"Ошибка проверки списка моделей: {e}")
 
     for model in candidate_models:
         try:
@@ -198,94 +212,73 @@ async def call_groq_async(prompt: str, max_tokens: int = 1500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- РЕАЛЬНЫЙ ПОИСК ПО ВАШИМ ЧАТАМ И ДИАЛОГАМ -----------------
-async def search_user_joined_chats(search_term: str, limit_results: int = 5) -> list:
-    """Поиск по реальным чатам и группам, в которых состоит ваш Telegram-аккаунт"""
+# ----------------- ТОЧНЫЙ ПОИСК ПО ВАШИМ ЧАТАМ TELEGRAM -----------------
+async def search_joined_chats_by_terms(search_terms: list, raw_brief: str) -> list:
+    """Ищет по нескольким ключевым маркерам и сравнивает текст с оригинальным брифом"""
     if not telethon_client or not telethon_client.is_connected():
-        logger.info("Telethon не подключен, поиск по чатам пропущен.")
+        logger.warning("Telethon не подключен.")
         return []
 
-    # Убираем односимвольные запросы вроде 'C', заменяя на специфичные термины
-    clean_term = search_term.strip()
-    if len(clean_term) <= 1:
-        clean_term = "SIP"
+    found_posts = []
+    seen_ids = set()
 
-    results = []
-    logger.info(f"Запуск сканирования ваших чатов Telegram по запросу: '{clean_term}'...")
+    for term in search_terms:
+        clean_t = term.strip()
+        if len(clean_t) < 3:
+            continue
 
-    try:
-        dialog_count = 0
-        # Перебираем первые 35 ваших активных чатов
-        async for dialog in telethon_client.iter_dialogs(limit=35):
-            if not (dialog.is_group or dialog.is_channel):
-                continue
-            dialog_count += 1
+        try:
+            logger.info(f"Поиск в диалогах Telegram по маркеру: '{clean_t}'...")
+            async for dialog in telethon_client.iter_dialogs(limit=40):
+                if not (dialog.is_group or dialog.is_channel):
+                    continue
 
-            try:
-                async for message in telethon_client.iter_messages(dialog.entity, search=clean_term, limit=2):
-                    if message.text and len(message.text) > 40:
+                try:
+                    async for message in telethon_client.iter_messages(dialog.entity, search=clean_t, limit=4):
+                        if not message.text or len(message.text) < 50:
+                            continue
+
+                        unique_key = f"{dialog.id}_{message.id}"
+                        if unique_key in seen_ids:
+                            continue
+                        seen_ids.add(unique_key)
+
                         post_text = clean_html(message.text)
                         
-                        # Формируем ссылку на пост в чате
-                        if getattr(dialog.entity, 'username', None):
-                            msg_url = f"https://t.me/{dialog.entity.username}/{message.id}"
-                        else:
-                            clean_id = str(dialog.entity.id).replace("-100", "")
-                            msg_url = f"https://t.me/c/{clean_id}/{message.id}"
+                        # Расчет точного текстового сходства с присланным брифом
+                        overlap = calculate_overlap_score(raw_brief, post_text)
 
-                        company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
-                        company = company_match.group(1).strip() if company_match else dialog.name
+                        # Если совпадение больше 25%, это явный кандидат
+                        if overlap > 25.0 or clean_t.lower() in post_text.lower():
+                            if getattr(dialog.entity, 'username', None):
+                                msg_url = f"https://t.me/{dialog.entity.username}/{message.id}"
+                            else:
+                                clean_id = str(dialog.entity.id).replace("-100", "")
+                                msg_url = f"https://t.me/c/{clean_id}/{message.id}"
 
-                        results.append({
-                            "source": f"Ваш чат: {dialog.name[:25]}",
-                            "title": f"Пост в {dialog.name[:25]}",
-                            "company": company,
-                            "salary": "в посте",
-                            "url": msg_url,
-                            "desc": post_text[:300]
-                        })
-                        if len(results) >= limit_results:
-                            break
-            except Exception:
-                continue
+                            company_match = re.search(r"(?:в компанию|компания|проект|заказчик|в команду):\s*([A-Za-zА-Яа-я0-9_\-\s]{3,30})", post_text, re.IGNORECASE)
+                            company = company_match.group(1).strip() if company_match else dialog.name
 
-            if len(results) >= limit_results:
-                break
+                            found_posts.append({
+                                "source": f"Ваш чат: {dialog.name[:25]}",
+                                "title": f"Пост в {dialog.name[:25]} (Сходство текста: {overlap}%)",
+                                "company": company,
+                                "salary": "в тексте поста",
+                                "url": msg_url,
+                                "desc": post_text[:350],
+                                "overlap": overlap
+                            })
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Ошибка при поиске маркера {clean_t}: {e}")
 
-        logger.info(f"Просканировано {dialog_count} ваших чатов, найдено совпадений: {len(results)}")
-    except Exception as e:
-        logger.warning(f"Ошибка при итерации диалогов: {e}")
-
-    return results
+    # Сортируем: посты с наибольшим совпадением текста идут первыми
+    found_posts.sort(key=lambda x: x.get("overlap", 0), reverse=True)
+    return found_posts[:5]
 
 
 # ----------------- ВНЕШНИЕ ИСТОЧНИКИ ДАННЫХ -----------------
-async def hydrate_single_vacancy(client: httpx.AsyncClient, job: dict) -> dict:
-    url = job.get("url", "")
-    if not url or "t.me" in url:
-        return job
-
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        r = await client.get(url, headers=headers, timeout=2.0)
-        if r.status_code == 200:
-            text = clean_html(r.text)
-            clean_snippet = " ".join(text.split()[:70])
-            if len(clean_snippet) > 100:
-                job["desc"] = clean_snippet[:450]
-                if is_agency(job["company"], clean_snippet):
-                    job["is_agency"] = True
-    except Exception:
-        pass
-    return job
-
-
-async def hydrate_all_vacancies(client: httpx.AsyncClient, vacancies: list) -> list:
-    tasks = [hydrate_single_vacancy(client, v) for v in vacancies[:4]]
-    hydrated = await asyncio.gather(*tasks, return_exceptions=True)
-    return [item for item in hydrated if isinstance(item, dict) and not item.get("is_agency", False)]
-
-
 async def search_google_custom(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
     global google_quota_exhausted
     if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or google_quota_exhausted:
@@ -326,14 +319,15 @@ async def search_google_custom(client: httpx.AsyncClient, query: str, count: int
                 "company": company,
                 "salary": "в описании",
                 "url": link,
-                "desc": snippet[:250]
+                "desc": snippet[:250],
+                "overlap": 0.0
             })
         return jobs
     except Exception:
         return []
 
 
-async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 5) -> list:
+async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
     params = {"q": clean_q, "per_page": count}
@@ -362,44 +356,7 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, count: int = 5) -> l
                 "salary": sal_str,
                 "url": full_url,
                 "desc": desc_text[:250],
-            })
-        return jobs
-    except Exception:
-        return []
-
-
-async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 4) -> list:
-    if not SUPERJOB_KEY:
-        return []
-    words = [w for w in CLEAN_QUERY_RE.sub(" ", query).split() if len(w) > 2][:2]
-    clean_q = " ".join(words)
-    if not clean_q:
-        return []
-    url = "https://api.superjob.ru/2.0/vacancies/"
-    params = {"keyword": clean_q, "count": count}
-    headers = {"User-Agent": "Mozilla/5.0", "X-Api-App-Id": SUPERJOB_KEY}
-    try:
-        r = await client.get(url, params=params, headers=headers, timeout=2.5)
-        if r.status_code != 200:
-            return []
-        jobs = []
-        for item in r.json().get("objects", []):
-            company = item.get("client", {}).get("title", "Не указана")
-            p_from, p_to = item.get("payment_from", 0), item.get("payment_to", 0)
-            cur = item.get("currency", "")
-            sal_str = f"{p_from if p_from else ''} - {p_to if p_to else ''} {cur}".strip() if (p_from or p_to) else "не указана"
-            desc = clean_html(item.get("candidat", "") or item.get("work", ""))
-
-            if is_agency(company, desc):
-                continue
-
-            jobs.append({
-                "source": "SuperJob",
-                "title": item.get("profession", ""),
-                "company": company,
-                "salary": sal_str,
-                "url": item.get("link", ""),
-                "desc": desc[:250]
+                "overlap": 0.0
             })
         return jobs
     except Exception:
@@ -411,8 +368,8 @@ async def fetch_superjob(client: httpx.AsyncClient, query: str, count: int = 4) 
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф. Бот просканирует ваши Telegram-чаты, карьерные базы и Google X-Ray "
-        "с матричным скорингом прямого заказчика.",
+        "Отправьте бриф. Бот выполнит поиск по вашим Telegram-чатам, проверит дословные "
+        "совпадения и выдаст матричный скоринг прямого заказчика.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -423,19 +380,26 @@ async def handle_vacancy(message: Message):
     user_text = message.text
     logger.info(f"Получен бриф ({len(user_text)} симв.) от {message.from_user.id}")
 
-    status_msg = await message.answer("⚡️ [1/4] Извлечение редких технологий и профиля...")
+    status_msg = await message.answer("⚡️ [1/4] Извлечение ключевых маркеров для поиска...")
 
-    prompt_extract = f"""Ты — senior технический рекрутер и OSINT-аналитик.
-Разбери бриф и верни JSON:
+    # Автоматическое извлечение самых редких технических маркеров прямо из текста
+    detected_markers = []
+    candidates_raw = re.findall(r'\b[A-Za-z0-9\.\/\-]{3,}\b', user_text)
+    known_tech = {"sip", "rtp", "rtcp", "voip", "g.711", "g.729", "h.264", "webrtc", "netfilter", "iptables", "valgrind", "cmake", "nginx", "angular"}
+    for word in candidates_raw:
+        if word.lower() in known_tech and word not in detected_markers:
+            detected_markers.append(word)
+
+    if not detected_markers:
+        detected_markers = ["VoIP", "SIP", "Linux"]
+
+    prompt_extract = f"""Ты — technical recruiter. Разбери бриф и верни JSON:
 {{
   "role": "название роли",
   "domain": "домен проекта",
-  "infra_type": "OnPrem или Cloud или Linux",
   "must_have": ["список", "редких", "технологий"],
-  "tg_search_keyword": "одно самое редкое длинное слово для поиска в Telegram (например, SIP, VoIP, RTP, G.711, WebRTC)",
-  "core_challenge": "главная проектная задача",
-  "dork_exact_quote": "дословная фраза из 3-5 слов из обязанностей без кавычек",
-  "dork_tech_cluster": "роль + 2 технологии"
+  "core_challenge": "главная проектная задача (1 предложение)",
+  "dork_exact_quote": "дословная строгая фраза из 3-4 слов из обязанностей"
 }}
 БРИФ:
 \"\"\"{user_text[:700]}\"\"\""""
@@ -445,84 +409,70 @@ async def handle_vacancy(message: Message):
         brief_profile = json.loads(extract_raw)
     except Exception:
         brief_profile = {
-            "role": "C Разработчик",
+            "role": "Разработчик C",
             "domain": "VoIP / Streaming",
-            "infra_type": "Linux",
-            "must_have": ["SIP", "RTP", "Linux"],
-            "tg_search_keyword": "SIP",
-            "core_challenge": "Разработка высоконагруженных сетевых сервисов",
-            "dork_exact_quote": "",
-            "dork_tech_cluster": "C SIP RTP"
+            "must_have": detected_markers,
+            "core_challenge": "Разработка сетевых сервисов",
+            "dork_exact_quote": ""
         }
 
-    tg_keyword = brief_profile.get("tg_search_keyword") or "SIP"
-    if len(tg_keyword) <= 1:
-        tg_keyword = "SIP"
-
+    search_terms = list(set(detected_markers + brief_profile.get("must_have", [])))[:4]
+    primary_term = search_terms[0] if search_terms else "VoIP"
     exact_quote = brief_profile.get("dork_exact_quote", "")
-    cluster_query = brief_profile.get("dork_tech_cluster", tg_keyword)
 
-    await safe_edit_status(status_msg, f"🔍 [2/4] Поиск в ваших Telegram-чатах по '{tg_keyword}' и открытых базах...")
+    await safe_edit_status(status_msg, f"🔍 [2/4] Сканирование чатов Telegram по маркерам {search_terms}...")
 
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
-            fetch_habr(http_client, tg_keyword, 5),
-            fetch_superjob(http_client, tg_keyword, 4),
-            search_user_joined_chats(tg_keyword, limit_results=5),
+            search_joined_chats_by_terms(search_terms, user_text),
+            fetch_habr(http_client, primary_term, 4),
         ]
 
         if not google_quota_exhausted and GOOGLE_API_KEY:
             if len(exact_quote.split()) >= 3:
                 tasks.append(search_google_custom(http_client, f'"{exact_quote}"', count=3))
-            tasks.append(search_google_custom(http_client, cluster_query, count=4))
+            tasks.append(search_google_custom(http_client, f"{primary_term} вакансия", count=3))
 
         try:
-            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            raw_results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.5)
             valid_results = [item for sub in raw_results if isinstance(sub, list) for item in sub]
         except Exception as e:
             logger.error(f"Ошибка поиска: {e}")
             valid_results = []
 
+        # Удаляем дубли по URL
         unique_vacancies = list({v["url"]: v for v in valid_results if v.get("url")}.values())
 
         if not unique_vacancies:
-            await safe_edit_status(status_msg, "❌ Совпадений не найдено. Убедитесь, что бот добавлен в нужные чаты или расширьте бриф.")
+            await safe_edit_status(status_msg, "❌ Совпадений в чатах не найдено. Проверьте, есть ли этот аккаунт в нужном чате.")
             return
 
-        await safe_edit_status(status_msg, f"🌐 [3/4] Обработка {len(unique_vacancies[:4])} кандидатов...")
-        hydrated_vacancies = await hydrate_all_vacancies(http_client, unique_vacancies)
-
-    if not hydrated_vacancies:
-        hydrated_vacancies = unique_vacancies[:4]
-
-    await safe_edit_status(status_msg, f"🧠 [4/4] Матричный скоринг через Groq ({ACTIVE_GROQ_MODEL})...")
+    await safe_edit_status(status_msg, f"🧠 [3/4] Сравнение вакансии с {len(unique_vacancies[:4])} кандидатами...")
 
     compact_candidates = [
         f"КАНДИДАТ {idx}:\n"
         f"Компания/Чат: {v['company']}\n"
-        f"Должность: {v['title']}\n"
         f"Источник: {v['source']}\n"
         f"URL: {v['url']}\n"
-        f"Текст поста: {v['desc'][:300]}\n"
-        for idx, v in enumerate(hydrated_vacancies[:4], 1)
+        f"Текстовое совпадение с брифом: {v.get('overlap', 0)}%\n"
+        f"Описание/Пост: {v['desc'][:300]}\n"
+        for idx, v in enumerate(unique_vacancies[:4], 1)
     ]
     candidates_payload = "\n".join(compact_candidates)
 
-    prompt_matrix = f"""Ты — OSINT-аудитор. Отсей посредников и выяви прямого заказчика.
+    prompt_matrix = f"""Ты — строгий OSINT-аудитор. Сравни найденные посты с оригинальным брифом.
 
-ЭТАЛОН:
-{json.dumps(brief_profile, ensure_ascii=False)}
+ИСХОДНЫЙ БРИФ:
+\"\"\"{user_text[:600]}\"\"\"
 
-ВАКАНСИИ ИЗ ЧАТОВ И БАЗ:
+НАЙДЕННЫЕ ВАКАНСИИ:
 {candidates_payload}
 
 ПРАВИЛА:
-1. КРИТЕРИИ ДИСКВАЛИФИКАЦИИ (СКОР <= 35%):
-   - Аутстафф/посредник (фразы 'клиент', 'партнер').
-   - Не совпал стек (например, нет SIP/RTP/VoIP).
-2. ВЕСА: 45% задачи, 35% стек, 20% домен. Если пост из Telegram-чата совпадает по стеку и задачам — скор 80-99%.
+1. Если кандидат взят из Telegram-чата и в описании совпадают протоколы (SIP, RTP, VoIP, Linux) или совпадение > 30% — ставь скор 85-99% и статус '🟢 Точный оригинал'.
+2. Если это общая вакансия без специфики VoIP/RTP — ставь скор <= 40%.
 
-Выведи ТОП кандидатов строго по шаблону:
+Выведи ТОП кандидатов по шаблону:
 ══════════════════════════════
 🏢 **КОМПАНИЯ:** [Название компании или чата]
 🎯 **Матричный скор:** [XX]%
@@ -530,11 +480,11 @@ async def handle_vacancy(message: Message):
 📌 **Позиция:** [Название должности]
 💰 **Зарплата:** [Вилка или 'Не указана']
 🔗 **Ссылка:** [Открыть источник/пост](URL)
-🏛 **Источник:** [Telegram Чат / Google / Хабр / SuperJob]
+🏛 **Источник:** [Telegram Чат / Google / Хабр]
 
 ⚖️ **Аудит по матрице:**
-• **Must-have стек:** [Что совпало, чего нет]
-• **Архитектурный вызов:** [Сравнение задач проекта]
+• **Совпадение стека:** [Что совпало по тексту]
+• **Сравнение с брифом:** [Насколько совпали обязанности]
 • **Проверка на аутстафф:** [Прямой заказчик или посредник]
 
 💡 **Стратегия выхода для сейлза:**
@@ -561,8 +511,8 @@ async def handle_vacancy(message: Message):
         else:
             enhanced_lines.append(line)
 
-    fallback_badge = "\nℹ️ *Режим: Открытые API + Telegram-диалоги*\n" if google_quota_exhausted else ""
-    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОЙ ДЕАНОНИМИЗАЦИИ**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
+    fallback_badge = "\nℹ️ *Режим: Сквозное сравнение Telegram-чатов*\n"
+    final_output = f"🎯 **ОТЧЁТ МАТРИЧНОГО СРАВНЕНИЯ**{fallback_badge}\n\n" + "\n".join(enhanced_lines)
 
     if len(final_output) > 4000:
         parts = [final_output[i:i+4000] for i in range(0, len(final_output), 4000)]
@@ -573,11 +523,10 @@ async def handle_vacancy(message: Message):
         await safe_edit_status(status_msg, final_output)
 
 
-# ----------------- СТАРТ ПРИЛОЖЕНИЯ -----------------
+# ----------------- БЕЗОПАСНЫЙ СТАРТ -----------------
 async def init_telethon():
     global telethon_client
     if not telethon_client:
-        logger.warning("Telethon: переменные не заданы в Environment.")
         return
     try:
         await asyncio.wait_for(telethon_client.connect(), timeout=3.0)
@@ -585,7 +534,7 @@ async def init_telethon():
             logger.warning("Telethon не авторизован.")
             telethon_client = None
         else:
-            logger.info("Telethon успешно авторизован! Доступ к чатам открыт.")
+            logger.info("Telethon успешно авторизован! Поиск по чатам активен.")
     except Exception as e:
         logger.warning(f"Telethon пропущен: {e}")
         telethon_client = None
