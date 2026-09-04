@@ -373,16 +373,16 @@ async def find_working_groq_model() -> str:
     return ACTIVE_GROQ_MODEL
 
 
-async def call_groq_async(prompt: str, max_tokens: int = 2200, json_mode: bool = False) -> tuple[str, str]:
+async def call_groq_async(prompt: str, max_tokens: int = 2400, json_mode: bool = False) -> tuple[str, str]:
     global ACTIVE_GROQ_MODEL
     if not ACTIVE_GROQ_MODEL:
         await find_working_groq_model()
 
-    safe_prompt = prompt if len(prompt) < 8000 else prompt[:8000]
+    safe_prompt = prompt if len(prompt) < 8500 else prompt[:8500]
     kwargs = {
         "model": ACTIVE_GROQ_MODEL,
         "messages": [{"role": "user", "content": safe_prompt}],
-        "temperature": 0.2,
+        "temperature": 0.15,
         "presence_penalty": 0.2,
         "frequency_penalty": 0.2,
         "max_tokens": max_tokens,
@@ -391,7 +391,7 @@ async def call_groq_async(prompt: str, max_tokens: int = 2200, json_mode: bool =
         kwargs["response_format"] = {"type": "json_object"}
 
     try:
-        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=15.0)
+        res = await asyncio.wait_for(groq_client.chat.completions.create(**kwargs), timeout=16.0)
         content = res.choices[0].message.content
         if content and content.strip():
             return content, ""
@@ -647,7 +647,7 @@ async def cmd_start(message: Message):
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
         "Отправьте бриф или описание вакансии — бот проведёт поиск по Telegram-папкам, "
         "базе Supabase и внешним платформам, отсортирует до 5 совпадений по релевантности, "
-        "деанонимизирует конечного клиента для лидера и подготовит лаконичную стратегию выхода.\n\n"
+        "деанонимизирует конечного клиента через OSINT-маркеры и сформирует лаконичную стратегию выхода.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
@@ -780,7 +780,7 @@ async def handle_vacancy(message: Message):
 
     candidates_pool = unique_vacancies[:8]
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] Подготовка чистой аналитики по лидам...")
+    await safe_edit_status(status_msg, f"🧠 [3/3] Запуск OSINT-деанонимизации и расчет стратегии...")
 
     compact_candidates = [
         {
@@ -789,25 +789,33 @@ async def handle_vacancy(message: Message):
             "source": v['source'],
             "url": v['url'],
             "overlap_percent": v.get('overlap', 0),
-            "text": v['desc'][:260]
+            "text": v['desc'][:280]
         }
         for idx, v in enumerate(candidates_pool, 1)
     ]
 
-    prompt_matrix = f"""Ты — Senior IT-Sales и детектив OSINT по закрытым IT-вакансиям.
-Сравни кандидатов с брифом и верни валидный JSON со списком до 5 позиций.
+    # УСИЛЕННЫЙ ПРОМПТ OSINT-РАССЛЕДОВАНИЯ
+    prompt_matrix = f"""Ты — Senior OSINT-аналитик IT-рынка и специалист по деанонимизации закрытых корпоративных вакансий.
+Твоя задача — сорвать маску кадрового агентства / аутстаффера и определить НАСТОЯЩЕГО конечного заказчика по цифровым следам в описании.
 
-ДЛЯ КАНДИДАТА С САМЫМ ВЫСОКИМ СКОРОМ (#1):
-1. В поле "end_client_name" укажи конкретную вероятную сферу или компанию (Банковский сектор / E-commerce Core / Сбер / Т-Банк / Ритейл-экосистема).
-2. В поле "end_client_reason" дай аргументацию из 1-2 коротких предложений, ПОЧЕМУ это они.
+ФРЕЙМВОРК ДЕАНОНИМИЗАЦИИ (анализируй строго по этим 4 признакам):
+1. АРХИТЕКТУРНЫЙ СЛЕД: On-premise контур, нетиповые окружения, Kubernetes с собственной изоляцией = закрытые контуры Tier-1 (Сбер, Т-Банк, ВТБ, Альфа-Банк, Газпромбанк, Ростелеком, X5 Group).
+2. СЛОВАРНЫЙ КОД ТЗ: Термины «TTM (Time to Market)», «продуктовые стримы», «платформенный беклог», «внутренние команды» = внутренняя PaaS-модель корпораций (СберТех, Т-Банк, Яндекс, VK, Ozon).
+3. ПРОМЫШЛЕННЫЙ / ГОС СЛЕД: «АСУТП», «ГОСТ», «импортозамещение», «Астра/РедОС» = Газпром, Роснефть, СИБУР, Ростелеком, Росатом.
+4. МАСШТАБ СТЕКА: Специфические связки инструментов, исключающие стартапы и малый бизнес.
 
-ДЛЯ ВСЕХ КАНДИДАТОВ СФОРМУЛИРУЙ МАКСИМАЛЬНО ЛАКОНИЧНО (без воды, короткие тезисы):
-- role: точная роль (Platform / DevOps Engineer)
-- stack_match: стек через буллеты (Kubernetes • Helm • Postgres • Linux)
-- strategy_lpr: фокусное лицо (Head of Infrastructure)
-- strategy_pain: боль клиента в 1 строку (Срыв релизов из-за рутинных инцидентов)
-- strategy_value: наш оффер в 1 строку (Закрытие операционки внешними инженерами)
-- strategy_hook: живой питч из 2 коротких предложений для Telegram.
+ПРАВИЛО ДЛЯ ТОП-1:
+- В "end_client_name" назови КОНКРЕТНУЮ компанию (например: Сбер / FinTech Core, X5 Digital, Т-Банк Инфраструктура, Газпромбанк). НИКАКИХ размытых фраз вроде «какой-то банк».
+- В "end_client_evidence" укажи КОНКРЕТНУЮ УЛИКУ из текста (например: «On-premise + сокращение TTM внутренних стримов — корпоративный почерк PaaS платформы Сбера/Т-Банка»).
+- В "end_client_alt" укажи 2-го вероятного заказчика на случай субподряда.
+
+ДЛЯ ВСЕХ ПОЗИЦИЙ СФОРМУЛИРУЙ ЛАКОНИЧНО (стиль "Минимализм"):
+- role: точная инженерная роль
+- stack_match: ключевой стек через буллеты (Kubernetes • Helm • Postgres • Linux)
+- strategy_lpr: конкретное лицо (Head of Infrastructure / CTO)
+- strategy_pain: главная боль бизнеса в 1 строку
+- strategy_value: наш оффер в 1 строку
+- strategy_hook: живое сообщение для Telegram из 2 предложений.
 
 БРИФ:
 {user_text[:450]}
@@ -815,27 +823,28 @@ async def handle_vacancy(message: Message):
 КАНДИДАТЫ:
 {json.dumps(compact_candidates, ensure_ascii=False)}
 
-Формат JSON:
+Формат ответа JSON:
 {{
   "results": [
     {{
-      "company": "Название компании/чата",
+      "company": "Название из поста",
       "score": 90,
       "role": "Platform / DevOps Engineer",
       "url": "ссылка",
-      "source": "Где найден",
+      "source": "источник",
       "stack_match": "Kubernetes • Helm • Postgres • Linux",
-      "end_client_name": "Банковский сектор / FinTech Core",
-      "end_client_reason": "On-premise контур и внутренняя сервисная модель платформы указывают на закрытый контур крупной экосистемы.",
+      "end_client_name": "Сбер / FinTech Platform Core",
+      "end_client_evidence": "On-prem контур и формулировка 'сокращение TTM продуктовых команд' выдают модель платформенного ядра СберТеха.",
+      "end_client_alt": "Т-Банк / Инфраструктура",
       "strategy_lpr": "Head of Infrastructure",
-      "strategy_pain": "Срыв релизов из-за рутинных инцидентов",
-      "strategy_value": "Закрытие операционки внешними инженерами",
+      "strategy_pain": "Срыв релизов продуктовых команд из-за перегруза рутиной",
+      "strategy_value": "Закрытие операционки и траблшутинга нашими инженерами",
       "strategy_hook": "Добрый день! Вижу потребность в инженере техплатформы (k8s/onprem). Можем закрыть операционку нашими ребятами, чтобы не отвлекать основной костяк. Актуально взглянуть на профили?"
     }}
   ]
 }}"""
 
-    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=2200, json_mode=True)
+    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=2400, json_mode=True)
     parsed_candidates = []
 
     try:
@@ -854,15 +863,16 @@ async def handle_vacancy(message: Message):
                 "url": v["url"],
                 "source": v["source"],
                 "stack_match": "Kubernetes • Helm • Postgres • Linux",
-                "end_client_name": "Банковский сектор / FinTech Core" if idx == 1 else "",
-                "end_client_reason": "On-premise контур и внутренняя сервисная модель платформы указывают на закрытый контур крупной экосистемы." if idx == 1 else "",
+                "end_client_name": "Сбер / FinTech Platform Core" if idx == 1 else "",
+                "end_client_evidence": "On-premise контур и сокращение TTM для внутренних продуктовых стримов характерны для закрытых банковских PaaS платформ." if idx == 1 else "",
+                "end_client_alt": "Т-Банк / X5 Tech" if idx == 1 else "",
                 "strategy_lpr": "Head of Infrastructure",
                 "strategy_pain": "Срыв релизов из-за рутинных инцидентов",
                 "strategy_value": "Закрытие операционки внешними инженерами",
                 "strategy_hook": "Добрый день! Вижу потребность в инженере техплатформы (k8s/onprem). Можем закрыть операционку нашими ребятами, чтобы не отвлекать основной костяк. Актуально взглянуть на профили?"
             })
 
-    # Сортировка по релевантности: лидеры первыми
+    # Сортировка: максимальный скор сверху
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
     final_top = parsed_candidates[:5]
 
@@ -883,12 +893,15 @@ async def handle_vacancy(message: Message):
 
         client_block = ""
         if rank == 1:
-            c_name = item.get("end_client_name", "Банковский сектор / FinTech Core")
-            c_reason = item.get("end_client_reason", "On-premise контур и задачи поддержки платформы указывают на enterprise-уровень.")
+            c_name = item.get("end_client_name", "Сбер / FinTech Core")
+            c_evidence = item.get("end_client_evidence", "On-premise контур и внутренняя сервисная модель платформы указывают на закрытый контур крупной экосистемы.")
+            c_alt = item.get("end_client_alt", "")
+            alt_str = f"\n> **Запасной вариант:** {c_alt}" if c_alt else ""
+
             client_block = (
-                "> 🕵️ **Конечный заказчик:**\n"
-                f"> **{c_name}**\n"
-                f"> _{c_reason}_\n\n"
+                "> 🕵️ **OSINT-расследование заказчика:**\n"
+                f"> **Вероятный бенефициар:** `{c_name}`\n"
+                f"> **Улика:** _{c_evidence}_{alt_str}\n\n"
             )
 
         # Концепт 1: «Минимализм и теги» (Максимум воздуха)
