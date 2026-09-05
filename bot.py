@@ -80,6 +80,30 @@ STOP_WORDS = {
     "базе", "задачи", "плюсом", "уровень", "описание", "навыки", "обязательные"
 }
 
+# ----------------- СЛОВАРЬ СИНОНИМОВ (QUERY EXPANSION) -----------------
+TECH_SYNONYMS = {
+    "kubernetes": ["k8s", "kube", "кубер", "openshift", "helm"],
+    "k8s": ["kubernetes", "kube", "кубер", "helm"],
+    "devops": ["sre", "platform engineer", "девопс", "инфраструктур", "ci/cd", "infrastructure"],
+    "sre": ["devops", "platform engineer", "reliability", "надежност"],
+    "postgresql": ["postgres", "psql", "постгрес", "пг"],
+    "postgres": ["postgresql", "psql", "постгрес"],
+    "golang": ["go", "голанг", "gopher"],
+    "go": ["golang", "голанг"],
+    "python": ["питон", "пайтон", "django", "fastapi"],
+    "java": ["джава", "spring", "springboot"],
+    "frontend": ["фронтенд", "react", "vue", "angular", "typescript"],
+    "react": ["frontend", "фронтенд", "redux", "nextjs"],
+    "qa": ["тестировщик", "тестирование", "quality assurance", "autotests", "автотест"],
+    "linux": ["линукс", "ubuntu", "debian", "rhel", "centos", "redhat", "astralinux"],
+    "docker": ["докер", "containerd", "podman"],
+    "ansible": ["ансибл", "terraform", "терраформ", "iac"],
+    "terraform": ["ansible", "iac", "терраформ"],
+    "kafka": ["кафка", "rabbitmq", "брокер сообщений"],
+    "clickhouse": ["кликхаус", "ch"],
+    "асутп": ["scada", "скада", "автоматизаци", "гост"]
+}
+
 # ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -316,47 +340,56 @@ async def build_folders_keyboard() -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И QUERY EXPANSION -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
 
 def extract_key_tokens(text: str) -> set:
-    words = re.findall(r'[A-Za-zА-Яа-я0-9\+\#]{3,}', text.lower())
+    words = re.findall(r'[A-Za-zА-Яа-я0-9\+\#]{2,}', text.lower())
     return {w for w in words if w not in STOP_WORDS}
 
 
-def extract_search_terms(text: str) -> list:
+def expand_search_terms(text: str) -> list:
+    """Расширяет поисковый запрос профессиональными IT-синонимами."""
     raw_cleaned = text.replace("/", " ").replace("-", " ")
-    abbrs = re.findall(r'\b[A-ZА-Я]{3,}\b', text)
-    tech_stack = re.findall(r'\b[A-Za-z]{3,}\b', text)
-    ru_tokens = list(extract_key_tokens(raw_cleaned))
-    ru_tokens.sort(key=lambda x: len(x), reverse=True)
+    tokens = list(extract_key_tokens(raw_cleaned))
+    
+    expanded = []
+    for token in tokens:
+        if token not in expanded and len(token) >= 2:
+            expanded.append(token)
+        # Проверяем словарь синонимов
+        synonyms = TECH_SYNONYMS.get(token, [])
+        for syn in synonyms:
+            if syn not in expanded:
+                expanded.append(syn)
 
-    terms = []
-    for a in abbrs:
-        if a.lower() not in STOP_WORDS and a not in terms:
-            terms.append(a)
-
-    for tech in tech_stack:
-        t_title = tech.capitalize()
-        if tech.lower() not in STOP_WORDS and t_title not in terms:
-            terms.append(t_title)
-
-    for t in ru_tokens:
-        if t not in terms and len(terms) < 6:
-            terms.append(t)
-
-    return terms[:6] if terms else ["разработчик"]
+    # Приоритет: сначала слова из самого запроса, затем их синонимы
+    return expanded[:10] if expanded else ["разработчик"]
 
 
 def calculate_overlap_score(brief_text: str, candidate_text: str) -> float:
+    """Расчет совпадения с учетом синонимов (k8s = kubernetes)."""
     brief_tokens = extract_key_tokens(brief_text)
     cand_tokens = extract_key_tokens(candidate_text)
     if not brief_tokens or not cand_tokens:
         return 0.0
-    intersection = brief_tokens.intersection(cand_tokens)
-    return round((len(intersection) / min(len(brief_tokens), len(cand_tokens))) * 100, 1)
+
+    # Расширяем токены кандидата их синонимами для честного сопоставления
+    augmented_cand = set(cand_tokens)
+    for ct in cand_tokens:
+        if ct in TECH_SYNONYMS:
+            augmented_cand.update(TECH_SYNONYMS[ct])
+
+    matches = 0
+    for bt in brief_tokens:
+        syns = set(TECH_SYNONYMS.get(bt, []))
+        syns.add(bt)
+        if any(s in augmented_cand for s in syns):
+            matches += 1
+
+    return round((matches / len(brief_tokens)) * 100, 1)
 
 
 def is_agency(company_name: str, text: str = "") -> bool:
@@ -708,7 +741,7 @@ async def search_joined_chats_global(search_terms: list, raw_brief: str, bot_id:
     for target_chat in chat_targets:
         for term in search_terms:
             clean_t = term.strip()
-            if len(clean_t) < 3:
+            if len(clean_t) < 2:
                 continue
 
             try:
@@ -803,11 +836,10 @@ def register_telethon_listener():
 async def cmd_start(message: Message):
     await message.answer(
         "💼 **Multi-Source OSINT Lead Hunter**\n\n"
-        "Отправьте бриф или описание вакансии — бот выполнит честный кросс-платформенный поиск:\n"
-        "• Telegram-папки и база Supabase\n"
-        "• Внешние IT-ресурсы (Хабр, VC, GeekLink, Finder, Web Dorks)\n"
-        "• Дедупликация и жесткая квалификация по стеку (Chain-of-Thought)\n"
-        "• Точечная OSINT-деанонимизация конечного заказчика.\n\n"
+        "Отправьте бриф или описание вакансии — бот выполнит поиск со **словарем синонимов (Query Expansion)**:\n"
+        "• Распознает сокращения (k8s = kubernetes, postgres = psql, девопс = sre)\n"
+        "• Сканирует папки Telegram, Supabase и открытые платформы\n"
+        "• Проводит дедупликацию и деанонимизирует заказчика.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
@@ -903,22 +935,23 @@ async def handle_vacancy(message: Message):
         me = await bot.get_me()
         BOT_USER_ID = me.id
 
-    status_msg = await message.answer("⚡️ [1/3] Извлечение ключевого стека...")
+    status_msg = await message.answer("⚡️ [1/3] Расширение запроса через синонимы стека...")
 
-    search_terms = extract_search_terms(user_text)
-    # Составной поисковый запрос (например: "DevOps Kubernetes" вместо просто "DevOps")
-    composite_query = " ".join(search_terms[:2]) if len(search_terms) >= 2 else (search_terms[0] if search_terms else "разработчик")
+    # Расширенный поиск через словарь синонимов
+    expanded_search_terms = expand_search_terms(user_text)
+    composite_query = " ".join(expanded_search_terms[:2]) if len(expanded_search_terms) >= 2 else (expanded_search_terms[0] if expanded_search_terms else "разработчик")
     scope_desc = f"{len(ACTIVE_FOLDERS)} папкам" if ACTIVE_FOLDERS else "всем чатам"
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Опрос источников (TG, Supabase, Хабр, VC, GeekLink, Dorks)...")
+    terms_preview = ", ".join([f"`{t}`" for t in expanded_search_terms[:4]])
+    await safe_edit_status(status_msg, f"🔍 [2/3] Поиск по {terms_preview} в TG ({scope_desc}), Supabase, Хабр, VC...")
 
     # 1. Поиск в Supabase
-    db_results = await search_vacancies_in_db(search_terms, user_text)
+    db_results = await search_vacancies_in_db(expanded_search_terms, user_text)
 
     # 2. Параллельный сбор по всем остальным платформам
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         tasks = [
-            search_joined_chats_global(search_terms, user_text, BOT_USER_ID),
+            search_joined_chats_global(expanded_search_terms, user_text, BOT_USER_ID),
             fetch_telegram_dorks(http_client, composite_query, user_text),
             fetch_habr(http_client, composite_query, user_text, 5),
             fetch_vc_vacancies(http_client, composite_query, user_text),
@@ -955,12 +988,11 @@ async def handle_vacancy(message: Message):
         internal_pool.sort(key=lambda x: x.get("overlap", 0), reverse=True)
         external_pool.sort(key=lambda x: x.get("overlap", 0), reverse=True)
 
-        # Берем до 5 лучших из TG/Supabase и до 5 лучших с внешних платформ
         balanced_selection = internal_pool[:5] + external_pool[:5]
         balanced_selection.sort(key=lambda x: x.get("overlap", 0), reverse=True)
         candidates_pool = balanced_selection[:8]
 
-    await safe_edit_status(status_msg, f"🧠 [3/3] Глубокий анализ релевантности и OSINT заказчика...")
+    await safe_edit_status(status_msg, f"🧠 [3/3] Анализ релевантности и OSINT заказчика...")
 
     compact_candidates = [
         {
@@ -975,7 +1007,6 @@ async def handle_vacancy(message: Message):
         for idx, v in enumerate(candidates_pool, 1)
     ]
 
-    # УСИЛЕННЫЙ CHAIN-OF-THOUGHT ПРОМПТ
     prompt_matrix = f"""Ты — ведущий технический IT-рекрутер и OSINT-аналитик закрытого рынка вакансий.
 Твоя задача — строго сопоставить найденных кандидатов с брифом, отсеять лишнее и деанонимизировать прямого заказчика.
 
@@ -988,8 +1019,8 @@ async def handle_vacancy(message: Message):
 ПРАВИЛА АНАЛИЗА И СКОРИНГА (score):
 1. match_reasoning: в 1 кратком предложении напиши, совпадает ли специальность и ядро стека (например: "Ищут DevOps с K8s, ядро совпало" ИЛИ "Ищут Backend Java, это не подходит").
 2. СКОРИНГ:
-   - 85-100%: Полное совпадение роли и ключевого стека.
-   - 55-84%: Роль совпадает, но стек совпал частично (например, k8s есть, но другие БД).
+   - 85-100%: Полное совпадение роли и ключевого стека (учитывай синонимы: k8s=kubernetes, postgres=postgresql, sre=devops).
+   - 55-84%: Роль совпадает, но стек совпал частично.
    - 0-45%: Другая специальность (Frontend вместо DevOps), стажировки, курсы, резюме человека -> ставить строго меньше 50%!
 3. end_client_name:
    - Если есть `fwd_origin` — это 100% улика, пиши строго имя источника пересылки.
@@ -1055,17 +1086,13 @@ async def handle_vacancy(message: Message):
                 "strategy_hook": "Добрый день! Увидели вашу открытую позицию. Готовы обсудить подключение свободных специалистов?"
             })
 
-    # Сортировка по скору от LLM
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
-
-    # ЖЕСТКАЯ ФИЛЬТРАЦИЯ: Показываем только релевантные позиции со скором >= 50%
     qualified_leads = [item for item in parsed_candidates if int(item.get("score", 0)) >= 50][:5]
 
     if not qualified_leads:
-        # Если жесткий скоринг отбросил всё, берем хотя бы топ-2 лучших, чтобы не отдавать пустоту
         qualified_leads = parsed_candidates[:2]
 
-    await safe_edit_status(status_msg, f"🏁 Найдено **{len(qualified_leads)}** релевантных позиций (отсеяно всё лишнее):")
+    await safe_edit_status(status_msg, f"🏁 Найдено **{len(qualified_leads)}** позиций (с учетом сленга и синонимов стека):")
 
     for rank, item in enumerate(qualified_leads, 1):
         company = item.get("company", "Не указана")
