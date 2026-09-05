@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -11,7 +12,6 @@ from urllib.parse import quote_plus, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncpg
 import httpx
-import defusedxml.ElementTree as ET
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
@@ -21,6 +21,7 @@ from telethon import TelegramClient, events
 from telethon.tl.types import User
 from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
 
 # ----------------- ЛОГИРОВАНИЕ -----------------
 logging.basicConfig(
@@ -50,9 +51,11 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY.strip())
 ACTIVE_GROQ_MODEL = None
 BOT_USER_ID = None
 db_pool = None
+db_semaphore = asyncio.Semaphore(3)
 
 ACTIVE_FOLDERS = {}
 ALLOWED_CHAT_IDS = set()
+ENTITY_CACHE = {}
 
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
@@ -183,33 +186,34 @@ async def sync_folder_to_db(folder_id: int, folder_title: str, add: bool):
 async def save_vacancy_to_db(chat_title: str, msg_id: int, chat_id: int, text: str, url: str, fwd_source: str = ""):
     if not db_pool:
         return
-    try:
-        content_hash = generate_content_hash(text)
-        saved_text = f"[FWD: {fwd_source}] {text}" if fwd_source else text
+    async with db_semaphore:
+        try:
+            content_hash = generate_content_hash(text)
+            saved_text = f"[FWD: {fwd_source}] {text}" if fwd_source else text
 
-        async with db_pool.acquire() as conn:
-            existing = await conn.fetchrow(
-                "SELECT id, chat_title FROM vacancies WHERE content_hash = $1 LIMIT 1;",
-                content_hash
-            )
+            async with db_pool.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT id, chat_title FROM vacancies WHERE content_hash = $1 LIMIT 1;",
+                    content_hash
+                )
 
-            if existing:
-                old_title = existing['chat_title']
-                if chat_title not in old_title:
-                    new_title = f"{old_title}, {chat_title}"[:80]
-                    await conn.execute(
-                        "UPDATE vacancies SET chat_title = $1 WHERE id = $2;",
-                        new_title, existing['id']
-                    )
-                return
+                if existing:
+                    old_title = existing['chat_title']
+                    if chat_title not in old_title:
+                        new_title = f"{old_title}, {chat_title}"[:80]
+                        await conn.execute(
+                            "UPDATE vacancies SET chat_title = $1 WHERE id = $2;",
+                            new_title, existing['id']
+                        )
+                    return
 
-            await conn.execute("""
-                INSERT INTO vacancies (chat_title, message_id, chat_id, post_text, post_url, content_hash)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (chat_id, message_id) DO NOTHING;
-            """, chat_title, msg_id, chat_id, saved_text, url, content_hash)
-    except Exception as e:
-        logger.debug(f"Ошибка сохранения вакансии в БД: {e}")
+                await conn.execute("""
+                    INSERT INTO vacancies (chat_title, message_id, chat_id, post_text, post_url, content_hash)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (chat_id, message_id) DO NOTHING;
+                """, chat_title, msg_id, chat_id, saved_text, url, content_hash)
+        except Exception as e:
+            logger.debug(f"Ошибка сохранения вакансии в БД: {e}")
 
 
 async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
@@ -309,7 +313,7 @@ async def build_folders_keyboard() -> tuple[str, InlineKeyboardMarkup]:
     keyboard = []
 
     reset_icon = "🔘" if not ACTIVE_FOLDERS else "⚪️"
-    keyboard.append([InlineKeyboardButton(text=f"{reset_icon} Все чаты (без ограничений)", callbackdata="f_toggle:0")])
+    keyboard.append([InlineKeyboardButton(text=f"{reset_icon} Все чаты (без ограничений)", callback_data="f_toggle:0")])
 
     for f in filters_result.filters:
         f_id = getattr(f, 'id', None)
@@ -324,20 +328,20 @@ async def build_folders_keyboard() -> tuple[str, InlineKeyboardMarkup]:
             keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=f"f_toggle:{f_id}")])
 
     if ACTIVE_FOLDERS:
-        selected_names = ", ".join([f"`{name}`" for name in ACTIVE_FOLDERS.values()])
-        status_text = f"📂 Выбрано папок: **{len(ACTIVE_FOLDERS)}** ({selected_names})\n💬 Чатов под фильтром: **{len(ALLOWED_CHAT_IDS)}**"
+        selected_names = ", ".join([f"<code>{html.escape(name)}</code>" for name in ACTIVE_FOLDERS.values()])
+        status_text = f"📂 Выбрано папок: <b>{len(ACTIVE_FOLDERS)}</b> ({selected_names})\n💬 Чатов под фильтром: <b>{len(ALLOWED_CHAT_IDS)}</b>"
     else:
-        status_text = "🌐 Режим: **Все чаты без ограничений**"
+        status_text = "🌐 Режим: <b>Все чаты без ограничений</b>"
 
     text = (
-        f"📁 **ВЫБОР ПАПОК ДЛЯ СКАНИРОВАНИЯ**\n\n"
+        f"📁 <b>ВЫБОР ПАПОК ДЛЯ СКАНИРОВАНИЯ</b>\n\n"
         f"{status_text}\n\n"
         f"Нажмите на папку, чтобы включить (☑️) или исключить (◻️) её из поиска:"
     )
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-# ----------------- ИСПРАВЛЕНИЕ 1 И 3: ЯКОРНЫЙ ПОИСК И MIN-OVERLAP -----------------
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
@@ -347,7 +351,6 @@ def extract_key_tokens(text: str) -> set:
     return {w for w in words if w not in STOP_WORDS}
 
 
-# ИСПРАВЛЕНИЕ 1: Извлекаем устойчивые связки терминов (вместо обрезки до 2 слов)
 def extract_anchor_phrases(text: str) -> list:
     clean = text.replace("\n", " ")
     tech_matches = re.findall(r'\b[A-Za-z\+\#]{2,}\b', clean)
@@ -358,9 +361,9 @@ def extract_anchor_phrases(text: str) -> list:
 
     queries = []
     if len(unique_tech) >= 3:
-        queries.append(" ".join(unique_tech[:3]))  # например: "Kubernetes Helm Postgres"
+        queries.append(" ".join(unique_tech[:3]))
     if len(unique_tech) >= 2:
-        queries.append(" ".join(unique_tech[:2]))  # например: "Kubernetes Helm"
+        queries.append(" ".join(unique_tech[:2]))
     if unique_tech:
         queries.append(unique_tech[0])
 
@@ -379,7 +382,6 @@ def expand_search_terms(text: str) -> list:
     return expanded[:8] if expanded else ["разработчик"]
 
 
-# ИСПРАВЛЕНИЕ 3: Двусторонний расчет overlap (без штрафа за разницу в длине текста)
 def calculate_overlap_score(brief_text: str, candidate_text: str) -> float:
     brief_tokens = extract_key_tokens(brief_text)
     cand_tokens = extract_key_tokens(candidate_text)
@@ -398,7 +400,6 @@ def calculate_overlap_score(brief_text: str, candidate_text: str) -> float:
         if any(s in augmented_cand for s in syns):
             matches += 1
 
-    # Важно: берем min(), чтобы короткий пост из чата получал справедливые 80-100%
     base_len = min(len(brief_tokens), len(cand_tokens))
     return round((matches / base_len) * 100, 1)
 
@@ -422,11 +423,11 @@ def build_lead_osint_url(company_name: str, target_role: str = "CTO") -> str:
 
 async def safe_edit_status(msg: Message, text: str):
     try:
-        await msg.edit_text(text)
+        await msg.edit_text(text, parse_mode=ParseMode.HTML)
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after + 0.5)
         try:
-            await msg.edit_text(text)
+            await msg.edit_text(text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
     except TelegramAPIError:
@@ -441,13 +442,21 @@ async def extract_forward_metadata(message) -> str:
         if getattr(fwd, 'from_name', None):
             return f"Переслано от: {fwd.from_name}"
         if getattr(fwd, 'from_id', None):
-            try:
-                entity = await telethon_client.get_entity(fwd.from_id)
+            f_id = getattr(fwd.from_id, 'user_id', getattr(fwd.from_id, 'channel_id', None))
+            if f_id and f_id in ENTITY_CACHE:
+                entity = ENTITY_CACHE[f_id]
+            else:
+                try:
+                    entity = await telethon_client.get_entity(fwd.from_id)
+                    if f_id:
+                        ENTITY_CACHE[f_id] = entity
+                except (FloodWaitError, Exception):
+                    entity = None
+
+            if entity:
                 title = getattr(entity, 'title', getattr(entity, 'username', getattr(entity, 'first_name', '')))
                 username = f"(@{entity.username})" if getattr(entity, 'username', None) else ""
                 return f"Канал-первоисточник: {title} {username}".strip()
-            except Exception:
-                pass
         if getattr(fwd, 'post_author', None):
             return f"Автор оригинального поста: {fwd.post_author}"
     except Exception:
@@ -455,7 +464,7 @@ async def extract_forward_metadata(message) -> str:
     return ""
 
 
-# ----------------- ИСПРАВЛЕНИЕ 2: ГЛУБОКИЙ ПОИСК В TELEGRAM (ДО 100 ПОСТОВ) -----------------
+# ----------------- ГЛУБОКИЙ ПОИСК В TELEGRAM -----------------
 async def search_joined_chats_deep(raw_brief: str, bot_id: int) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
@@ -475,7 +484,6 @@ async def search_joined_chats_deep(raw_brief: str, bot_id: int) -> list:
                 continue
 
             try:
-                # УВЕЛИЧЕННАЯ ГЛУБИНА: 80 постов для выбранных папок, 35 для общего скана
                 limit_scan = 80 if target_chat else 35
                 async for message in telethon_client.iter_messages(target_chat, search=clean_q, limit=limit_scan):
                     if not message.text or len(message.text) < 30:
@@ -690,12 +698,12 @@ async def call_groq_async(prompt: str, max_tokens: int = 2500, json_mode: bool =
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "💼 **Multi-Source OSINT Lead Hunter**\n\n"
+        "💼 <b>Multi-Source OSINT Lead Hunter</b>\n\n"
         "Отправьте бриф или описание вакансии — бот выполнит поиск по вашим Telegram-папкам с увеличенной глубиной и точным сопоставлением стека.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.HTML
     )
 
 
@@ -709,7 +717,7 @@ async def cmd_set_folder(message: Message):
     try:
         await refresh_all_allowed_chats()
         text, markup = await build_folders_keyboard()
-        await status.edit_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        await status.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception as e:
         await status.edit_text(f"⚠️ Ошибка получения папок: {e}", parse_mode=None)
 
@@ -747,7 +755,7 @@ async def handle_folder_toggle_callback(call: CallbackQuery):
 
     try:
         text, markup = await build_folders_keyboard()
-        await call.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        await call.message.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -761,18 +769,18 @@ async def cmd_debug(message: Message):
     try:
         me = await telethon_client.get_me()
         if ACTIVE_FOLDERS:
-            folders_str = ", ".join([f"**{name}**" for name in ACTIVE_FOLDERS.values()])
-            folder_info = f"📁 Активные папки: {folders_str}\n💬 Чатов под фильтром: **{len(ALLOWED_CHAT_IDS)}**"
+            folders_str = ", ".join([f"<b>{html.escape(name)}</b>" for name in ACTIVE_FOLDERS.values()])
+            folder_info = f"📁 Активные папки: {folders_str}\n💬 Чатов под фильтром: <b>{len(ALLOWED_CHAT_IDS)}</b>"
         else:
-            folder_info = "🌐 Охват: **Все чаты без фильтра**"
+            folder_info = "🌐 Охват: <b>Все чаты без фильтра</b>"
 
         response = (
-            f"🗄 **База данных Supabase:** {db_status}\n"
-            f"👤 **Telethon аккаунт:** {me.first_name} (@{me.username})\n"
+            f"🗄 <b>База данных Supabase:</b> {db_status}\n"
+            f"👤 <b>Telethon аккаунт:</b> {html.escape(str(me.first_name))} (@{me.username})\n"
             f"{folder_info}\n\n"
-            f"🔒 *Личные диалоги (1-на-1) исключены из поиска.*"
+            f"🔒 <i>Личные диалоги (1-на-1) исключены из поиска.</i>"
         )
-        await message.answer(response, parse_mode=ParseMode.MARKDOWN)
+        await message.answer(response, parse_mode=ParseMode.HTML)
     except Exception as e:
         await message.answer(f"⚠️ Ошибка: {e}", parse_mode=None)
 
@@ -795,14 +803,12 @@ async def handle_vacancy(message: Message):
 
     await safe_edit_status(status_msg, f"🔍 [2/3] Глубокое сканирование Telegram ({scope_desc}) и базы...")
 
-    # Сканирование с увеличенной глубиной
     tg_task = search_joined_chats_deep(user_text, BOT_USER_ID)
     db_task = search_vacancies_in_db(expand_search_terms(user_text), user_text)
 
     tg_results, db_results = await asyncio.gather(tg_task, db_task)
     internal_results = tg_results + db_results
 
-    # Внешние источники пока опрашиваем параллельно (пункт 4 обсудим позже)
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         web_tasks = [
             fetch_habr(http_client, primary_q, user_text),
@@ -810,197 +816,3 @@ async def handle_vacancy(message: Message):
         ]
         web_results = await asyncio.gather(*web_tasks, return_exceptions=True)
         valid_web = [item for sub in web_results if isinstance(sub, list) for item in sub]
-        all_collected = internal_results + valid_web
-
-    # Семантическая дедупликация
-    seen_hashes = set()
-    deduped = []
-    for v in all_collected:
-        h = v.get("content_hash") or generate_content_hash(v.get("desc", ""))
-        if h not in seen_hashes and v.get("url"):
-            seen_hashes.add(h)
-            deduped.append(v)
-
-    if not deduped:
-        await safe_edit_status(status_msg, "❌ Совпадений по источникам не найдено.")
-        return
-
-    # Сортируем строго по честному overlap_score
-    deduped.sort(key=lambda x: x.get("overlap", 0), reverse=True)
-    candidates_pool = deduped[:6]
-
-    await safe_edit_status(status_msg, f"🧠 [3/3] OSINT-анализ и деанонимизация заказчика...")
-
-    compact_candidates = [
-        {
-            "id": idx,
-            "company": v['company'],
-            "source": v['source'],
-            "url": v['url'],
-            "overlap_calc": v.get('overlap', 0),
-            "fwd_origin": v.get('fwd_source', ''),
-            "text": v['desc'][:320]
-        }
-        for idx, v in enumerate(candidates_pool, 1)
-    ]
-
-    prompt_matrix = f"""Ты — технический IT-аудитор и OSINT-аналитик.
-Сопоставь найденные посты с входящим текстом.
-
-ВХОДЯЩИЙ ЗАПРОС:
-{user_text[:500]}
-
-КАНДИДАТЫ (ОТСОРТИРОВАНЫ ПО СОВПАДЕНИЮ):
-{json.dumps(compact_candidates, ensure_ascii=False)}
-
-ПРАВИЛА:
-1. match_reasoning: сопоставь стек кандидата с запросом. Если это тот же самый пост или точное совпадение стека — ставь скор 90-100%.
-2. score:
-   - 85-100%: Полное совпадение ядра стека и роли.
-   - 55-84%: Роль совпадает, но есть отличия по инструментам.
-   - 0-45%: Другая специальность (Frontend вместо DevOps), курсы, резюме -> ставь меньше 50%!
-3. end_client_name:
-   - Если есть `fwd_origin` — это 100% улика, пиши строго имя источника.
-   - Если on-premise + PaaS = Финтех (Сбер, Т-Банк, ВТБ, Альфа).
-   - Если e-com + гибридное облако = X5 Group, Ozon, Wildberries, Яндекс.
-   - Если явных маркеров нет — пиши "Прямой IT-бизнес". НЕ выдумывай корпорации на пустом месте!
-
-Формат JSON:
-{{
-  "results": [
-    {{
-      "company": "...",
-      "score": 95,
-      "role": "...",
-      "url": "...",
-      "source": "...",
-      "stack_match": "...",
-      "match_reasoning": "...",
-      "end_client_name": "...",
-      "end_client_evidence": "...",
-      "strategy_lpr": "...",
-      "strategy_pain": "...",
-      "strategy_value": "...",
-      "strategy_hook": "..."
-    }}
-  ]
-}}"""
-
-    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=2500, json_mode=True)
-    parsed_candidates = []
-
-    try:
-        parsed_data = json.loads(result_json_str)
-        parsed_candidates = parsed_data.get("results", [])
-    except Exception:
-        pass
-
-    if not parsed_candidates:
-        for idx, v in enumerate(candidates_pool[:4], 1):
-            calc_score = int(v.get("overlap", 40))
-            parsed_candidates.append({
-                "company": v["company"],
-                "score": max(50, min(98, calc_score + 10)),
-                "role": "IT Специалист",
-                "url": v["url"],
-                "source": v["source"],
-                "stack_match": "Стек из описания",
-                "end_client_name": "Прямой IT-бизнес",
-                "end_client_evidence": "Совпадение по стеку и профилю задач.",
-                "strategy_lpr": "CTO / Team Lead",
-                "strategy_pain": "Потребность в закрытии задач проекта",
-                "strategy_value": "Предоставление готовых инженеров",
-                "strategy_hook": "Добрый день! Видим потребность в специалисте. Актуально взглянуть на профили наших инженеров?"
-            })
-
-    parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
-    qualified_leads = [item for item in parsed_candidates if int(item.get("score", 0)) >= 50][:4]
-
-    if not qualified_leads:
-        qualified_leads = parsed_candidates[:1]
-
-    await safe_edit_status(status_msg, f"🏁 Найдено **{len(qualified_leads)}** точных совпадений:")
-
-    for rank, item in enumerate(qualified_leads, 1):
-        company = item.get("company", "Не указана")
-        score = int(item.get("score", 50))
-        role = item.get("role", "IT Специалист")
-        url = item.get("url", "#")
-        source = item.get("source", "Источник")
-        stack = item.get("stack_match", "Технологии в тексте")
-        
-        c_name = item.get("end_client_name", "Прямой IT-бизнес")
-        c_evidence = item.get("end_client_evidence", "Определено по специфике задач.")
-        
-        lpr = item.get("strategy_lpr", "CTO / Head of Infrastructure")
-        pain = item.get("strategy_pain", "Нехватка рук на ключевые задачи")
-        value_prop = item.get("strategy_value", "Закрытие операционки готовыми инженерами")
-        hook = item.get("strategy_hook", "Добрый день! Обратили внимание на вакансию. Актуально взглянуть на профили?")
-
-        client_block = (
-            "> 🕵️ **OSINT-расследование заказчика:**\n"
-            f"> **Вероятный бенефициар:** `{c_name}`\n"
-            f"> **Улика:** _{c_evidence}_\n\n"
-        )
-
-        card = (
-            f"**#{rank}. {company} • {score}%**\n"
-            f"{role}\n\n"
-            f"**Стек:** {stack}\n"
-            f"**Где:** {source}\n\n"
-            f"{client_block}"
-            f"🎯 **Фокус:** {lpr}\n"
-            f"🚨 **Боль:** {pain}\n"
-            f"💎 **Оффер:** {value_prop}\n\n"
-            f"> 💬 **Питч для контакта:**\n"
-            f"> {hook}"
-        )
-
-        buttons = [
-            [
-                InlineKeyboardButton(text="↗ Открыть вакансию", url=url),
-                InlineKeyboardButton(text="🕵️ Найти ЛПР", url=build_lead_osint_url(company))
-            ]
-        ]
-
-        reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await message.answer(card, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-
-
-# ----------------- БЕЗОПАСНЫЙ СТАРТ -----------------
-async def init_telethon():
-    global telethon_client
-    if not telethon_client:
-        return
-    try:
-        await asyncio.wait_for(telethon_client.connect(), timeout=4.0)
-        if not await telethon_client.is_user_authorized():
-            logger.warning("Telethon не авторизован.")
-            telethon_client = None
-        else:
-            logger.info("Telethon успешно авторизован! Регистрация фонового слушателя...")
-            await refresh_all_allowed_chats()
-    except Exception as e:
-        logger.warning(f"Telethon пропущен: {e}")
-        telethon_client = None
-
-
-async def main():
-    logger.info("Инициализация сервиса...")
-    threading.Thread(target=run_health_server, daemon=True).start()
-    await init_db()
-    await find_working_groq_model()
-    await init_telethon()
-
-    try:
-        await asyncio.wait_for(bot.delete_webhook(drop_pending_updates=True), timeout=3.0)
-        logger.info("Webhook сброшен.")
-    except Exception as e:
-        logger.warning(f"delete_webhook: {e}")
-
-    logger.info(">>> Запуск polling aiogram. Бот слушает сообщения! <<<")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
