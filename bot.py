@@ -8,7 +8,7 @@ import re
 import ssl
 import sys
 import threading
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus, unquote, urlparse, parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncpg
 import httpx
@@ -64,6 +64,7 @@ if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 CLEAN_NAME_RE = re.compile(r'[\'\"«»@]')
 CLEAN_QUERY_RE = re.compile(r'[^\w\s\+\#\.\-]')
+URL_FINDER_RE = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
 
 KNOWN_AGENCIES = (
     "кадровое", "рекрутинг", "recruitment", "staffing", "hr", "agency",
@@ -102,6 +103,18 @@ TECH_SYNONYMS = {
     "docker": ["докер", "containerd"],
     "ansible": ["ансибл", "terraform", "iac"],
     "terraform": ["ansible", "iac"]
+}
+
+ENTERPRISE_FINGERPRINTS = {
+    "Сбер / СберТех": ["платформа v", "сфера", "sberworks", "ефс", "сббол", "каста", "дельта", "субд едо"],
+    "Т-Банк": ["t-platform", "sage", "t-id", "t-data", "желтый банк", "t-bank"],
+    "Альфа-Банк": ["alfa-campus", "alfa-cloud", "а-инвестиции", "а-платформа", "midas"],
+    "X5 Group": ["x5 tech", "x5 cloud", "х5 id", "пятерочка core", "charlie"],
+    "Ozon": ["ozon tech", "озон маркетплейс", "wms озон", "goms"],
+    "Яндекс": ["yandex cloud", "arcadia", "аркадия", "yabs", "ya.make"],
+    "ВТБ": ["втб онлайн", "диджитал втб", "омниканал втб"],
+    "Ростелеком": ["базис", "basis.vdi", "ртк", "ростелеком ключ"],
+    "СИБУР / Промышленность": ["сибур диджитал", "асутп", "scada", "промавтоматика", "гост 19"]
 }
 
 # ----------------- HEALTH SERVER -----------------
@@ -417,6 +430,8 @@ def is_agency(company_name: str, text: str = "") -> bool:
 
 def build_lead_osint_url(company_name: str, target_role: str = "CTO") -> str:
     clean_company = CLEAN_NAME_RE.sub("", company_name).strip()
+    if clean_company.startswith("@") or "канал" in clean_company.lower():
+        clean_company = "IT Компания"
     query = f'site:linkedin.com/in "{clean_company}" ({target_role} OR "Head of Engineering" OR "Team Lead")'
     return f"https://www.google.com/search?q={quote_plus(query)}"
 
@@ -435,6 +450,7 @@ async def safe_edit_status(msg: Message, text: str):
 
 
 async def extract_forward_metadata(message) -> str:
+    global ENTITY_CACHE
     if not message.fwd_from:
         return ""
     try:
@@ -449,6 +465,8 @@ async def extract_forward_metadata(message) -> str:
                 try:
                     entity = await telethon_client.get_entity(fwd.from_id)
                     if f_id:
+                        if len(ENTITY_CACHE) > 1000:
+                            ENTITY_CACHE.clear()
                         ENTITY_CACHE[f_id] = entity
                 except (FloodWaitError, Exception):
                     entity = None
@@ -462,6 +480,65 @@ async def extract_forward_metadata(message) -> str:
     except Exception:
         pass
     return ""
+
+
+# ----------------- БЕЗОПАСНАЯ АВТОНОМНАЯ OSINT-РАЗВЕДКА -----------------
+async def deep_osint_investigation(client: httpx.AsyncClient, text: str) -> tuple[str, str]:
+    text_lower = text.lower()
+
+    # 1. Проверка базы маркеров
+    for brand, markers in ENTERPRISE_FINGERPRINTS.items():
+        for m in markers:
+            if m in text_lower:
+                return brand, f"Найден закрытый маркер архитектуры: «{m}»"
+
+    # 2. Быстрый Unshortener ссылок (ATS/UTM)
+    urls = URL_FINDER_RE.findall(text)
+    for u in urls[:2]:
+        try:
+            r = await client.head(u, follow_redirects=True, timeout=2.0)
+            final_url = str(r.url)
+            parsed = urlparse(final_url)
+            host = parsed.netloc.lower()
+            if "huntflow.io" in host or "potok.io" in host or "hrms" in host:
+                sub = host.split(".")[0].capitalize()
+                return sub, f"Раскрыта внутренняя ATS-система отклика: {host}"
+
+            qs = parse_qs(parsed.query)
+            for param in ["utm_campaign", "client", "company"]:
+                if param in qs:
+                    val = qs[param][0]
+                    if len(val) >= 3 and not any(a in val.lower() for a in ["tg", "telegram", "cpc"]):
+                        return val.upper(), f"Выявлен маркер в ссылке: {param}={val}"
+        except Exception:
+            pass
+
+    # 3. Фильтрованный слепок технических фраз (исключаем общие приветствия)
+    sentences = [s.strip() for s in re.split(r'[\n\.\!\?]', text) if len(s.strip().split()) >= 6]
+    tech_candidates = [
+        s for s in sentences 
+        if any(w in s.lower() for w in ["кластер", "стек", "ci/cd", "инфраструктур", "настройк", "k8s", "репликац", "сервер"])
+    ]
+
+    target_quote = tech_candidates[0] if tech_candidates else (sentences[0] if sentences else "")
+    if target_quote:
+        short_quote = " ".join(target_quote.split()[:8])
+        try:
+            search_query = f'"{short_quote}"'
+            url = "https://html.duckduckgo.com/html/"
+            data = {"q": search_query, "b": ""}
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = await client.post(url, data=data, headers=headers, timeout=2.0)
+            if r.status_code == 200:
+                links = re.findall(r'<a class="result__url" href="[^"]*uddg=([^"&]+)[^"]*">', r.text)
+                for l in links[:2]:
+                    domain = urlparse(unquote(l)).netloc.replace("www.", "")
+                    if domain and not any(ign in domain for ign in ["t.me", "duckduckgo", "telegra.ph"]):
+                        return domain, f"Найдена публикация требований на: {domain}"
+        except Exception:
+            pass
+
+    return "", ""
 
 
 # ----------------- ГЛУБОКИЙ ПОИСК В TELEGRAM -----------------
@@ -586,7 +663,7 @@ async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str, raw_brief:
         clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
         search_query = f'site:t.me/s/ "{clean_q}" "вакансия"'
         url = "https://html.duckduckgo.com/html/"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         data = {"q": search_query, "b": ""}
 
         r = await client.post(url, data=data, headers=headers, timeout=3.0)
@@ -699,7 +776,11 @@ async def call_groq_async(prompt: str, max_tokens: int = 2500, json_mode: bool =
 async def cmd_start(message: Message):
     await message.answer(
         "💼 <b>Multi-Source OSINT Lead Hunter</b>\n\n"
-        "Отправьте бриф или описание вакансии — бот выполнит поиск по вашим Telegram-папкам с увеличенной глубиной и точным сопоставлением стека.\n\n"
+        "Отправьте бриф или описание вакансии. Бот проведет полный цикл разведки:\n"
+        "• Найдет точный оригинал в Telegram-папках и базе\n"
+        "• Раскроет скрытые ATS-ссылки и проверит закрытые маркеры\n"
+        "• Деанонимизирует конечного бенефициара и сформирует питч\n"
+        "• Питч копируется в буфер кликом по тексту.\n\n"
         "Команды:\n"
         "• /set_folder — выбор папок Telegram для поиска\n"
         "• /debug_tg — статус базы и выбранных папок",
@@ -816,3 +897,215 @@ async def handle_vacancy(message: Message):
         ]
         web_results = await asyncio.gather(*web_tasks, return_exceptions=True)
         valid_web = [item for sub in web_results if isinstance(sub, list) for item in sub]
+        all_collected = internal_results + valid_web
+
+        seen_hashes = set()
+        deduped = []
+        for v in all_collected:
+            h = v.get("content_hash") or generate_content_hash(v.get("desc", ""))
+            if h not in seen_hashes and v.get("url"):
+                seen_hashes.add(h)
+                deduped.append(v)
+
+        if not deduped:
+            await safe_edit_status(status_msg, "❌ Совпадений по источникам не найдено.")
+            return
+
+        deduped.sort(key=lambda x: x.get("overlap", 0), reverse=True)
+        candidates_pool = deduped[:5]
+
+        await safe_edit_status(status_msg, f"🧠 [3/3] Автономный OSINT-деанон заказчиков и сбор стратегии...")
+
+        # Защищенный тайм-аутом сбор внешних улик
+        osint_tasks = [deep_osint_investigation(http_client, c['desc']) for c in candidates_pool]
+        try:
+            osint_results = await asyncio.wait_for(asyncio.gather(*osint_tasks, return_exceptions=True), timeout=3.0)
+        except asyncio.TimeoutError:
+            osint_results = [("", "") for _ in candidates_pool]
+
+    compact_candidates = []
+    for idx, v in enumerate(candidates_pool, 1):
+        res = osint_results[idx - 1] if idx - 1 < len(osint_results) and isinstance(osint_results[idx - 1], tuple) else ("", "")
+        osint_client, osint_evidence = res
+        compact_candidates.append({
+            "id": idx,
+            "company": v['company'],
+            "source": v['source'],
+            "url": v['url'],
+            "overlap_calc": v.get('overlap', 0),
+            "fwd_origin": v.get('fwd_source', ''),
+            "auto_osint_client": osint_client,
+            "auto_osint_evidence": osint_evidence,
+            "text": v['desc'][:320]
+        })
+
+    prompt_matrix = f"""Ты — технический IT-аудитор и OSINT-аналитик.
+Твоя цель — сопоставить стек и утвердить конечного бенефициара для сейлза.
+
+ВХОДЯЩИЙ ЗАПРОС:
+{user_text[:500]}
+
+КАНДИДАТЫ С АВТОНОМНЫМИ OSINT-УЛИКАМИ:
+{json.dumps(compact_candidates, ensure_ascii=False)}
+
+ПРАВИЛА:
+1. match_reasoning: сопоставь стек кандидата с запросом. При точном совпадении ставь скор 90-100%.
+2. score:
+   - 85-100%: Полное совпадение ядра стека и роли.
+   - 55-84%: Роль совпадает, но есть отличия по инструментам.
+   - 0-45%: Другая специальность, курсы, резюме -> ставь меньше 50%!
+3. end_client_name:
+   - Если в объекте кандидата уже есть непустой `auto_osint_client` — СТРОГО бери его и его `auto_osint_evidence`!
+   - Если есть `fwd_origin` — бери имя из fwd_origin.
+   - Иначе определяй по стеку (on-premise/PaaS = Финтех, e-com = Retail/Маркетплейсы).
+   - Если зацепок нет — пиши "Прямой IT-бизнес".
+
+Формат JSON:
+{{
+  "results": [
+    {{
+      "company": "...",
+      "score": 95,
+      "role": "...",
+      "url": "...",
+      "source": "...",
+      "stack_match": "...",
+      "match_reasoning": "...",
+      "end_client_name": "...",
+      "end_client_evidence": "...",
+      "strategy_lpr": "...",
+      "strategy_pain": "...",
+      "strategy_value": "...",
+      "strategy_hook": "..."
+    }}
+  ]
+}}"""
+
+    result_json_str, err = await call_groq_async(prompt_matrix, max_tokens=2500, json_mode=True)
+    parsed_candidates = []
+
+    try:
+        clean_json_str = result_json_str.strip()
+        json_match = re.search(r"\{.*\}", clean_json_str, re.DOTALL)
+        if json_match:
+            clean_json_str = json_match.group(0)
+        parsed_data = json.loads(clean_json_str)
+        parsed_candidates = parsed_data.get("results", [])
+    except Exception as e:
+        logger.warning(f"Ошибка декодирования JSON от Groq: {e}")
+
+    if not parsed_candidates:
+        for idx, v in enumerate(candidates_pool[:4], 1):
+            calc_score = int(v.get("overlap", 40))
+            parsed_candidates.append({
+                "company": v["company"],
+                "score": max(50, min(98, calc_score + 10)),
+                "role": "IT Специалист",
+                "url": v["url"],
+                "source": v["source"],
+                "stack_match": "Стек из описания",
+                "end_client_name": "Прямой IT-бизнес",
+                "end_client_evidence": "Совпадение по стеку и профилю задач.",
+                "strategy_lpr": "CTO / Team Lead",
+                "strategy_pain": "Потребность в закрытии задач проекта",
+                "strategy_value": "Предоставление готовых инженеров",
+                "strategy_hook": "Добрый день! Видим потребность в специалисте. Актуально взглянуть на профили наших инженеров?"
+            })
+
+    parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
+    qualified_leads = [item for item in parsed_candidates if int(item.get("score", 0)) >= 50][:4]
+
+    if not qualified_leads:
+        qualified_leads = parsed_candidates[:1]
+
+    await safe_edit_status(status_msg, f"🏁 Найдено <b>{len(qualified_leads)}</b> позиций (автономный OSINT-разбор готов):")
+
+    for rank, item in enumerate(qualified_leads, 1):
+        raw_company = str(item.get("company", "Не указана"))
+        company = html.escape(raw_company)
+        score = int(item.get("score", 50))
+        role = html.escape(str(item.get("role", "IT Специалист")))
+        url = item.get("url", "#")
+        source = html.escape(str(item.get("source", "Источник")))
+        stack = html.escape(str(item.get("stack_match", "Технологии в тексте")))
+        
+        raw_client_name = str(item.get("end_client_name", "Прямой IT-бизнес"))
+        c_name = html.escape(raw_client_name)
+        c_evidence = html.escape(str(item.get("end_client_evidence", "Определено по специфике задач.")))
+        
+        lpr = html.escape(str(item.get("strategy_lpr", "CTO / Head of Infrastructure")))
+        pain = html.escape(str(item.get("strategy_pain", "Нехватка рук на ключевые задачи")))
+        value_prop = html.escape(str(item.get("strategy_value", "Закрытие операционки готовыми инженерами")))
+        raw_hook = str(item.get("strategy_hook", "Добрый день! Обратили внимание на вакансию. Актуально взглянуть на профили?"))
+        hook = html.escape(raw_hook)
+
+        # Выбираем целевую компанию для поиска ЛПР (реальный бенефициар в приоритете)
+        target_lpr_company = raw_client_name if raw_client_name and "Прямой" not in raw_client_name else raw_company
+
+        client_block = (
+            f"<blockquote>🕵️ <b>OSINT-разведка заказчика:</b>\n"
+            f"<b>Конечный бенефициар:</b> <code>{c_name}</code>\n"
+            f"<b>Доказательство:</b> <i>{c_evidence}</i></blockquote>\n\n"
+        )
+
+        card = (
+            f"<b>#{rank}. {company} • {score}%</b>\n"
+            f"{role}\n\n"
+            f"<b>Стек:</b> {stack}\n"
+            f"<b>Где:</b> {source}\n\n"
+            f"{client_block}"
+            f"🎯 <b>Фокус:</b> {lpr}\n"
+            f"🚨 <b>Боль:</b> {pain}\n"
+            f"💎 <b>Оффер:</b> {value_prop}\n\n"
+            f"<blockquote>💬 <b>Питч (нажмите для копирования):</b>\n"
+            f"<code>{hook}</code></blockquote>"
+        )
+
+        buttons = [
+            [
+                InlineKeyboardButton(text="↗ Открыть вакансию", url=url),
+                InlineKeyboardButton(text="🕵️ Найти ЛПР", url=build_lead_osint_url(target_lpr_company))
+            ]
+        ]
+
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await message.answer(card, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+
+
+# ----------------- БЕЗОПАСНЫЙ СТАРТ -----------------
+async def init_telethon():
+    global telethon_client
+    if not telethon_client:
+        return
+    try:
+        await asyncio.wait_for(telethon_client.connect(), timeout=4.0)
+        if not await telethon_client.is_user_authorized():
+            logger.warning("Telethon не авторизован.")
+            telethon_client = None
+        else:
+            logger.info("Telethon успешно авторизован! Регистрация фонового слушателя...")
+            await refresh_all_allowed_chats()
+    except Exception as e:
+        logger.warning(f"Telethon пропущен: {e}")
+        telethon_client = None
+
+
+async def main():
+    logger.info("Инициализация сервиса...")
+    threading.Thread(target=run_health_server, daemon=True).start()
+    await init_db()
+    await find_working_groq_model()
+    await init_telethon()
+
+    try:
+        await asyncio.wait_for(bot.delete_webhook(drop_pending_updates=True), timeout=3.0)
+        logger.info("Webhook сброшен.")
+    except Exception as e:
+        logger.warning(f"delete_webhook: {e}")
+
+    logger.info(">>> Запуск polling aiogram. Бот слушает сообщения! <<<")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
