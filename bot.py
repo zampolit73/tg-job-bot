@@ -25,21 +25,13 @@ from telethon.errors import FloodWaitError
 
 # =====================================================================
 # 🎛 ПУЛЬТ УПРАВЛЕНИЯ (НАСТРОЙКИ ДЛЯ НЕ-ПРОГРАММИСТА)
-# Редактируйте эти параметры прямо здесь, не трогая основной код ниже!
 # =====================================================================
 
-# 1. Сколько постов сканировать в чатах (чем больше, тем глубже поиск, но чуть дольше)
-SCAN_DEPTH_FOLDER = 80   # Глубина для выбранных папок (рекомендуется 50-100)
-SCAN_DEPTH_GLOBAL = 35   # Глубина для общего поиска (рекомендуется 25-40)
+SCAN_DEPTH_FOLDER = 80   # Глубина сканирования для выбранных папок
+SCAN_DEPTH_GLOBAL = 35   # Глубина для общего поиска
+MIN_MATCH_SCORE = 50     # Порог отбора кандидатов (0-100%)
+MAX_CARDS_TO_SHOW = 4    # Сколько карточек выводить
 
-# 2. Порог строгости отбора (в процентах от 0 до 100)
-# Если бот находит мало — снизьте до 40. Если много лишнего — поднимите до 60.
-MIN_MATCH_SCORE = 50
-
-# 3. Максимальное количество карточек в ответе
-MAX_CARDS_TO_SHOW = 4
-
-# 4. Словарь соответствий стека (Синонимы: что чему равно)
 TECH_SYNONYMS = {
     "kubernetes": ["k8s", "kube", "кубер", "openshift", "helm"],
     "k8s": ["kubernetes", "kube", "кубер", "helm"],
@@ -60,7 +52,6 @@ TECH_SYNONYMS = {
     "terraform": ["ansible", "iac"]
 }
 
-# 5. Секретные кодовые слова компаний для мгновенного раскрытия (OSINT)
 ENTERPRISE_FINGERPRINTS = {
     "Сбер / СберТех": ["платформа v", "сфера", "sberworks", "ефс", "сббол", "каста", "дельта", "субд едо"],
     "Т-Банк": ["t-platform", "sage", "t-id", "t-data", "желтый банк", "t-bank"],
@@ -74,7 +65,7 @@ ENTERPRISE_FINGERPRINTS = {
 }
 
 # =====================================================================
-# ⚙️ СИСТЕМНЫЙ БЛОК (ДАЛЕЕ ТЕХНИЧЕСКИЙ КОД)
+# ⚙️ СИСТЕМНЫЙ БЛОК
 # =====================================================================
 
 logging.basicConfig(
@@ -108,6 +99,7 @@ db_semaphore = asyncio.Semaphore(3)
 ACTIVE_FOLDERS = {}
 ALLOWED_CHAT_IDS = set()
 ENTITY_CACHE = {}
+ACTIVE_SEARCH_SESSIONS = {}
 
 telethon_client = None
 if TG_API_ID and TG_API_HASH and TG_SESSION_STRING:
@@ -705,6 +697,34 @@ async def call_groq_async(prompt: str, max_tokens: int = 2500, json_mode: bool =
     return "", "Empty response"
 
 
+# ----------------- ФОНОВЫЙ СЛУШАТЕЛЬ TELETHON -----------------
+def register_telethon_listener():
+    if not telethon_client:
+        return
+
+    @telethon_client.on(events.NewMessage)
+    async def handler_new_message(event):
+        try:
+            if event.is_private or not event.text or len(event.text) < 30:
+                return
+
+            if ALLOWED_CHAT_IDS and normalize_id(event.chat_id) not in ALLOWED_CHAT_IDS:
+                return
+
+            text_lower = event.text.lower()
+            markers = ("вакансия", "ищем", "senior", "middle", "lead", "remote", "developer", "инженер", "асутп", "devops", "kubernetes")
+            if any(k in text_lower for k in markers):
+                chat = await event.get_chat()
+                chat_title = getattr(chat, 'title', 'TG Группа')
+                clean_id = str(chat.id).replace("-100", "")
+                url = f"https://t.me/c/{clean_id}/{event.id}" if not getattr(chat, 'username', None) else f"https://t.me/{chat.username}/{event.id}"
+                
+                fwd_source = await extract_forward_metadata(event.message)
+                await save_vacancy_to_db(chat_title, event.id, chat.id, clean_html(event.text), url, fwd_source)
+        except Exception:
+            pass
+
+
 # ----------------- ОБРАБОТЧИКИ AIOGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
@@ -772,8 +792,29 @@ async def handle_folder_toggle_callback(call: CallbackQuery):
         pass
 
 
-@dp.callback_query(F.data == "delete_output")
-async def handle_delete_output(call: CallbackQuery):
+@dp.callback_query(F.data.startswith("del_session:"))
+async def handle_delete_session(call: CallbackQuery):
+    session_id = call.data.split(":")[1]
+    msg_ids = ACTIVE_SEARCH_SESSIONS.pop(session_id, [])
+    
+    # Добавляем ID сообщения, на котором была нажата кнопка
+    if call.message and call.message.message_id not in msg_ids:
+        msg_ids.append(call.message.message_id)
+
+    if msg_ids:
+        try:
+            await bot.delete_messages(chat_id=call.message.chat.id, message_ids=msg_ids)
+            await call.answer("Вся выдача удалена 🗑", show_alert=False)
+            return
+        except Exception:
+            for m_id in msg_ids:
+                try:
+                    await bot.delete_message(chat_id=call.message.chat.id, message_id=m_id)
+                except Exception:
+                    pass
+            await call.answer("Выдача очищена 🗑", show_alert=False)
+            return
+
     try:
         await call.message.delete()
         await call.answer("Выдача удалена 🗑", show_alert=False)
@@ -811,7 +852,6 @@ async def handle_vacancy(message: Message):
     global BOT_USER_ID
     user_text = message.text.strip()
 
-    # Защита от случайных смайликов и коротких сообщений
     if len(user_text) < 15:
         await message.answer(
             "ℹ️ <b>Сообщение слишком короткое.</b>\n"
@@ -968,6 +1008,9 @@ async def handle_vacancy(message: Message):
 
     await safe_edit_status(status_msg, f"🏁 Найдено <b>{len(qualified_leads)}</b> позиций:")
 
+    session_id = hashlib.md5(f"{message.from_user.id}_{message.message_id}".encode()).hexdigest()[:8]
+    sent_cards_ids = [status_msg.message_id]
+
     for rank, item in enumerate(qualified_leads, 1):
         raw_company = str(item.get("company", "Не указана"))
         company = html.escape(raw_company)
@@ -1015,12 +1058,14 @@ async def handle_vacancy(message: Message):
             ]
         ]
 
-        # Под последней карточкой добавляем кнопку очистки чата
         if rank == len(qualified_leads):
-            buttons.append([InlineKeyboardButton(text="🗑 Удалить эту выдачу", callback_data="delete_output")])
+            buttons.append([InlineKeyboardButton(text="🗑 Удалить эту выдачу", callback_data=f"del_session:{session_id}")])
 
         reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await message.answer(card, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        sent_m = await message.answer(card, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        sent_cards_ids.append(sent_m.message_id)
+
+    ACTIVE_SEARCH_SESSIONS[session_id] = sent_cards_ids
 
 
 # ----------------- СТАРТ СЕРВИСА -----------------
@@ -1035,6 +1080,7 @@ async def init_telethon():
             telethon_client = None
         else:
             logger.info("Telethon успешно авторизован! Регистрация фонового слушателя...")
+            register_telethon_listener()
             await refresh_all_allowed_chats()
     except Exception as e:
         logger.warning(f"Telethon пропущен: {e}")
