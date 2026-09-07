@@ -23,7 +23,60 @@ from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
-# ----------------- ЛОГИРОВАНИЕ -----------------
+# =====================================================================
+# 🎛 ПУЛЬТ УПРАВЛЕНИЯ (НАСТРОЙКИ ДЛЯ НЕ-ПРОГРАММИСТА)
+# Редактируйте эти параметры прямо здесь, не трогая основной код ниже!
+# =====================================================================
+
+# 1. Сколько постов сканировать в чатах (чем больше, тем глубже поиск, но чуть дольше)
+SCAN_DEPTH_FOLDER = 80   # Глубина для выбранных папок (рекомендуется 50-100)
+SCAN_DEPTH_GLOBAL = 35   # Глубина для общего поиска (рекомендуется 25-40)
+
+# 2. Порог строгости отбора (в процентах от 0 до 100)
+# Если бот находит мало — снизьте до 40. Если много лишнего — поднимите до 60.
+MIN_MATCH_SCORE = 50
+
+# 3. Максимальное количество карточек в ответе
+MAX_CARDS_TO_SHOW = 4
+
+# 4. Словарь соответствий стека (Синонимы: что чему равно)
+TECH_SYNONYMS = {
+    "kubernetes": ["k8s", "kube", "кубер", "openshift", "helm"],
+    "k8s": ["kubernetes", "kube", "кубер", "helm"],
+    "devops": ["sre", "platform engineer", "девопс", "инфраструктур", "ci/cd"],
+    "sre": ["devops", "platform engineer"],
+    "postgresql": ["postgres", "psql", "постгрес"],
+    "postgres": ["postgresql", "psql"],
+    "golang": ["go", "голанг"],
+    "go": ["golang", "голанг"],
+    "python": ["питон", "пайтон", "django", "fastapi"],
+    "java": ["джава", "spring", "springboot"],
+    "frontend": ["фронтенд", "react", "vue", "typescript"],
+    "react": ["frontend", "фронтенд", "nextjs"],
+    "qa": ["тестировщик", "тестирование", "autotests", "автотест"],
+    "linux": ["линукс", "ubuntu", "debian", "centos", "redhat", "astralinux"],
+    "docker": ["докер", "containerd"],
+    "ansible": ["ансибл", "terraform", "iac"],
+    "terraform": ["ansible", "iac"]
+}
+
+# 5. Секретные кодовые слова компаний для мгновенного раскрытия (OSINT)
+ENTERPRISE_FINGERPRINTS = {
+    "Сбер / СберТех": ["платформа v", "сфера", "sberworks", "ефс", "сббол", "каста", "дельта", "субд едо"],
+    "Т-Банк": ["t-platform", "sage", "t-id", "t-data", "желтый банк", "t-bank"],
+    "Альфа-Банк": ["alfa-campus", "alfa-cloud", "а-инвестиции", "а-платформа", "midas"],
+    "X5 Group": ["x5 tech", "x5 cloud", "х5 id", "пятерочка core", "charlie"],
+    "Ozon": ["ozon tech", "озон маркетплейс", "wms озон", "goms"],
+    "Яндекс": ["yandex cloud", "arcadia", "аркадия", "yabs", "ya.make"],
+    "ВТБ": ["втб онлайн", "диджитал втб", "омниканал втб"],
+    "Ростелеком": ["базис", "basis.vdi", "ртк", "ростелеком ключ"],
+    "СИБУР / Промышленность": ["сибур диджитал", "асутп", "scada", "промавтоматика", "гост 19"]
+}
+
+# =====================================================================
+# ⚙️ СИСТЕМНЫЙ БЛОК (ДАЛЕЕ ТЕХНИЧЕСКИЙ КОД)
+# =====================================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -31,7 +84,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("OSINT_Matcher")
 
-# ----------------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ -----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -42,7 +94,7 @@ TG_SESSION_STRING = os.getenv("TG_SESSION_STRING", "")
 
 if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
     logger.critical("TELEGRAM_BOT_TOKEN или GROQ_API_KEY не заданы!")
-    raise ValueError("Критические переменные не заданы!")
+    raise ValueError("Критические переменные не заданы в Environment!")
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -85,39 +137,7 @@ STOP_WORDS = {
     "ищем", "компанию", "требуется", "формат", "локация", "ставка", "грейд", "мы"
 }
 
-TECH_SYNONYMS = {
-    "kubernetes": ["k8s", "kube", "кубер", "openshift", "helm"],
-    "k8s": ["kubernetes", "kube", "кубер", "helm"],
-    "devops": ["sre", "platform engineer", "девопс", "инфраструктур", "ci/cd"],
-    "sre": ["devops", "platform engineer"],
-    "postgresql": ["postgres", "psql", "постгрес"],
-    "postgres": ["postgresql", "psql"],
-    "golang": ["go", "голанг"],
-    "go": ["golang", "голанг"],
-    "python": ["питон", "пайтон", "django", "fastapi"],
-    "java": ["джава", "spring", "springboot"],
-    "frontend": ["фронтенд", "react", "vue", "typescript"],
-    "react": ["frontend", "фронтенд", "nextjs"],
-    "qa": ["тестировщик", "тестирование", "autotests", "автотест"],
-    "linux": ["линукс", "ubuntu", "debian", "centos", "redhat", "astralinux"],
-    "docker": ["докер", "containerd"],
-    "ansible": ["ансибл", "terraform", "iac"],
-    "terraform": ["ansible", "iac"]
-}
 
-ENTERPRISE_FINGERPRINTS = {
-    "Сбер / СберТех": ["платформа v", "сфера", "sberworks", "ефс", "сббол", "каста", "дельта", "субд едо"],
-    "Т-Банк": ["t-platform", "sage", "t-id", "t-data", "желтый банк", "t-bank"],
-    "Альфа-Банк": ["alfa-campus", "alfa-cloud", "а-инвестиции", "а-платформа", "midas"],
-    "X5 Group": ["x5 tech", "x5 cloud", "х5 id", "пятерочка core", "charlie"],
-    "Ozon": ["ozon tech", "озон маркетплейс", "wms озон", "goms"],
-    "Яндекс": ["yandex cloud", "arcadia", "аркадия", "yabs", "ya.make"],
-    "ВТБ": ["втб онлайн", "диджитал втб", "омниканал втб"],
-    "Ростелеком": ["базис", "basis.vdi", "ртк", "ростелеком ключ"],
-    "СИБУР / Промышленность": ["сибур диджитал", "асутп", "scada", "промавтоматика", "гост 19"]
-}
-
-# ----------------- HEALTH SERVER -----------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -136,7 +156,6 @@ def run_health_server():
     server.serve_forever()
 
 
-# ----------------- СЕМАНТИЧЕСКИЙ ОТПЕЧАТОК -----------------
 def generate_content_hash(text: str) -> str:
     clean_text = HTML_TAG_RE.sub(" ", text.lower())
     words = re.findall(r'[a-zа-я0-9\+\#]{3,}', clean_text)
@@ -145,7 +164,6 @@ def generate_content_hash(text: str) -> str:
     return hashlib.md5(signature.encode("utf-8")).hexdigest()
 
 
-# ----------------- РАБОТА С SUPABASE -----------------
 async def init_db():
     global db_pool, ACTIVE_FOLDERS
     if not DATABASE_URL:
@@ -280,7 +298,6 @@ async def search_vacancies_in_db(terms: list, raw_brief: str) -> list:
     return results
 
 
-# ----------------- РАБОТА С ПАПКАМИ TELEGRAM -----------------
 def normalize_id(tg_id: int) -> int:
     s = str(tg_id)
     if s.startswith("-100"):
@@ -354,7 +371,6 @@ async def build_folders_keyboard() -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 def clean_html(raw_html: str) -> str:
     return " ".join(HTML_TAG_RE.sub(" ", raw_html).split())
 
@@ -482,17 +498,14 @@ async def extract_forward_metadata(message) -> str:
     return ""
 
 
-# ----------------- БЫСТРАЯ ДЕТЕРМИНИРОВАННАЯ OSINT-РАЗВЕДКА (БЕЗ DDG) -----------------
 async def deep_osint_investigation(client: httpx.AsyncClient, text: str) -> tuple[str, str]:
     text_lower = text.lower()
 
-    # 1. Проверка базы маркеров систем
     for brand, markers in ENTERPRISE_FINGERPRINTS.items():
         for m in markers:
             if m in text_lower:
                 return brand, f"Найден закрытый маркер архитектуры: «{m}»"
 
-    # 2. Быстрый Unshortener ссылок (ATS / UTM)
     urls = URL_FINDER_RE.findall(text)
     for u in urls[:2]:
         try:
@@ -516,7 +529,6 @@ async def deep_osint_investigation(client: httpx.AsyncClient, text: str) -> tupl
     return "", ""
 
 
-# ----------------- ГЛУБОКИЙ ПОИСК В TELEGRAM -----------------
 async def search_joined_chats_deep(raw_brief: str, bot_id: int) -> list:
     if not telethon_client or not telethon_client.is_connected():
         return []
@@ -536,7 +548,7 @@ async def search_joined_chats_deep(raw_brief: str, bot_id: int) -> list:
                 continue
 
             try:
-                limit_scan = 80 if target_chat else 35
+                limit_scan = SCAN_DEPTH_FOLDER if target_chat else SCAN_DEPTH_GLOBAL
                 async for message in telethon_client.iter_messages(target_chat, search=clean_q, limit=limit_scan):
                     if not message.text or len(message.text) < 30:
                         continue
@@ -591,7 +603,6 @@ async def search_joined_chats_deep(raw_brief: str, bot_id: int) -> list:
     return found_posts
 
 
-# ----------------- ПАРСИНГ ХАБР КАРЬЕРА -----------------
 async def fetch_habr(client: httpx.AsyncClient, query: str, raw_brief: str) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
@@ -633,7 +644,6 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, raw_brief: str) -> l
         return []
 
 
-# ----------------- ВЫБОР МОДЕЛЕЙ GROQ -----------------
 async def find_working_groq_model() -> str:
     global ACTIVE_GROQ_MODEL
     candidate_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
@@ -695,19 +705,16 @@ async def call_groq_async(prompt: str, max_tokens: int = 2500, json_mode: bool =
     return "", "Empty response"
 
 
-# ----------------- ХЭНДЛЕРЫ AIOGRAM -----------------
+# ----------------- ОБРАБОТЧИКИ AIOGRAM -----------------
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
         "💼 <b>Multi-Source OSINT Lead Hunter</b>\n\n"
-        "Отправьте бриф или описание вакансии. Бот проведет полный цикл разведки:\n"
-        "• Найдет точный оригинал в Telegram-папках и базе\n"
-        "• Раскроет скрытые ATS-ссылки и проверит закрытые маркеры\n"
-        "• Деанонимизирует конечного бенефициара и сформирует питч\n"
-        "• Питч копируется в буфер кликом по тексту.\n\n"
-        "Команды:\n"
-        "• /set_folder — выбор папок Telegram для поиска\n"
-        "• /debug_tg — статус базы и выбранных папок",
+        "Отправьте мне бриф или описание вакансии.\n"
+        "Я найду публикации в Telegram-папках, базе и на Хабре, деанонимизирую прямого заказчика и сформирую питч для сейлза.\n\n"
+        "🛠 <b>Команды управления:</b>\n"
+        "• /set_folder — выбрать конкретные папки Telegram\n"
+        "• /debug_tg — проверить статус подключения к базе и аккаунту",
         parse_mode=ParseMode.HTML
     )
 
@@ -715,7 +722,7 @@ async def cmd_start(message: Message):
 @dp.message(F.text == "/set_folder")
 async def cmd_set_folder(message: Message):
     if not telethon_client or not telethon_client.is_connected():
-        await message.answer("⚠️ Telethon не подключен к Telegram.", parse_mode=None)
+        await message.answer("⚠️ Telethon-аккаунт сейчас не подключен. Проверьте настройки авторизации в Render.", parse_mode=None)
         return
 
     status = await message.answer("🔄 Загружаю ваши папки...")
@@ -724,7 +731,7 @@ async def cmd_set_folder(message: Message):
         text, markup = await build_folders_keyboard()
         await status.edit_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
     except Exception as e:
-        await status.edit_text(f"⚠️ Ошибка получения папок: {e}", parse_mode=None)
+        await status.edit_text(f"⚠️ Не удалось получить список папок: {e}", parse_mode=None)
 
 
 @dp.callback_query(F.data.startswith("f_toggle:"))
@@ -737,7 +744,7 @@ async def handle_folder_toggle_callback(call: CallbackQuery):
             await sync_folder_to_db(f_id, "", add=False)
         ACTIVE_FOLDERS.clear()
         await refresh_all_allowed_chats()
-        await call.answer("Режим сброшен: сканируются все группы ✅", show_alert=False)
+        await call.answer("Режим сброшен: сканируются все чаты ✅", show_alert=False)
     else:
         filters_result = await telethon_client(GetDialogFiltersRequest())
         f_title = f"Папка {filter_id}"
@@ -750,11 +757,11 @@ async def handle_folder_toggle_callback(call: CallbackQuery):
         if filter_id in ACTIVE_FOLDERS:
             del ACTIVE_FOLDERS[filter_id]
             await sync_folder_to_db(filter_id, f_title, add=False)
-            await call.answer(f"Папка '{f_title}' выключена ◻️", show_alert=False)
+            await call.answer(f"Папка '{f_title}' исключена ◻️", show_alert=False)
         else:
             ACTIVE_FOLDERS[filter_id] = f_title
             await sync_folder_to_db(filter_id, f_title, add=True)
-            await call.answer(f"Папка '{f_title}' включена ☑️", show_alert=False)
+            await call.answer(f"Папка '{f_title}' подключена ☑️", show_alert=False)
 
         await refresh_all_allowed_chats()
 
@@ -765,9 +772,18 @@ async def handle_folder_toggle_callback(call: CallbackQuery):
         pass
 
 
+@dp.callback_query(F.data == "delete_output")
+async def handle_delete_output(call: CallbackQuery):
+    try:
+        await call.message.delete()
+        await call.answer("Выдача удалена 🗑", show_alert=False)
+    except Exception:
+        await call.answer("Сообщение уже скрыто.", show_alert=False)
+
+
 @dp.message(F.text == "/debug_tg")
 async def cmd_debug(message: Message):
-    db_status = "✅ Подключена" if db_pool else "❌ Не подключена"
+    db_status = "✅ Подключена" if db_pool else "❌ Ошибка подключения"
     if not telethon_client or not telethon_client.is_connected():
         await message.answer(f"🗄 База данных Supabase: {db_status}\nTelethon: ⚠️ Не подключен к Telegram.", parse_mode=None)
         return
@@ -781,9 +797,9 @@ async def cmd_debug(message: Message):
 
         response = (
             f"🗄 <b>База данных Supabase:</b> {db_status}\n"
-            f"👤 <b>Telethon аккаунт:</b> {html.escape(str(me.first_name))} (@{me.username})\n"
+            f"👤 <b>Рабочий аккаунт Telegram:</b> {html.escape(str(me.first_name))} (@{me.username})\n"
             f"{folder_info}\n\n"
-            f"🔒 <i>Личные диалоги (1-на-1) исключены из поиска.</i>"
+            f"🔒 <i>Личные переписки 1-на-1 исключены из сканирования.</i>"
         )
         await message.answer(response, parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -793,20 +809,30 @@ async def cmd_debug(message: Message):
 @dp.message(F.text)
 async def handle_vacancy(message: Message):
     global BOT_USER_ID
-    user_text = message.text
+    user_text = message.text.strip()
+
+    # Защита от случайных смайликов и коротких сообщений
+    if len(user_text) < 15:
+        await message.answer(
+            "ℹ️ <b>Сообщение слишком короткое.</b>\n"
+            "Пожалуйста, пришлите текст вакансии или ключевой стек (например: <code>Senior DevOps Kubernetes Helm Terraform</code>).",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     logger.info(f"Получен бриф ({len(user_text)} симв.) от {message.from_user.id}")
 
     if not BOT_USER_ID:
         me = await bot.get_me()
         BOT_USER_ID = me.id
 
-    status_msg = await message.answer("⚡️ [1/3] Построение связок ключевого стека...")
+    status_msg = await message.answer("⚡️ [1/3] Извлекаю ключевой стек технологий...")
 
     anchor_queries = extract_anchor_phrases(user_text)
     primary_q = anchor_queries[0] if anchor_queries else "разработчик"
     scope_desc = f"{len(ACTIVE_FOLDERS)} папкам" if ACTIVE_FOLDERS else "всем чатам"
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Сканирование Telegram ({scope_desc}) и базы...")
+    await safe_edit_status(status_msg, f"🔍 [2/3] Сканирую Telegram-чаты ({scope_desc}) и базу Supabase...")
 
     tg_task = search_joined_chats_deep(user_text, BOT_USER_ID)
     db_task = search_vacancies_in_db(expand_search_terms(user_text), user_text)
@@ -814,7 +840,6 @@ async def handle_vacancy(message: Message):
     tg_results, db_results = await asyncio.gather(tg_task, db_task)
     internal_results = tg_results + db_results
 
-    # Опрос Хабр Карьеры (без медленного и нестабильного DuckDuckGo)
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
         habr_results = await fetch_habr(http_client, primary_q, user_text)
         all_collected = internal_results + habr_results
@@ -828,15 +853,18 @@ async def handle_vacancy(message: Message):
                 deduped.append(v)
 
         if not deduped:
-            await safe_edit_status(status_msg, "❌ Совпадений по источникам не найдено.")
+            await safe_edit_status(
+                status_msg, 
+                "❌ <b>Совпадений не найдено.</b>\n"
+                "Попробуйте отправить чуть более общее описание или проверьте, подключены ли нужные папки через команду /set_folder."
+            )
             return
 
         deduped.sort(key=lambda x: x.get("overlap", 0), reverse=True)
         candidates_pool = deduped[:5]
 
-        await safe_edit_status(status_msg, f"🧠 [3/3] Деанонимизация заказчиков и сбор стратегии...")
+        await safe_edit_status(status_msg, f"🧠 [3/3] OSINT-деанонимизация заказчиков и формирование питчей...")
 
-        # Быстрый сбор OSINT-улик
         osint_tasks = [deep_osint_investigation(http_client, c['desc']) for c in candidates_pool]
         try:
             osint_results = await asyncio.wait_for(asyncio.gather(*osint_tasks, return_exceptions=True), timeout=2.0)
@@ -915,7 +943,7 @@ async def handle_vacancy(message: Message):
         logger.warning(f"Ошибка декодирования JSON от Groq: {e}")
 
     if not parsed_candidates:
-        for idx, v in enumerate(candidates_pool[:4], 1):
+        for idx, v in enumerate(candidates_pool[:MAX_CARDS_TO_SHOW], 1):
             calc_score = int(v.get("overlap", 40))
             parsed_candidates.append({
                 "company": v["company"],
@@ -933,7 +961,7 @@ async def handle_vacancy(message: Message):
             })
 
     parsed_candidates.sort(key=lambda x: int(x.get("score", 0)), reverse=True)
-    qualified_leads = [item for item in parsed_candidates if int(item.get("score", 0)) >= 50][:4]
+    qualified_leads = [item for item in parsed_candidates if int(item.get("score", 0)) >= MIN_MATCH_SCORE][:MAX_CARDS_TO_SHOW]
 
     if not qualified_leads:
         qualified_leads = parsed_candidates[:1]
@@ -987,11 +1015,15 @@ async def handle_vacancy(message: Message):
             ]
         ]
 
+        # Под последней карточкой добавляем кнопку очистки чата
+        if rank == len(qualified_leads):
+            buttons.append([InlineKeyboardButton(text="🗑 Удалить эту выдачу", callback_data="delete_output")])
+
         reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer(card, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
 
 
-# ----------------- БЕЗОПАСНЫЙ СТАРТ -----------------
+# ----------------- СТАРТ СЕРВИСА -----------------
 async def init_telethon():
     global telethon_client
     if not telethon_client:
