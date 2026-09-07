@@ -8,7 +8,7 @@ import re
 import ssl
 import sys
 import threading
-from urllib.parse import quote_plus, unquote, urlparse, parse_qs
+from urllib.parse import quote_plus, urlparse, parse_qs
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import asyncpg
 import httpx
@@ -482,21 +482,21 @@ async def extract_forward_metadata(message) -> str:
     return ""
 
 
-# ----------------- БЕЗОПАСНАЯ АВТОНОМНАЯ OSINT-РАЗВЕДКА -----------------
+# ----------------- БЫСТРАЯ ДЕТЕРМИНИРОВАННАЯ OSINT-РАЗВЕДКА (БЕЗ DDG) -----------------
 async def deep_osint_investigation(client: httpx.AsyncClient, text: str) -> tuple[str, str]:
     text_lower = text.lower()
 
-    # 1. Проверка базы маркеров
+    # 1. Проверка базы маркеров систем
     for brand, markers in ENTERPRISE_FINGERPRINTS.items():
         for m in markers:
             if m in text_lower:
                 return brand, f"Найден закрытый маркер архитектуры: «{m}»"
 
-    # 2. Быстрый Unshortener ссылок (ATS/UTM)
+    # 2. Быстрый Unshortener ссылок (ATS / UTM)
     urls = URL_FINDER_RE.findall(text)
     for u in urls[:2]:
         try:
-            r = await client.head(u, follow_redirects=True, timeout=2.0)
+            r = await client.head(u, follow_redirects=True, timeout=1.5)
             final_url = str(r.url)
             parsed = urlparse(final_url)
             host = parsed.netloc.lower()
@@ -510,31 +510,6 @@ async def deep_osint_investigation(client: httpx.AsyncClient, text: str) -> tupl
                     val = qs[param][0]
                     if len(val) >= 3 and not any(a in val.lower() for a in ["tg", "telegram", "cpc"]):
                         return val.upper(), f"Выявлен маркер в ссылке: {param}={val}"
-        except Exception:
-            pass
-
-    # 3. Фильтрованный слепок технических фраз (исключаем общие приветствия)
-    sentences = [s.strip() for s in re.split(r'[\n\.\!\?]', text) if len(s.strip().split()) >= 6]
-    tech_candidates = [
-        s for s in sentences 
-        if any(w in s.lower() for w in ["кластер", "стек", "ci/cd", "инфраструктур", "настройк", "k8s", "репликац", "сервер"])
-    ]
-
-    target_quote = tech_candidates[0] if tech_candidates else (sentences[0] if sentences else "")
-    if target_quote:
-        short_quote = " ".join(target_quote.split()[:8])
-        try:
-            search_query = f'"{short_quote}"'
-            url = "https://html.duckduckgo.com/html/"
-            data = {"q": search_query, "b": ""}
-            headers = {"User-Agent": "Mozilla/5.0"}
-            r = await client.post(url, data=data, headers=headers, timeout=2.0)
-            if r.status_code == 200:
-                links = re.findall(r'<a class="result__url" href="[^"]*uddg=([^"&]+)[^"]*">', r.text)
-                for l in links[:2]:
-                    domain = urlparse(unquote(l)).netloc.replace("www.", "")
-                    if domain and not any(ign in domain for ign in ["t.me", "duckduckgo", "telegra.ph"]):
-                        return domain, f"Найдена публикация требований на: {domain}"
         except Exception:
             pass
 
@@ -616,14 +591,14 @@ async def search_joined_chats_deep(raw_brief: str, bot_id: int) -> list:
     return found_posts
 
 
-# ----------------- ПАРСИНГ ВНЕШНИХ ИСТОЧНИКОВ -----------------
+# ----------------- ПАРСИНГ ХАБР КАРЬЕРА -----------------
 async def fetch_habr(client: httpx.AsyncClient, query: str, raw_brief: str) -> list:
     clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
     url = "https://career.habr.com/api/frontend/vacancies"
-    params = {"q": clean_q, "per_page": 4}
+    params = {"q": clean_q, "per_page": 5}
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        r = await client.get(url, params=params, headers=headers, timeout=2.5)
+        r = await client.get(url, params=params, headers=headers, timeout=2.0)
         if r.status_code != 200:
             return []
         jobs = []
@@ -653,57 +628,6 @@ async def fetch_habr(client: httpx.AsyncClient, query: str, raw_brief: str) -> l
                 "content_hash": generate_content_hash(desc_text),
                 "is_external": True
             })
-        return jobs
-    except Exception:
-        return []
-
-
-async def fetch_telegram_dorks(client: httpx.AsyncClient, query: str, raw_brief: str) -> list:
-    try:
-        clean_q = CLEAN_QUERY_RE.sub(" ", query).strip()
-        search_query = f'site:t.me/s/ "{clean_q}" "вакансия"'
-        url = "https://html.duckduckgo.com/html/"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        data = {"q": search_query, "b": ""}
-
-        r = await client.post(url, data=data, headers=headers, timeout=3.0)
-        if r.status_code != 200:
-            return []
-
-        raw_results = re.findall(
-            r'<a class="result__url" href="[^"]*uddg=([^"&]+)[^"]*">.*?</a>.*?<a class="result__snippet[^>]*>(.*?)</a>',
-            r.text, re.DOTALL
-        )
-
-        jobs = []
-        for enc_url, snippet in raw_results[:3]:
-            decoded_url = unquote(enc_url)
-            match = re.search(r"t\.me/(?:s/)?([a-zA-Z0-9_]+)/(\d+)", decoded_url)
-            if not match:
-                continue
-
-            channel_username = match.group(1)
-            msg_id = match.group(2)
-            post_url = f"https://t.me/{channel_username}/{msg_id}"
-            desc = clean_html(snippet)
-
-            if len(desc) < 30 or is_agency(channel_username, desc):
-                continue
-
-            overlap = calculate_overlap_score(raw_brief, desc)
-            jobs.append({
-                "source": f"TG: @{channel_username}",
-                "title": f"Пост в @{channel_username}",
-                "company": f"@{channel_username}",
-                "salary": "в тексте",
-                "url": post_url,
-                "desc": desc[:350],
-                "overlap": overlap,
-                "fwd_source": "",
-                "content_hash": generate_content_hash(desc),
-                "is_external": True
-            })
-
         return jobs
     except Exception:
         return []
@@ -882,7 +806,7 @@ async def handle_vacancy(message: Message):
     primary_q = anchor_queries[0] if anchor_queries else "разработчик"
     scope_desc = f"{len(ACTIVE_FOLDERS)} папкам" if ACTIVE_FOLDERS else "всем чатам"
 
-    await safe_edit_status(status_msg, f"🔍 [2/3] Глубокое сканирование Telegram ({scope_desc}) и базы...")
+    await safe_edit_status(status_msg, f"🔍 [2/3] Сканирование Telegram ({scope_desc}) и базы...")
 
     tg_task = search_joined_chats_deep(user_text, BOT_USER_ID)
     db_task = search_vacancies_in_db(expand_search_terms(user_text), user_text)
@@ -890,14 +814,10 @@ async def handle_vacancy(message: Message):
     tg_results, db_results = await asyncio.gather(tg_task, db_task)
     internal_results = tg_results + db_results
 
+    # Опрос Хабр Карьеры (без медленного и нестабильного DuckDuckGo)
     async with httpx.AsyncClient(follow_redirects=True) as http_client:
-        web_tasks = [
-            fetch_habr(http_client, primary_q, user_text),
-            fetch_telegram_dorks(http_client, primary_q, user_text)
-        ]
-        web_results = await asyncio.gather(*web_tasks, return_exceptions=True)
-        valid_web = [item for sub in web_results if isinstance(sub, list) for item in sub]
-        all_collected = internal_results + valid_web
+        habr_results = await fetch_habr(http_client, primary_q, user_text)
+        all_collected = internal_results + habr_results
 
         seen_hashes = set()
         deduped = []
@@ -914,12 +834,12 @@ async def handle_vacancy(message: Message):
         deduped.sort(key=lambda x: x.get("overlap", 0), reverse=True)
         candidates_pool = deduped[:5]
 
-        await safe_edit_status(status_msg, f"🧠 [3/3] Автономный OSINT-деанон заказчиков и сбор стратегии...")
+        await safe_edit_status(status_msg, f"🧠 [3/3] Деанонимизация заказчиков и сбор стратегии...")
 
-        # Защищенный тайм-аутом сбор внешних улик
+        # Быстрый сбор OSINT-улик
         osint_tasks = [deep_osint_investigation(http_client, c['desc']) for c in candidates_pool]
         try:
-            osint_results = await asyncio.wait_for(asyncio.gather(*osint_tasks, return_exceptions=True), timeout=3.0)
+            osint_results = await asyncio.wait_for(asyncio.gather(*osint_tasks, return_exceptions=True), timeout=2.0)
         except asyncio.TimeoutError:
             osint_results = [("", "") for _ in candidates_pool]
 
@@ -1018,7 +938,7 @@ async def handle_vacancy(message: Message):
     if not qualified_leads:
         qualified_leads = parsed_candidates[:1]
 
-    await safe_edit_status(status_msg, f"🏁 Найдено <b>{len(qualified_leads)}</b> позиций (автономный OSINT-разбор готов):")
+    await safe_edit_status(status_msg, f"🏁 Найдено <b>{len(qualified_leads)}</b> позиций:")
 
     for rank, item in enumerate(qualified_leads, 1):
         raw_company = str(item.get("company", "Не указана"))
@@ -1039,7 +959,6 @@ async def handle_vacancy(message: Message):
         raw_hook = str(item.get("strategy_hook", "Добрый день! Обратили внимание на вакансию. Актуально взглянуть на профили?"))
         hook = html.escape(raw_hook)
 
-        # Выбираем целевую компанию для поиска ЛПР (реальный бенефициар в приоритете)
         target_lpr_company = raw_client_name if raw_client_name and "Прямой" not in raw_client_name else raw_company
 
         client_block = (
